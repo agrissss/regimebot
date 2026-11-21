@@ -1,0 +1,376 @@
+"""The event loop shared by backtest and paper trading.
+
+The ``Engine`` turns decision-bar features into regimes, signals, risk decisions, fills and
+trades. A feed drives it with four events: ``on_decision`` at each decision-bar close,
+``fill_queued`` at the first price after a decision (entries and exits decided at a close fill
+there, never at the close itself), ``on_minute`` for every base bar while a position is open
+(stops and targets), and ``on_funding``. Everything it does is appended to a ``RunLog``.
+
+Causality: a decision at ``ts`` reads only ``windows`` (features up to and including ``ts``)
+and state built from earlier events. Orders it queues fill no earlier than the next event.
+"""
+
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import pandas as pd
+import structlog
+
+from regimebot.config import AppConfig
+from regimebot.engine.portfolio import Portfolio, Position
+from regimebot.engine.rules import stop_reason, trailed_stop
+from regimebot.execution.fill_model import market_fill, quote_from_bar_open, stop_fill, target_fill
+from regimebot.market_state.regime import REQUIRED_FEATURES, classify, playbook_for
+from regimebot.risk.manager import MIN_NOTIONAL, RiskManager
+from regimebot.strategy.base import Strategy
+from regimebot.types import (
+    Bar,
+    ExitReason,
+    Fill,
+    OrderSide,
+    Regime,
+    RiskDecision,
+    RiskEvent,
+    Side,
+    Signal,
+    Trade,
+    side_sign,
+)
+
+log = structlog.get_logger(__name__)
+
+REGIME_INPUTS = ("close", *REQUIRED_FEATURES)  # every value ``classify`` reads
+
+
+@dataclass
+class RunLog:
+    """Everything an engine run produced, in event order (the rows ``persist_result`` saves).
+
+    ``decisions`` are ``(index into signals, ts, RiskDecision)``; an entry cancelled after
+    approval adds a second decision for the same signal. ``regimes`` carry the inputs the
+    classifier read (NaN stored as None). ``equity`` rows are ``(ts, equity, gross_exposure,
+    drawdown)``, one per decision (and per ``flatten_all``).
+    """
+
+    signals: list[Signal] = field(default_factory=list)
+    decisions: list[tuple[int, datetime, RiskDecision]] = field(default_factory=list)
+    fills: list[Fill] = field(default_factory=list)
+    trades: list[Trade] = field(default_factory=list)
+    regimes: list[tuple[str, datetime, Regime, dict[str, float | None]]] = field(
+        default_factory=list
+    )
+    risk_events: list[RiskEvent] = field(default_factory=list)
+    equity: list[tuple[datetime, float, float, float]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedEntry:
+    signal_index: int
+    signal: Signal
+    qty: float  # approved qty; the fill may cut it
+
+
+def _order_side(side: Side, entering: bool) -> OrderSide:
+    """BUY to open a long or close a short, SELL otherwise."""
+    return OrderSide.BUY if (side == Side.LONG) == entering else OrderSide.SELL
+
+
+def _last_row(window: pd.DataFrame | None, ts: datetime) -> tuple[dict[str, float] | None, str]:
+    """The window's last row if it is the decision bar at ``ts`` with a usable close, else
+    (None, why). Reads one numpy row: ``iloc`` per decision is several times slower."""
+    if window is None or window.empty:
+        return None, "no features"
+    last = window.index[-1]
+    if last != ts:
+        return None, f"last features row at {last}"
+    row = dict(zip(window.columns.tolist(), window.to_numpy(dtype=float)[-1].tolist(), strict=True))
+    close = row.get("close", math.nan)
+    if not (math.isfinite(close) and close > 0):
+        return None, f"invalid close {close!r}"
+    return row, ""
+
+
+class Engine:
+    """Regimes, signals, risk, fills and trades for ``cfg.exchange.symbols``.
+
+    At most one position or queued order per symbol. A queued exit takes the whole position;
+    a queued entry fills once, possibly cut by the participation cap.
+    """
+
+    def __init__(
+        self,
+        cfg: AppConfig,
+        strategies: Sequence[Strategy],
+        risk: RiskManager,
+        portfolio: Portfolio,
+        log: RunLog,
+    ) -> None:
+        self.cfg = cfg
+        self.strategies = list(strategies)
+        self.risk = risk
+        self.portfolio = portfolio
+        self.log = log
+        self._entries: dict[str, _QueuedEntry] = {}
+        self._exits: dict[str, ExitReason] = {}
+        self._last_close: dict[str, float] = {}  # last decision close: exit ref_price
+
+    def is_active(self, symbol: str) -> bool:
+        """True when ``symbol`` has an open position or a queued order (it needs bars)."""
+        return (
+            symbol in self.portfolio.positions or symbol in self._entries or symbol in self._exits
+        )
+
+    # --- events --------------------------------------------------------------------------
+
+    def on_decision(
+        self,
+        ts: datetime,
+        windows: Mapping[str, pd.DataFrame],
+        spreads: Mapping[str, float] | None = None,
+    ) -> None:
+        """Process the decision bar closing at ``ts``: mark, classify, manage open positions,
+        check loss limits, then look for entries. A symbol without a window ending at ``ts``
+        is ``NO_TRADE`` (one ``stale_data`` event); its open position keeps only its stop and
+        target. Ends with an equity snapshot."""
+        rows: dict[str, dict[str, float]] = {}
+        for symbol in self.cfg.exchange.symbols:
+            row, why = _last_row(windows.get(symbol), ts)
+            if row is None:
+                detail = f"{symbol}: {why}"
+                self.log.risk_events.append(RiskEvent(ts, "stale_data", detail, "skip_symbol"))
+                log.warning("stale_data", symbol=symbol, ts=ts.isoformat(), detail=why)
+            else:
+                rows[symbol] = row
+        closes = {symbol: row["close"] for symbol, row in rows.items()}
+        self.portfolio.mark(closes)
+        self._last_close.update(closes)
+
+        regimes = {
+            symbol: self._classify(symbol, ts, rows.get(symbol), spreads)
+            for symbol in self.cfg.exchange.symbols
+        }
+        self._manage_positions(rows, regimes)
+
+        self.log.risk_events.extend(self.risk.check_limits(self.portfolio, ts))
+        if self.risk.must_flatten:
+            for symbol in self.portfolio.positions:
+                self._exits.setdefault(symbol, ExitReason.KILL)
+            for symbol in list(self._entries):
+                self._cancel_entry(symbol, ts, "kill_switch", f"halted: {self.risk.halted_reason}")
+        else:
+            self._look_for_entries(ts, windows, rows, regimes)
+        self._snapshot(ts)
+
+    def fill_queued(
+        self, symbol: str, ts: datetime, bid: float, ask: float, bar_volume: float
+    ) -> None:
+        """Execute ``symbol``'s queued order at the quote (taker, ``market_fill``).
+
+        An exit closes the whole position (``ref_price`` = last decision close). An entry is
+        capped at ``max_participation`` of ``bar_volume`` (``ref_price`` = signal entry); no fill,
+        or a fill under ``MIN_NOTIONAL``, cancels it with a ``no_liquidity`` decision."""
+        reason = self._exits.pop(symbol, None)
+        position = self.portfolio.positions.get(symbol)
+        if reason is not None and position is not None:
+            fill = self._exit_fill(position, ts, bid, ask, self._last_close[symbol], bar_volume)
+            self._close(fill, reason)
+        entry = self._entries.pop(symbol, None)
+        if entry is not None:
+            self._fill_entry(entry, ts, bid, ask, bar_volume)
+
+    def on_minute(self, bar: Bar) -> None:
+        """Check ``bar`` against the open position's stop, then its target (stop first when one
+        bar touches both: the order inside a bar is unknown, so assume the worse)."""
+        position = self.portfolio.positions.get(bar.symbol)
+        if position is None:
+            return
+        exit_side = _order_side(position.side, entering=False)
+        fill = stop_fill(bar.symbol, bar, exit_side, position.qty, position.stop, self.cfg.costs)
+        if fill is not None:
+            self._close(fill, stop_reason(position))
+            return
+        fill = target_fill(
+            bar.symbol, bar, exit_side, position.qty, position.target, self.cfg.costs
+        )
+        if fill is not None:
+            self._close(fill, ExitReason.TARGET)
+
+    def on_funding(self, symbol: str, ts: datetime, rate: float, mark_price: float) -> None:
+        """Settle a funding event stamped ``ts`` on a position held at that time. A position
+        entered at or after ``ts`` was not held then and pays nothing."""
+        position = self.portfolio.positions.get(symbol)
+        if position is None or position.entry_ts >= ts:
+            return
+        self.portfolio.apply_funding(symbol, mark_price, rate)
+
+    def flatten_all(self, ts: datetime, prices: Mapping[str, float], reason: ExitReason) -> None:
+        """Close every position at ``prices`` and cancel queued entries (end of data, shutdown).
+
+        Each exit is a taker fill on ``quote_from_bar_open(price)`` at full participation
+        (``bar_volume=0``: no volume information, so the worst bounded impact), stamped ``ts``.
+        The equity snapshot at ``ts`` is replaced by the flat one."""
+        for symbol in list(self._entries):
+            self._cancel_entry(symbol, ts, "cancelled", f"flatten_all: {reason}")
+        for symbol, position in list(self.portfolio.positions.items()):
+            bid, ask = quote_from_bar_open(prices[symbol], self.cfg.costs)
+            fill = self._exit_fill(position, ts, bid, ask, prices[symbol], bar_volume=0.0)
+            self._close(fill, reason)
+        self._exits.clear()
+        self._snapshot(ts)
+
+    # --- decision steps ------------------------------------------------------------------
+
+    def _classify(
+        self,
+        symbol: str,
+        ts: datetime,
+        row: dict[str, float] | None,
+        spreads: Mapping[str, float] | None,
+    ) -> Regime:
+        if row is None:
+            regime, inputs = Regime.NO_TRADE, {}
+        else:
+            spread = None if spreads is None else spreads.get(symbol)
+            regime = classify(row, self.cfg.regime, ts, spread)
+            inputs = {k: None if math.isnan(v := row[k]) else v for k in REGIME_INPUTS}
+        self.log.regimes.append((symbol, ts, regime, inputs))
+        return regime
+
+    def _manage_positions(
+        self, rows: Mapping[str, dict[str, float]], regimes: Mapping[str, Regime]
+    ) -> None:
+        """Step 3: count the bar, trail the stop, queue time and regime exits. A stale symbol
+        only counts the bar."""
+        for symbol, position in self.portfolio.positions.items():
+            position.bars_held += 1
+            row = rows.get(symbol)
+            if row is None:
+                continue
+            close, sign = row["close"], side_sign(position.side)
+            if sign * (close - position.best_price) > 0:
+                position.best_price = close
+            position.stop = trailed_stop(position, row["atr"])
+            if symbol in self._exits:
+                continue
+            if position.bars_held >= position.max_hold_bars:
+                self._exits[symbol] = ExitReason.TIME
+            elif playbook_for(regimes[symbol], self.cfg).force_close:
+                self._exits[symbol] = ExitReason.REGIME
+
+    def _look_for_entries(
+        self,
+        ts: datetime,
+        windows: Mapping[str, pd.DataFrame],
+        rows: Mapping[str, dict[str, float]],
+        regimes: Mapping[str, Regime],
+    ) -> None:
+        """Step 5, in configured symbol order: the first signal from the strategies the regime's
+        playbook allows (in strategy order) goes to risk, with queued entries as ``pending``."""
+        for symbol in self.cfg.exchange.symbols:
+            if symbol not in rows or self.is_active(symbol):
+                continue
+            playbook = playbook_for(regimes[symbol], self.cfg)
+            signal = self._first_signal(
+                symbol, windows[symbol], regimes[symbol], playbook.strategies
+            )
+            if signal is None:
+                continue
+            index = len(self.log.signals)
+            self.log.signals.append(signal)
+            pending = {s: e.qty * e.signal.entry for s, e in self._entries.items()}
+            decision = self.risk.evaluate(signal, self.portfolio, playbook, ts, pending)
+            self.log.decisions.append((index, ts, decision))
+            if decision.approved:
+                self._entries[symbol] = _QueuedEntry(index, signal, decision.qty)
+
+    def _first_signal(
+        self, symbol: str, window: pd.DataFrame, regime: Regime, allowed: Sequence[str]
+    ) -> Signal | None:
+        for strategy in self.strategies:
+            if strategy.name not in allowed:
+                continue
+            signal = strategy.generate(symbol, window, regime)
+            if signal is None:
+                continue
+            if signal.symbol != symbol or signal.ts != window.index[-1]:
+                raise ValueError(
+                    f"{strategy.name} returned a signal for {signal.symbol} at {signal.ts}, "
+                    f"expected {symbol} at {window.index[-1]}"
+                )
+            return signal
+        return None
+
+    # --- orders --------------------------------------------------------------------------
+
+    def _fill_entry(
+        self, entry: _QueuedEntry, ts: datetime, bid: float, ask: float, bar_volume: float
+    ) -> None:
+        signal = entry.signal
+        fill = market_fill(
+            signal.symbol,
+            ts,
+            _order_side(signal.side, entering=True),
+            entry.qty,
+            bid,
+            ask,
+            signal.entry,
+            bar_volume,
+            self.cfg.costs,
+            cap_participation=True,
+        )
+        if fill is None or fill.qty * fill.price < MIN_NOTIONAL:
+            why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
+            detail = f"{why} at bar volume {bar_volume}, min notional {MIN_NOTIONAL}"
+            self.log.decisions.append(
+                (entry.signal_index, ts, RiskDecision(False, 0.0, "no_liquidity", detail))
+            )
+            return
+        self.portfolio.open(signal, fill)
+        self.log.fills.append(fill)
+
+    def _cancel_entry(self, symbol: str, ts: datetime, rule: str, detail: str) -> None:
+        entry = self._entries.pop(symbol)
+        self.log.decisions.append((entry.signal_index, ts, RiskDecision(False, 0.0, rule, detail)))
+
+    def _exit_fill(
+        self,
+        position: Position,
+        ts: datetime,
+        bid: float,
+        ask: float,
+        ref_price: float,
+        bar_volume: float,
+    ) -> Fill:
+        fill = market_fill(
+            position.symbol,
+            ts,
+            _order_side(position.side, entering=False),
+            position.qty,
+            bid,
+            ask,
+            ref_price,
+            bar_volume,
+            self.cfg.costs,
+            cap_participation=False,
+        )
+        if fill is None:  # market_fill always fills an uncapped order
+            raise RuntimeError(f"exit for {position.symbol} got no fill")
+        return fill
+
+    def _close(self, fill: Fill, reason: ExitReason) -> None:
+        trade = self.portfolio.close(fill.symbol, fill, reason)
+        self._exits.pop(fill.symbol, None)
+        self.risk.on_trade_closed(trade)
+        self.log.fills.append(fill)
+        self.log.trades.append(trade)
+
+    def _snapshot(self, ts: datetime) -> None:
+        """Append (ts, equity, gross exposure, drawdown); replaces a snapshot at the same ts."""
+        p = self.portfolio
+        snapshot = (ts, p.equity, p.gross_exposure, p.drawdown)
+        if self.log.equity and self.log.equity[-1][0] == ts:
+            self.log.equity[-1] = snapshot
+        else:
+            self.log.equity.append(snapshot)
