@@ -280,8 +280,11 @@ def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
     # no funding is stored: the run says it charged none, in one line
     (warning,) = [line for line in ok.output.splitlines() if line.startswith("warning: funding")]
     gap = "no funding stamp from 2024-01-02T00:00:00+00:00 to 2024-01-04T00:00:00+00:00"
-    assert all(f"{s}: {gap}" in warning for s in (BTC, "ETH/USDT:USDT", "SOL/USDT:USDT"))
-    assert warning.endswith("run `regimebot data download` for the funding history")
+    # the first gap only, however many there are: the rest are in the run's risk events
+    assert warning == (
+        f"warning: funding missing, not charged there ({BTC}: {gap} (+2 more, see risk events)): "
+        "run `regimebot data download` for the funding history"
+    )
     with session_scope(engine) as session:
         (run_id,) = session.scalars(select(Run.id)).all()
         run = repo.load_run(session, run_id)

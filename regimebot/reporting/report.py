@@ -432,7 +432,10 @@ def _execution_html(e: ExecutionQuality) -> str:
             ["Fills", _count(e.n_fills)],
             ["Decision-to-fill lag of entries, median", _secs(e.entry_lag_median_s)],
             ["Decision-to-fill lag of entries, 95th percentile", _secs(e.entry_lag_p95_s)],
-            ["Average quoted spread at fill (fills with a quote)", _bps(e.avg_spread_bps)],
+            [
+                "Average quoted spread at fill (live quotes: entries and market exits)",
+                _bps(e.avg_spread_bps),
+            ],
         ],
     )
     slippage = _table(

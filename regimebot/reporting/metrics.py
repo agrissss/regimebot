@@ -292,7 +292,8 @@ def largest_market_moves(
 class ExecutionQuality:
     """How a run's simulated fills went. Lags are seconds from the signal (decision close) to
     the entry fill; slippage is bps against the fill's reference price (positive = worse) by
-    fill type; the spread is (ask - bid) / mid in bps over the fills that recorded a quote."""
+    fill type; the spread is (ask - bid) / mid in bps over the entries and market exits that
+    recorded a quote (``LIVE_QUOTE_TYPES``: in paper, the fills priced at a live quote)."""
 
     n_fills: int
     entry_lag_median_s: float
@@ -303,6 +304,9 @@ class ExecutionQuality:
 
 
 FILL_TYPES = ("entry", "stop exit", "target exit", "market exit")
+# The fills a paper session prices at a live quote; a stop is priced from the quote the model
+# builds around its trigger, and a target from no quote at all.
+LIVE_QUOTE_TYPES = ("entry", "market exit")
 _EXIT_TYPES = {
     ExitReason.STOP: "stop exit",
     ExitReason.TRAIL: "stop exit",
@@ -346,7 +350,7 @@ def execution_quality(
     for sid in approved_ids:
         symbol, ts = signals[sid]
         approved[symbol].append(ts)
-    queues, lags = _fill_types(trades), []
+    queues, lags, spreads = _fill_types(trades), [], []
     by_type: dict[str, list[float]] = defaultdict(list)
     for f in fills:
         queue = queues.get((f.symbol, f.ts, str(f.side)))
@@ -356,11 +360,8 @@ def execution_quality(
             before = [ts for ts in approved[f.symbol] if ts <= f.ts]
             if before:
                 lags.append((f.ts - max(before)).total_seconds())
-    spreads = [
-        (f.ask - f.bid) / ((f.ask + f.bid) / 2) * 1e4
-        for f in fills
-        if f.bid is not None and f.ask is not None
-    ]
+        if kind in LIVE_QUOTE_TYPES and f.bid is not None and f.ask is not None:
+            spreads.append((f.ask - f.bid) / ((f.ask + f.bid) / 2) * 1e4)
     seen_approved, cancelled = set(approved_ids), Counter[str]()
     for signal_id, _, d in decisions:
         if not d.approved and signal_id in seen_approved and d.rule in CANCEL_RULES:

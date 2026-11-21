@@ -245,6 +245,27 @@ def test_an_interior_funding_hole_is_filled_and_only_the_hole_is_fetched(session
     assert len(load_funding(session, SYM)) == 20
 
 
+def test_an_interrupted_interior_funding_fill_leaves_no_new_hole_and_a_rerun_completes_it(
+    session: Session,
+) -> None:
+    end = T0 + 299 * EIGHT_H + timedelta(hours=16)  # within the tolerance of the last event
+    download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end)  # k 0..9
+    island = FakeExchange(n_bars=1, n_funding=300)
+    download_funding(island, session, SYM, T0 + 290 * EIGHT_H, end)  # k 290..299
+    before = list(load_funding(session, SYM).index)
+    assert len(before) == 20
+    broken = FakeExchange(n_bars=1, n_funding=300, fail_on_call=2)  # dies on the hole's page 2
+    with pytest.raises(ccxt.NetworkError):
+        download_funding(broken, session, SYM, T0, end)
+    assert list(load_funding(session, SYM).index) == before  # page 1 rolled back: no new hole
+    rerun = FakeExchange(n_bars=1, n_funding=300)
+    assert download_funding(rerun, session, SYM, T0, end) == 280  # k 10..289
+    assert len(rerun.funding_calls) == 4  # three pages and the empty one that ends the hole
+    assert len(load_funding(session, SYM)) == 300
+    covered = FakeExchange(n_bars=1, n_funding=300)
+    assert download_funding(covered, session, SYM, T0, end) == 0 and covered.funding_calls == []
+
+
 def test_an_unfillable_funding_gap_costs_one_request_per_run_and_terminates(
     session: Session,
 ) -> None:

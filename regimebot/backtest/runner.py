@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import AppConfig, timeframe_minutes
 from regimebot.data.resample import resample
-from regimebot.data.validate import funding_gaps
+from regimebot.data.validate import FUNDING_GAP_TOLERANCE, funding_gaps
 from regimebot.db import repo
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
@@ -146,14 +146,23 @@ def _warmup_events(
 def _funding_events(feeds: Mapping[str, _Feed], start: datetime, end: datetime) -> list[RiskEvent]:
     """One ``funding_missing`` event at ``start`` per stretch of ``[start, end)`` longer than
     ``FUNDING_GAP_TOLERANCE`` without a funding stamp for a symbol: positions held there pay or
-    receive no funding, so the result is not silently charged zero."""
+    receive no funding, so the result is not silently charged zero. The first stretch is
+    measured from the last stamp in the tolerance before ``start`` when there is one (events
+    missing right at the start count, a normal cadence across it does not) and reported from
+    ``start``."""
     lo, hi = _ns(pd.to_datetime([start, end], utc=True))
+    lookback = int(FUNDING_GAP_TOLERANCE / timedelta(microseconds=1)) * 1000  # ns
     events = []
     for symbol, feed in feeds.items():
-        ns = feed.funding_ts[(feed.funding_ts >= lo) & (feed.funding_ts < hi)]
-        for a, b in funding_gaps([_dt(int(t)) for t in ns], start, end):
-            detail = f"{symbol}: no funding stamp from {a.isoformat()} to {b.isoformat()}"
-            events.append(RiskEvent(start, "funding_missing", detail, "funding_not_charged"))
+        ts = feed.funding_ts  # sorted
+        before = ts[(ts >= lo - lookback) & (ts < lo)]
+        left = _dt(int(before[-1])) if len(before) else start
+        inside = [_dt(int(t)) for t in ts[(ts >= lo) & (ts < hi)]]
+        for a, b in funding_gaps(inside, left, end):
+            detail = f"{symbol}: no funding stamp from {max(a, start).isoformat()} to "
+            events.append(
+                RiskEvent(start, "funding_missing", detail + b.isoformat(), "funding_not_charged")
+            )
     return events
 
 

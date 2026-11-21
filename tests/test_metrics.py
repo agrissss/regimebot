@@ -317,6 +317,13 @@ def test_execution_quality_from_fills_trades_signals_and_decisions() -> None:
         exit_ts=t + timedelta(minutes=20),
         exit_reason=ExitReason.TARGET,
     )
+    xrp = replace(
+        btc,
+        symbol="XRP",
+        entry_ts=t + timedelta(seconds=4),
+        exit_ts=t + timedelta(minutes=30),
+        exit_reason=ExitReason.TIME,
+    )
 
     def quoted(
         symbol: str, ts: datetime, side: OrderSide, slip: float, bid: float, ask: float
@@ -324,10 +331,12 @@ def test_execution_quality_from_fills_trades_signals_and_decisions() -> None:
         return Fill(symbol, ts, side, 1.0, 100.0, 100.0, 0.0, slip, "taker", bid, ask)
 
     fills = [
-        quoted("BTC", btc.entry_ts, OrderSide.BUY, 2.0, 99.5, 100.5),  # spread 100 bps
-        quoted("ETH", eth.entry_ts, OrderSide.BUY, 4.0, 99.0, 101.0),  # 200 bps
-        quoted("BTC", btc.exit_ts, OrderSide.SELL, 10.0, 99.75, 100.25),  # stop: 50 bps
+        quoted("BTC", btc.entry_ts, OrderSide.BUY, 2.0, 99.5, 100.5),  # live: 100 bps
+        quoted("XRP", xrp.entry_ts, OrderSide.BUY, 8.0, 99.0, 101.0),  # live: 200 bps
+        quoted("ETH", eth.entry_ts, OrderSide.BUY, 4.0, 99.0, 101.0),  # live: 200 bps
+        quoted("BTC", btc.exit_ts, OrderSide.SELL, 10.0, 99.75, 100.25),  # stop: modelled 50
         fill("ETH", eth.exit_ts, OrderSide.SELL, 0.0, "maker"),  # target: no quote
+        quoted("XRP", xrp.exit_ts, OrderSide.SELL, 3.0, 99.9, 100.1),  # market exit: live 20
         fill("SOL", hm(2, 0) + timedelta(seconds=2), OrderSide.BUY, 6.0),  # still open
     ]
     signals = {
@@ -337,18 +346,25 @@ def test_execution_quality_from_fills_trades_signals_and_decisions() -> None:
         4: ("BTC", hm(3)),
         5: ("ETH", hm(3)),
     }
-    signals[6] = ("SOL", hm(4))
+    signals |= {6: ("SOL", hm(4)), 7: ("XRP", t)}
     ok, no = RiskDecision(True, 1.0, "ok", ""), RiskDecision(False, 0.0, "", "")
-    decisions = [(1, t, ok), (2, t, ok), (3, hm(2), ok), (4, hm(3), ok)]
+    decisions = [(1, t, ok), (7, t, ok), (2, t, ok), (3, hm(2), ok), (4, hm(3), ok)]
     decisions += [(4, hm(3, 15), replace(no, rule="expired"))]  # cancelled after approval
     decisions += [(5, hm(3), replace(no, rule="kill_switch"))]  # rejected outright: not counted
     decisions += [(6, hm(4), ok), (6, hm(4), replace(no, rule="no_liquidity"))]
-    e = execution_quality(fills, [btc, eth], signals, decisions)
-    assert e.n_fills == 5
-    # entry lags 3 s, 5 s and 2 s (the open SOL position counts): median 3, p95 3 + 0.9 * 2
-    assert (e.entry_lag_median_s, e.entry_lag_p95_s) == (3.0, pytest.approx(4.8))
-    assert e.slippage_bps == {"entry": (3, 4.0), "stop exit": (1, 10.0), "target exit": (1, 0.0)}
-    assert e.avg_spread_bps == pytest.approx((100 + 200 + 50) / 3)
+    e = execution_quality(fills, [btc, eth, xrp], signals, decisions)
+    assert e.n_fills == 7
+    # entry lags 3, 4, 5 and 2 s (the open SOL position counts): median 3.5, p95 4 + 0.85 * 1
+    assert (e.entry_lag_median_s, e.entry_lag_p95_s) == (3.5, pytest.approx(4.85))
+    assert e.slippage_bps == {
+        "entry": (4, 5.0),  # (2 + 8 + 4 + 6) / 4
+        "stop exit": (1, 10.0),
+        "target exit": (1, 0.0),
+        "market exit": (1, 3.0),
+    }
+    # only live quotes: entries and market exits (100 + 200 + 200 + 20) / 4 = 130; a stop's
+    # quote is the model's own, so averaging every quoted fill would give 570 / 5 = 114
+    assert e.avg_spread_bps == pytest.approx(130.0)
     assert e.cancelled == {
         "no_liquidity": 1,
         "expired": 1,

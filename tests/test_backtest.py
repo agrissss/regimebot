@@ -240,6 +240,28 @@ def test_a_funding_gap_in_the_range_is_recorded_once_and_is_not_a_halt(
     assert len(result.trades) == 1  # recorded, nothing else changes
 
 
+@pytest.mark.parametrize(
+    ("hours", "flagged"),
+    [
+        # 00:00 and 08:00 of day 2 missing: 24 h without a stamp from 16:00 the day before, but
+        # only 16 h of it after the start at day 2 00:00
+        ((16, 40, 48, 56, 64), True),
+        ((20, 28, 36, 44, 52, 60, 68), False),  # the stamp before start is a normal 8 h earlier
+    ],
+    ids=["gap_across_start", "normal_cadence"],
+)
+def test_a_funding_gap_across_the_start_is_measured_from_the_stamp_before_it(
+    tmp_path: Path, hours: tuple[int, ...], flagged: bool
+) -> None:
+    candles = flat(72 * 60 - 1)  # history from T0; decisions in [T0 + 24 h, T0 + 72 h)
+    rates = funding_at(*((T0 + h * HOUR, 1e-4) for h in hours))
+    result = stub_run(tmp_path, candles, T0 + 25 * HOUR, funding=rates, start=T0 + 24 * HOUR)
+    events = [e for e in result.log.risk_events if e.kind == "funding_missing"]
+    # reported from the start: no funding is charged before it anyway
+    gap = f"{BTC}: no funding stamp from {(T0 + 24 * HOUR).isoformat()} to "
+    assert [e.detail for e in events] == ([gap + (T0 + 40 * HOUR).isoformat()] if flagged else [])
+
+
 def test_a_position_stopped_in_the_bar_closing_at_a_funding_time_pays_none(
     tmp_path: Path,
 ) -> None:

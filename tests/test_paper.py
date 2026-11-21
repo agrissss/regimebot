@@ -1115,8 +1115,9 @@ def test_cli_report_of_a_paper_run_shows_its_period_baseline_and_execution_quali
     assert "<td>Fills</td><td>8</td>" in text
     assert "<td>Decision-to-fill lag of entries, median</td><td>3.00 s</td>" in text
     assert "<td>Decision-to-fill lag of entries, 95th percentile</td><td>3.00 s</td>" in text
-    # every taker fill was priced from a quote 2 x 1 bp wide (live or modelled); targets have none
-    assert "<td>Average quoted spread at fill (fills with a quote)</td><td>2.00 bps</td>" in text
+    # the live quotes (4 entries, the TIME exit) are 2 x 1 bp wide; stops and targets excluded
+    spread = "<td>Average quoted spread at fill (live quotes: entries and market exits)</td>"
+    assert spread + "<td>2.00 bps</td>" in text
     entries = [f.slippage_bps for f in log.fills if f.side == "buy"]  # every trade is long
     assert f"<td>entry</td><td>4</td><td>{sum(entries) / 4:.2f} bps</td>" in text
     assert "<td>stop exit</td><td>2</td>" in text and "<td>market exit</td><td>1</td>" in text

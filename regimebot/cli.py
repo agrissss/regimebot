@@ -339,8 +339,9 @@ def backtest_run(
             "run `regimebot data download` for the warm-up history"
         )
     if holes := [e.detail for e in events if e.kind == "funding_missing"]:
+        more = f" (+{len(holes) - 1} more, see risk events)" if len(holes) > 1 else ""
         typer.echo(
-            f"warning: funding missing, not charged there ({'; '.join(holes)}): "
+            f"warning: funding missing, not charged there ({holes[0]}{more}): "
             "run `regimebot data download` for the funding history"
         )
     typer.echo(f"run {run_id}")
