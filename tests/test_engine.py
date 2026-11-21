@@ -126,6 +126,26 @@ def test_entry_without_liquidity_is_cancelled_and_the_symbol_is_free_again(
     assert rules(engine)[-1] == (1, "ok")
 
 
+def test_an_entry_not_filled_before_the_next_decision_expires(tmp_path: Path) -> None:
+    engine = make(tmp_path, Scripted("trend"))
+    decide(engine, T1, {BTC: 100.0})  # queued, but no bar arrives (feed gap)
+    decide(engine, T2, {BTC: 100.0})
+    assert rules(engine) == [(0, "ok"), (0, "expired"), (1, "ok")]  # T2 signals afresh
+    assert engine.log.decisions[1][1] == T2
+
+
+@pytest.mark.parametrize(("delay", "fills"), [(D - MINUTE, True), (D, False), (2 * D, False)])
+def test_a_fill_offered_at_or_after_the_next_decision_close_expires(
+    tmp_path: Path, delay: timedelta, fills: bool
+) -> None:
+    engine = make(tmp_path, Scripted("trend"))
+    decide(engine, T1, {BTC: 100.0})
+    engine.fill_queued(BTC, T1 + delay, 100.0, 100.0, 1e6)
+    assert (BTC in engine.portfolio.positions) == fills
+    assert rules(engine) == ([(0, "ok")] if fills else [(0, "ok"), (0, "expired")])
+    assert engine.is_active(BTC) == fills  # an expired entry frees the symbol
+
+
 def test_strategy_returning_another_bars_signal_is_an_error(tmp_path: Path) -> None:
     class Stale(Scripted):
         def generate(self, symbol: str, window: pd.DataFrame, regime: Regime) -> Signal | None:
@@ -260,9 +280,7 @@ def test_kill_switch_cancels_an_entry_still_queued(tmp_path: Path) -> None:
     assert engine.log.fills == [] and engine.portfolio.positions == {}
 
 
-def test_playbook_decides_which_strategies_run_and_strategy_order_breaks_ties(
-    tmp_path: Path,
-) -> None:
+def test_playbook_decides_which_strategies_run(tmp_path: Path) -> None:
     always = [Scripted("mean_reversion"), Scripted("breakout"), Scripted("trend")]
     engine = make(tmp_path, *always, symbols=(BTC, ETH, SOL))
     engine.on_decision(
@@ -273,12 +291,32 @@ def test_playbook_decides_which_strategies_run_and_strategy_order_breaks_ties(
             SOL: window(T1, 100.0, Regime.NO_TRADE),  # []
         },
     )
-    # mean_reversion fires first in strategy order but is not allowed in TREND_UP; of the
-    # allowed two, breakout comes first in strategy (config) order.
+    # mean_reversion always fires but is not allowed in TREND_UP or NO_TRADE; of the two
+    # allowed in TREND_UP, trend is first in the playbook (engine list order does not matter).
     assert [(s.symbol, s.strategy) for s in engine.log.signals] == [
-        (BTC, "breakout"),
+        (BTC, "trend"),
         (ETH, "mean_reversion"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("order", "winner"), [(["trend", "breakout"], "trend"), (["breakout", "trend"], "breakout")]
+)
+def test_the_playbooks_order_picks_between_strategies_that_both_fire(
+    tmp_path: Path, order: list[str], winner: str
+) -> None:
+    playbook = {"strategies": order, "size_mult": 1.0, "allow_entries": True, "force_close": False}
+    engine = make(
+        tmp_path, Scripted("trend"), Scripted("breakout"), overrides={"playbook.trend_up": playbook}
+    )
+    decide(engine, T1, {BTC: 100.0})
+    assert [s.strategy for s in engine.log.signals] == [winner]
+
+
+def test_a_playbook_strategy_without_an_instance_is_skipped(tmp_path: Path) -> None:
+    engine = make(tmp_path, Scripted("breakout"))  # trend disabled: not built
+    decide(engine, T1, {BTC: 100.0})  # TREND_UP: [trend, breakout]
+    assert [s.strategy for s in engine.log.signals] == ["breakout"]
 
 
 def test_entries_in_one_bar_share_the_group_and_gross_caps(tmp_path: Path) -> None:
@@ -357,3 +395,10 @@ def test_flatten_all_closes_at_worst_case_impact_and_cancels_queued_entries(
     assert engine.portfolio.positions == {} and not engine.is_active(ETH)
     assert engine.log.equity == [(T1, engine.portfolio.cash, 0.0, engine.portfolio.drawdown)]
     assert engine.portfolio.cash == approx(10_000 + trade.net_pnl)
+
+
+def test_flatten_all_keeps_the_reason_of_an_exit_already_queued(tmp_path: Path) -> None:
+    engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(engine, T2, {BTC: 100.0})  # TIME exit queued, flatten comes before it fills
+    engine.flatten_all(T2, {BTC: 100.0}, ExitReason.END_OF_DATA)
+    assert [t.exit_reason for t in engine.log.trades] == [ExitReason.TIME]

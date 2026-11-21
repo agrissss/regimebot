@@ -13,12 +13,12 @@ and state built from earlier events. Orders it queues fill no earlier than the n
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import structlog
 
-from regimebot.config import AppConfig
+from regimebot.config import AppConfig, timeframe_minutes
 from regimebot.engine.portfolio import Portfolio, Position
 from regimebot.engine.rules import stop_reason, trailed_stop
 from regimebot.execution.fill_model import market_fill, quote_from_bar_open, stop_fill, target_fill
@@ -96,7 +96,8 @@ class Engine:
     """Regimes, signals, risk, fills and trades for ``cfg.exchange.symbols``.
 
     At most one position or queued order per symbol. A queued exit takes the whole position;
-    a queued entry fills once, possibly cut by the participation cap.
+    a queued entry fills once, possibly cut by the participation cap, and only before the next
+    decision. ``strategies`` are looked up by name in each regime's playbook order.
     """
 
     def __init__(
@@ -108,7 +109,10 @@ class Engine:
         log: RunLog,
     ) -> None:
         self.cfg = cfg
-        self.strategies = list(strategies)
+        self.strategies = {s.name: s for s in strategies}
+        if len(self.strategies) != len(strategies):
+            raise ValueError(f"duplicate strategy names in {[s.name for s in strategies]}")
+        self._decision_width = timedelta(minutes=timeframe_minutes(cfg.exchange.decision_timeframe))
         self.risk = risk
         self.portfolio = portfolio
         self.log = log
@@ -160,6 +164,9 @@ class Engine:
             for symbol in list(self._entries):
                 self._cancel_entry(symbol, ts, "kill_switch", f"halted: {self.risk.halted_reason}")
         else:
+            for symbol, entry in list(self._entries.items()):
+                if entry.signal.ts < ts:  # never offered a fill (no bars since its decision)
+                    self._cancel_entry(symbol, ts, "expired", f"not filled since {entry.signal.ts}")
             self._look_for_entries(ts, windows, rows, regimes)
         self._snapshot(ts)
 
@@ -210,13 +217,14 @@ class Engine:
 
         Each exit is a taker fill on ``quote_from_bar_open(price)`` at full participation
         (``bar_volume=0``: no volume information, so the worst bounded impact), stamped ``ts``.
-        The equity snapshot at ``ts`` is replaced by the flat one."""
+        A position with an exit already queued keeps that exit's reason. The equity snapshot at
+        ``ts`` is replaced by the flat one."""
         for symbol in list(self._entries):
             self._cancel_entry(symbol, ts, "cancelled", f"flatten_all: {reason}")
         for symbol, position in list(self.portfolio.positions.items()):
             bid, ask = quote_from_bar_open(prices[symbol], self.cfg.costs)
             fill = self._exit_fill(position, ts, bid, ask, prices[symbol], bar_volume=0.0)
-            self._close(fill, reason)
+            self._close(fill, self._exits.get(symbol, reason))
         self._exits.clear()
         self._snapshot(ts)
 
@@ -267,7 +275,7 @@ class Engine:
         regimes: Mapping[str, Regime],
     ) -> None:
         """Step 5, in configured symbol order: the first signal from the strategies the regime's
-        playbook allows (in strategy order) goes to risk, with queued entries as ``pending``."""
+        playbook allows (in playbook order) goes to risk, with queued entries as ``pending``."""
         for symbol in self.cfg.exchange.symbols:
             if symbol not in rows or self.is_active(symbol):
                 continue
@@ -288,8 +296,11 @@ class Engine:
     def _first_signal(
         self, symbol: str, window: pd.DataFrame, regime: Regime, allowed: Sequence[str]
     ) -> Signal | None:
-        for strategy in self.strategies:
-            if strategy.name not in allowed:
+        """First signal of the playbook's strategies, in the playbook's order (its priority);
+        a listed strategy that is disabled in the config is skipped."""
+        for name in allowed:
+            strategy = self.strategies.get(name)
+            if strategy is None:
                 continue
             signal = strategy.generate(symbol, window, regime)
             if signal is None:
@@ -308,6 +319,9 @@ class Engine:
         self, entry: _QueuedEntry, ts: datetime, bid: float, ask: float, bar_volume: float
     ) -> None:
         signal = entry.signal
+        if ts >= signal.ts + self._decision_width:  # the next decision has passed: stale signal
+            self._reject(entry, ts, "expired", f"first fill offered at {ts}, signal at {signal.ts}")
+            return
         fill = market_fill(
             signal.symbol,
             ts,
@@ -323,15 +337,16 @@ class Engine:
         if fill is None or fill.qty * fill.price < MIN_NOTIONAL:
             why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
             detail = f"{why} at bar volume {bar_volume}, min notional {MIN_NOTIONAL}"
-            self.log.decisions.append(
-                (entry.signal_index, ts, RiskDecision(False, 0.0, "no_liquidity", detail))
-            )
+            self._reject(entry, ts, "no_liquidity", detail)
             return
         self.portfolio.open(signal, fill)
         self.log.fills.append(fill)
 
     def _cancel_entry(self, symbol: str, ts: datetime, rule: str, detail: str) -> None:
-        entry = self._entries.pop(symbol)
+        self._reject(self._entries.pop(symbol), ts, rule, detail)
+
+    def _reject(self, entry: _QueuedEntry, ts: datetime, rule: str, detail: str) -> None:
+        """Record that an approved entry will not fill: a second decision for its signal."""
         self.log.decisions.append((entry.signal_index, ts, RiskDecision(False, 0.0, rule, detail)))
 
     def _exit_fill(

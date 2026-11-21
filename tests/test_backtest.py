@@ -29,7 +29,7 @@ from regimebot.backtest.runner import BacktestResult, persist_result, run_backte
 from regimebot.cli import app
 from regimebot.config import AppConfig, load_config
 from regimebot.db import repo
-from regimebot.db.models import Base, RiskDecisionRow, Run, SignalRow
+from regimebot.db.models import Base, RiskDecisionRow, RiskEventRow, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.types import ExitReason, OrderSide, Regime
 
@@ -159,6 +159,37 @@ def test_symbols_are_replayed_together_in_time_order(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("with_eth", "expired_at"),
+    [(False, 30 * MINUTE), (True, 15 * MINUTE)],
+    ids=["fill_after_gap", "decision_in_gap"],
+)
+def test_an_entry_signalled_before_a_gap_in_base_bars_expires(
+    tmp_path: Path, with_eth: bool, expired_at: timedelta
+) -> None:
+    # BTC has no bars for 30 minutes after the signal at t. Alone, the first fill it is offered
+    # opens at t + 30m, two decision bars late; next to ETH, the ETH decision at t + 15m comes
+    # first. Either way the stale signal must not fill.
+    t = T0 + HOUR
+    btc = flat(240)
+    btc = btc[(btc.index <= t) | (btc.index > t + 30 * MINUTE)]
+    candles = {BTC: btc, ETH: flat(240)} if with_eth else {BTC: btc}
+    result = run_backtest(
+        open_cfg(tuple(candles)),
+        candles,
+        {},
+        T0,
+        T0 + 4 * HOUR,
+        tmp_path / "KILL",
+        strategies=[Scripted("breakout", at={t})],
+    )
+    btc_decisions = [
+        (ts, d.rule) for i, ts, d in result.log.decisions if result.log.signals[i].symbol == BTC
+    ]
+    assert btc_decisions == [(t, "ok"), (t + expired_at, "expired")]
+    assert [f.symbol for f in result.log.fills if f.symbol == BTC] == []
+
+
 def funding_at(*stamps_and_rates: tuple[datetime, float]) -> pd.Series:
     stamps, rates = zip(*stamps_and_rates, strict=True)
     return pd.Series(rates, index=pd.DatetimeIndex(stamps, name="ts"), name="rate")
@@ -197,8 +228,8 @@ def test_a_position_stopped_in_the_bar_closing_at_a_funding_time_pays_none(
 # --- real strategies on random data -----------------------------------------------------------
 
 DAYS = 20
-# 7 minutes after the 07:30 decision that enters ETH (open until 10:37): see test_no_look_ahead
-CUT = datetime(2024, 1, 13, 7, 37, tzinfo=UTC)
+# close of the fill bar of the 07:30 decision that enters ETH (open until 10:37)
+CUT = datetime(2024, 1, 13, 7, 31, tzinfo=UTC)
 
 
 def walk_inputs(seed: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
@@ -261,12 +292,12 @@ def replace_after(df: pd.DataFrame, cut: datetime, seed: int) -> pd.DataFrame:
 def test_no_look_ahead_end_to_end(tmp_path: Path, walk: BacktestResult) -> None:
     """Replacing everything after CUT (bars and funding) leaves every record up to CUT intact.
 
-    CUT sits where a leak would show first: just after a decision that queued an entry, while
-    that position is open. It is 7 minutes into the decision interval because an order queued
-    at a decision close D fills at the open of the bar closing at D + 1m and is stamped D: with
-    CUT on a decision close, that one fill would legitimately read a bar closing after CUT.
+    CUT sits where a leak would show first: just after a decision D that queued an entry, while
+    that position is open. It is D + 1m, the close of the bar the entry fills on: an order
+    queued at D fills at that bar's open and is stamped D, so with CUT = D that one fill would
+    legitimately read a bar closing after CUT. Every later bar is replaced.
     """
-    assert any(f.ts == CUT - 7 * MINUTE for f in walk.log.fills)
+    assert any(f.ts == CUT - MINUTE for f in walk.log.fills)
     assert any(t.entry_ts < CUT < t.exit_ts for t in walk.trades)
     candles, funding = walk_inputs(seed=1)
     candles = {s: replace_after(df, CUT, seed=99 + i) for i, (s, df) in enumerate(candles.items())}
@@ -349,4 +380,16 @@ def test_cli_backtest_run_persists_a_run(tmp_path: Path, monkeypatch: pytest.Mon
         equity = repo.load_equity(session, run.id)
     assert equity.index[0] == pd.Timestamp("2024-01-02", tz="UTC")
     assert equity.index[-1] < pd.Timestamp("2024-01-04", tz="UTC")
+    assert "halted at" not in result.output
+
+    # Short feature windows so 3 days of data trade; any entry fee then breaches the drawdown.
+    short = ["features.ema_slow=48", "features.ema_fast=12", "features.pctile_window=96"]
+    short += ["features.rv_window=24", "risk.max_drawdown=0.000001"]
+    halted = CliRunner().invoke(app, [*args, *(a for kv in short for a in ("--set", kv))])
+    assert halted.exit_code == 0, halted.output
+    with session_scope(engine) as session:
+        halt_ts, detail = session.execute(
+            select(RiskEventRow.ts, RiskEventRow.detail).where(RiskEventRow.kind == "max_drawdown")
+        ).one()
+    assert f"halted at {halt_ts.isoformat()}: max_drawdown ({detail})" in halted.output
     engine.dispose()

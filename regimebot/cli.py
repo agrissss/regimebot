@@ -244,6 +244,13 @@ def backtest_run(
         f"final_equity={final:.2f} return={final / bt.initial_equity - 1:+.2%} "
         f"max_drawdown={max_dd:.2%}"
     )
+    # these halts clear only by hand, so the run opened nothing after them
+    sticky = ("max_drawdown", "manual_kill")
+    events = result.log.risk_events
+    if halt := next((e for e in events if e.action == "halt" and e.kind in sticky), None):
+        typer.echo(
+            f"halted at {halt.ts.isoformat()}: {halt.kind} ({halt.detail}), no entries after"
+        )
     typer.echo(f"run {run_id}")
 
 
