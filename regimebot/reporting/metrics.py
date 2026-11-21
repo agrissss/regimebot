@@ -6,19 +6,34 @@ prints NaN as "n/a". Daily statistics use the last equity value of each UTC day.
 
 import math
 import statistics
-from collections.abc import Sequence
+from collections import Counter, defaultdict, deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from regimebot.risk.manager import PERMANENT_HALTS
-from regimebot.types import ExitReason, Fill, RiskEvent, Trade, entry_order_side, exit_order_side
+from regimebot.types import (
+    ExitReason,
+    Fill,
+    RiskDecision,
+    RiskEvent,
+    Trade,
+    entry_order_side,
+    exit_order_side,
+)
 
 DAYS_PER_YEAR = 365  # crypto trades every day
 BEST_TRADES_DROPPED = 0.05
 _FLAT_STD = 1e-12  # a deviation below this is rounding noise, not risk
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_MIN_TRADES = 20  # fewer trades: no interval (n/a)
+RR_REL_TOL = 1e-9  # a trade filled exactly at its signal's reward-to-risk must not fail by rounding
+# Rules of the second decision that cancels an approved entry before it fills (engine.loop).
+CANCEL_RULES = ("no_liquidity", "expired", "gapped_through_stop", "cancelled", "kill_switch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +76,16 @@ def daily_equity(equity: pd.Series) -> pd.Series:
         return pd.Series(dtype=float)
     days = pd.DatetimeIndex(equity.index).tz_convert("UTC").normalize()
     return equity.groupby(days).last()
+
+
+def daily_pnl(equity: pd.Series, initial_equity: float) -> pd.Series:
+    """Change of the last equity value of each UTC day from the day before (the first day from
+    ``initial_equity``)."""
+    daily = daily_equity(equity)
+    pnl = daily.diff()
+    if len(daily):
+        pnl.iloc[0] = daily.iloc[0] - initial_equity
+    return pnl
 
 
 def daily_returns(equity: pd.Series) -> pd.Series:
@@ -194,8 +219,164 @@ def compute_metrics(
     )
 
 
+def expectancy_ci(r_multiples: Sequence[float], seed: int = 0) -> tuple[float, float]:
+    """95% bootstrap interval of the mean R per trade: the 2.5th and 97.5th percentiles of the
+    means of ``BOOTSTRAP_RESAMPLES`` resamples of the trades with replacement (seeded, so a
+    report is reproducible). (NaN, NaN) under ``BOOTSTRAP_MIN_TRADES`` trades."""
+    r = np.asarray(r_multiples, dtype=float)
+    if len(r) < BOOTSTRAP_MIN_TRADES:
+        return math.nan, math.nan
+    rng = np.random.default_rng(seed)
+    means = [rng.choice(r, len(r)).mean() for _ in range(BOOTSTRAP_RESAMPLES)]
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def reward_to_risk_at_fill(trade: Trade) -> float:
+    """|target - entry_price| / |entry_price - initial_stop|: the reward-to-risk the trade had at
+    its actual entry fill, not at the decision close its signal was built on."""
+    return abs(trade.target - trade.entry_price) / abs(trade.entry_price - trade.initial_stop)
+
+
+def meets_min_rr(trade: Trade, min_rr: float) -> bool:
+    """True when the reward-to-risk at the entry fill reaches ``min_rr`` (within rounding)."""
+    return reward_to_risk_at_fill(trade) >= min_rr * (1 - RR_REL_TOL)
+
+
+def strategy_quality(trades: Sequence[Trade], min_rr: Mapping[str, float]) -> pd.DataFrame:
+    """Per strategy: ``target_hit_rate`` (share of exits at the target; mean reversion's target
+    is not a 5% move, so one number over all strategies misleads) and ``met_min_rr`` (share of
+    trades that met the strategy's ``min_rr`` at the actual entry fill; NaN for a strategy not in
+    ``min_rr``). Indexed by strategy, sorted."""
+    rows: dict[str, list[Trade]] = defaultdict(list)
+    for t in trades:
+        rows[t.strategy].append(t)
+    out = pd.DataFrame(
+        {
+            "target_hit_rate": {
+                s: float(np.mean([t.exit_reason == ExitReason.TARGET for t in ts]))
+                for s, ts in rows.items()
+            },
+            "met_min_rr": {
+                s: float(np.mean([meets_min_rr(t, min_rr[s]) for t in ts]))
+                if s in min_rr
+                else math.nan
+                for s, ts in rows.items()
+            },
+        },
+        columns=["target_hit_rate", "met_min_rr"],
+        dtype=float,
+    )
+    out.index.name = "strategy"
+    return out.sort_index()
+
+
+def largest_market_moves(
+    closes: pd.DataFrame, equity: pd.Series, initial_equity: float, n: int = 10
+) -> pd.DataFrame:
+    """The ``n`` UTC days of ``equity`` (the active period) with the largest absolute
+    equal-weight average daily return of the symbols, largest first: ``market_return`` (mean
+    over the symbols of the change of each one's last decision close of the day from the day
+    before; ``closes`` has one column per symbol and should start before the period, so its
+    first day has a return) and ``strategy_pnl`` (``daily_pnl``). Indexed by date."""
+    pnl = daily_pnl(equity, initial_equity)
+    days = pd.DatetimeIndex(closes.index).tz_convert("UTC").normalize()
+    market = closes.groupby(days).last().pct_change().mean(axis=1).reindex(pnl.index).dropna()
+    top = market.abs().sort_values(ascending=False, kind="stable").index[:n]
+    out = pd.DataFrame({"market_return": market[top], "strategy_pnl": pnl[top]})
+    out.index.name = "date"
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionQuality:
+    """How a run's simulated fills went. Lags are seconds from the signal (decision close) to
+    the entry fill; slippage is bps against the fill's reference price (positive = worse) by
+    fill type; the spread is (ask - bid) / mid in bps over the fills that recorded a quote."""
+
+    n_fills: int
+    entry_lag_median_s: float
+    entry_lag_p95_s: float
+    slippage_bps: dict[str, tuple[int, float]]  # fill type -> (fills, mean slippage)
+    avg_spread_bps: float
+    cancelled: dict[str, int]  # every rule in CANCEL_RULES -> approved entries it cancelled
+
+
+FILL_TYPES = ("entry", "stop exit", "target exit", "market exit")
+_EXIT_TYPES = {
+    ExitReason.STOP: "stop exit",
+    ExitReason.TRAIL: "stop exit",
+    ExitReason.TARGET: "target exit",
+}  # every other reason (time, regime, kill, end of data) exits at market
+
+
+def _fill_types(trades: Sequence[Trade]) -> dict[tuple[str, datetime, str], deque[str]]:
+    """The type of each closed trade's fills, queued per (symbol, ts, order side) in event order:
+    at one timestamp an exit comes before an entry (a stop in the bar closing at T, then the fill
+    of the decision at T), so a key both share is told apart by the order fills were logged."""
+    events = []
+    for t in trades:
+        exit_type = _EXIT_TYPES.get(t.exit_reason, "market exit")
+        events.append(
+            (t.exit_ts, 0, (t.symbol, t.exit_ts, str(exit_order_side(t.side))), exit_type)
+        )
+        events.append(
+            (t.entry_ts, 1, (t.symbol, t.entry_ts, str(entry_order_side(t.side))), "entry")
+        )
+    queues: dict[tuple[str, datetime, str], deque[str]] = defaultdict(deque)
+    for _, _, key, kind in sorted(events, key=lambda e: (e[0], e[1])):
+        queues[key].append(kind)
+    return queues
+
+
+def execution_quality(
+    fills: Sequence[Fill],
+    trades: Sequence[Trade],
+    signals: Mapping[int, tuple[str, datetime]],
+    decisions: Sequence[tuple[int | None, datetime, RiskDecision]],
+) -> ExecutionQuality:
+    """``ExecutionQuality`` of a run from its fills (in time order), closed trades, signals (row
+    id -> symbol, ts) and risk decisions (signal id, ts, decision) in stored order. A fill that
+    is no closed trade's is an open position's entry (every exit closes a trade). An entry's
+    signal is the latest approved signal of its symbol at or before the fill (one order per
+    symbol at a time, so it is the one that queued it). A cancellation is a rejection, with a
+    ``CANCEL_RULES`` rule, of a signal approved before."""
+    approved_ids = [sid for sid, _, d in decisions if d.approved and sid is not None]
+    approved: dict[str, list[datetime]] = defaultdict(list)
+    for sid in approved_ids:
+        symbol, ts = signals[sid]
+        approved[symbol].append(ts)
+    queues, lags = _fill_types(trades), []
+    by_type: dict[str, list[float]] = defaultdict(list)
+    for f in fills:
+        queue = queues.get((f.symbol, f.ts, str(f.side)))
+        kind = queue.popleft() if queue else "entry"
+        by_type[kind].append(f.slippage_bps)
+        if kind == "entry":
+            before = [ts for ts in approved[f.symbol] if ts <= f.ts]
+            if before:
+                lags.append((f.ts - max(before)).total_seconds())
+    spreads = [
+        (f.ask - f.bid) / ((f.ask + f.bid) / 2) * 1e4
+        for f in fills
+        if f.bid is not None and f.ask is not None
+    ]
+    seen_approved, cancelled = set(approved_ids), Counter[str]()
+    for signal_id, _, d in decisions:
+        if not d.approved and signal_id in seen_approved and d.rule in CANCEL_RULES:
+            cancelled[d.rule] += 1
+    return ExecutionQuality(
+        n_fills=len(fills),
+        entry_lag_median_s=float(np.median(lags)) if lags else math.nan,
+        entry_lag_p95_s=float(np.percentile(lags, 95)) if lags else math.nan,
+        slippage_bps={k: (len(v), _mean(v)) for k in FILL_TYPES if (v := by_type.get(k))},
+        avg_spread_bps=_mean(spreads),
+        cancelled={rule: cancelled[rule] for rule in CANCEL_RULES},
+    )
+
+
 def breakdown(
-    trades: Sequence[Trade], by: Literal["regime", "symbol", "strategy", "exit_reason"]
+    trades: Sequence[Trade], by: Literal["regime", "symbol", "strategy", "exit_reason", "side"]
 ) -> pd.DataFrame:
     """Per-group trade count, win rate, net pnl and mean R, indexed by the group value."""
     columns = ["n", "win_rate", "net_pnl", "expectancy_r"]

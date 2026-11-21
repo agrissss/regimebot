@@ -32,7 +32,8 @@ class Baselines:
 
     ``buy_and_hold`` covers the strategy's active period (up to a permanent halt), and
     ``buy_and_hold_full`` the whole backtest. ``random_entry`` holds one result per seed, all run
-    with the calibrated entry probability ``random_p``.
+    with the calibrated entry probability ``random_p``. ``closes`` are the market itself: every
+    symbol's decision-bar closes (one column each) over the loaded history.
     """
 
     buy_and_hold: pd.Series | None = None
@@ -41,6 +42,7 @@ class Baselines:
     random_seeds: tuple[int, ...] = ()
     random_p: float | None = None
     reference_signals: int | None = None
+    closes: pd.DataFrame | None = None
 
 
 def buy_and_hold(
@@ -198,7 +200,8 @@ def compute_baselines(
             seed=seeds[0],
         )
         runs = tuple(random_entry(cfg, candles, funding, result.start, end, s, p=p) for s in seeds)
-    return Baselines(active, full, runs, seeds, p, n_signals)
+    closes = pd.DataFrame({s: df["close"] for s, df in decision.items()})
+    return Baselines(active, full, runs, seeds, p, n_signals, closes)
 
 
 def _hold_until(window: Mapping[str, pd.DataFrame], cut: pd.Timestamp, cfg: AppConfig) -> pd.Series:

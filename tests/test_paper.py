@@ -31,9 +31,11 @@ from sqlalchemy.orm import Session
 from synth import BTC, ETH, MINUTE, T0, Scripted, candles_from_closes, regime_walk
 from typer.testing import CliRunner
 
+from regimebot.backtest.baselines import buy_and_hold
 from regimebot.backtest.runner import decision_features, run_backtest
 from regimebot.cli import app
 from regimebot.config import AppConfig, load_config
+from regimebot.data.resample import resample
 from regimebot.db import repo
 from regimebot.db.models import Base, OpenPosition, RegimeRow, RiskDecisionRow, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope
@@ -1039,6 +1041,57 @@ def cli_rig(tmp_path: Path, db: Database) -> Rig:
     rig = make_rig(tmp_path)
     rig.db = db
     return rig
+
+
+def test_cli_report_of_a_paper_run_shows_its_period_baseline_and_execution_quality(
+    tmp_path: Path, cli_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+    session = rig.session()
+    run_id = session.start()
+    rig.poll(session, END, every=EVERY_5M)
+    session.close()  # stopped but open: an open run can be reported at any time
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_id)])
+    assert result.exit_code == 0, result.output
+    out = tmp_path / "reports" / f"run_{run_id}"
+    for name in ("trades.csv", "daily_pnl.csv", "equity.png", "drawdown.png"):
+        assert (out / name).stat().st_size > 0
+    text = (out / "report.html").read_text("utf-8")
+    assert "<h1>regimebot paper trading report</h1>" in text
+    assert "PAPER TRADING RUN (simulated fills on live data)" in text
+    assert f"Paper run period: {START.isoformat()} to {END.isoformat()}" in text
+    # buy and hold over the run's own decisions is the only baseline
+    candles, _ = market()
+    closes = {s: resample(df, "1m", "15m") for s, df in candles.items()}
+    held = buy_and_hold(
+        {s: df[(df.index >= START) & (df.index <= END)] for s, df in closes.items()},
+        10_000.0,
+        rig.cfg.costs,
+    )
+    log = session.log
+    net = sum(t.net_pnl for t in log.trades)
+    row = f"<td>Net P&amp;L</td><td>{net:,.2f}</td><td>{held.iloc[-1] - 10_000:,.2f}</td>"
+    assert row + "<td>n/a: backtest only</td>" in text
+    assert "Random entry: n/a: backtest only" in text and "Random seed" not in text
+    # execution quality: 4 trades; entries fill LAG after their decision at the live quote
+    assert len(log.fills) == 8 and [t.exit_reason for t in log.trades] == [
+        ExitReason.STOP,
+        ExitReason.TARGET,
+        ExitReason.TRAIL,
+        ExitReason.TIME,
+    ]
+    assert "<td>Fills</td><td>8</td>" in text
+    assert "<td>Decision-to-fill lag of entries, median</td><td>3.00 s</td>" in text
+    assert "<td>Decision-to-fill lag of entries, 95th percentile</td><td>3.00 s</td>" in text
+    # every taker fill was priced from a quote 2 x 1 bp wide (live or modelled); targets have none
+    assert "<td>Average quoted spread at fill (fills with a quote)</td><td>2.00 bps</td>" in text
+    entries = [f.slippage_bps for f in log.fills if f.side == "buy"]  # every trade is long
+    assert f"<td>entry</td><td>4</td><td>{sum(entries) / 4:.2f} bps</td>" in text
+    assert "<td>stop exit</td><td>2</td>" in text and "<td>market exit</td><td>1</td>" in text
+    assert "<td>target exit</td><td>1</td><td>0.00 bps</td>" in text
+    for rule in ("no_liquidity", "expired", "gapped_through_stop", "cancelled", "kill_switch"):
+        assert f"<td>{rule}</td><td>0</td>" in text
 
 
 def test_cli_paper_status_shows_the_latest_paper_run_and_its_liveness(

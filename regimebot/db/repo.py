@@ -439,6 +439,25 @@ def save_signals(session: Session, run_id: int, signals: Sequence[Signal]) -> li
     return ids
 
 
+def load_signal_stamps(session: Session, run_id: int) -> dict[int, tuple[str, datetime]]:
+    """A run's signals as row id -> (symbol, ts), the link ``risk_decisions.signal_id`` uses."""
+    stmt = select(SignalRow.id, SignalRow.symbol, SignalRow.ts).where(SignalRow.run_id == run_id)
+    return {sid: (symbol, ts) for sid, symbol, ts in session.execute(stmt)}
+
+
+def load_risk_decisions(
+    session: Session, run_id: int
+) -> list[tuple[int | None, datetime, RiskDecision]]:
+    """A run's risk decisions as ``(signal_id, ts, RiskDecision)`` in insertion order."""
+    stmt = (
+        select(RiskDecisionRow).where(RiskDecisionRow.run_id == run_id).order_by(RiskDecisionRow.id)
+    )
+    return [
+        (r.signal_id, r.ts, RiskDecision(r.approved, r.qty, r.rule, r.detail))
+        for r in session.scalars(stmt)
+    ]
+
+
 def save_risk_decisions(
     session: Session, run_id: int, decisions: Sequence[tuple[int | None, datetime, RiskDecision]]
 ) -> None:

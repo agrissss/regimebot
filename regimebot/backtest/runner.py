@@ -280,8 +280,11 @@ def persist_result(session: Session, result: BacktestResult, note: str = "") -> 
 
 
 def load_result(session: Session, run_id: int, cfg: AppConfig) -> BacktestResult:
-    """Rebuild stored backtest ``run_id`` (its run config ``cfg``) from what ``persist_result``
-    wrote: trades, fills, risk events and equity snapshots (not signals or decisions)."""
+    """Rebuild stored run ``run_id`` (its run config ``cfg``) from what ``persist_result`` (or a
+    paper session) wrote: trades, fills, risk events and equity snapshots (not signals or
+    decisions). A backtest covers its configured period. A paper run covers its first equity
+    snapshot (its start before any) to its last, open or not; decisions are in ``[start, end)``,
+    so ``end`` is one microsecond after the last snapshot."""
     trades = repo.load_trades(session, run_id)
     snapshots = repo.load_equity_snapshots(session, run_id)
     log = RunLog(
@@ -291,4 +294,8 @@ def load_result(session: Session, run_id: int, cfg: AppConfig) -> BacktestResult
         equity=snapshots,
     )
     equity = _snapshot_series(snapshots, 1, "equity")
-    return BacktestResult(log, trades, equity, cfg, cfg.backtest.start, cfg.backtest.end)
+    start, end = cfg.backtest.start, cfg.backtest.end
+    if (run := repo.load_run(session, run_id)).mode == Mode.PAPER:
+        first, last = (snapshots[0][0], snapshots[-1][0]) if snapshots else (run.started_at,) * 2
+        start, end = first, last + timedelta(microseconds=1)
+    return BacktestResult(log, trades, equity, cfg, start, end)

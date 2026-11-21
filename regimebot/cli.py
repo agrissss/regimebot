@@ -16,9 +16,9 @@ import yaml
 from pydantic import ValidationError
 from sqlalchemy import Engine
 
-from regimebot.backtest.baselines import compute_baselines
+from regimebot.backtest.baselines import Baselines, compute_baselines
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
-from regimebot.backtest.runner import load_result, persist_result, run_backtest
+from regimebot.backtest.runner import BacktestResult, load_result, persist_result, run_backtest
 from regimebot.backtest.walk_forward import walk_forward
 from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
@@ -44,9 +44,10 @@ from regimebot.paper.state import (
     latest_status,
     lock_run,
 )
-from regimebot.reporting.metrics import compute_metrics, first_permanent_halt
+from regimebot.reporting.metrics import compute_metrics, execution_quality, first_permanent_halt
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
+from regimebot.types import Mode
 
 app = typer.Typer(help="Regime-aware crypto trading research system.", no_args_is_help=True)
 
@@ -399,8 +400,8 @@ def backtest_robustness(
     end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
     set_: _SetOption = None,
 ) -> None:
-    """Parameter sensitivity, doubled costs, and effective leverage (gross and group caps) 1.0
-    vs 1.5."""
+    """Parameter sensitivity, costs x0.5 / x1 / x2, and effective leverage (gross and group caps)
+    1.0 vs 1.5."""
     out = Path("reports")
     out.mkdir(parents=True, exist_ok=True)  # before the long computation, so it fails fast
     cfg, candles, funding = _research_inputs(start, end, set_)
@@ -414,6 +415,9 @@ def backtest_robustness(
     _show(leverage_compare(cfg, candles, funding, a, b), out / "leverage_compare.csv")
 
 
+MAX_RANDOM_SEEDS = 50
+
+
 @app.command()
 def report(
     run_id: Annotated[int, typer.Argument(help="Run id printed by `backtest run`.")],
@@ -421,13 +425,20 @@ def report(
         int | None, typer.Option(help="Parameter variants tried before this one (shown).")
     ] = None,
     random_seeds: Annotated[
-        int, typer.Option(min=0, help="Number of random-entry seeds (0, 1, ... N-1); 0 skips.")
+        int,
+        typer.Option(
+            min=0,
+            max=MAX_RANDOM_SEEDS,
+            help="Number of random-entry seeds (0, 1, ... N-1), at most 50; 0 skips. Backtests.",
+        ),
     ] = 3,
 ) -> None:
-    """Rebuild the HTML report for a stored backtest into reports/run_<id>/.
+    """Rebuild the HTML report for a stored run into reports/run_<id>/.
 
     Trades, fills, risk events and equity come from the database; the baselines are recomputed
     from stored candles with the run's stored config (the random-entry rerun takes a minute or two).
+    A paper run, open or ended, gets the same report over its period (first to last equity
+    snapshot) with buy and hold as its only baseline and an execution-quality section.
     """
     database_url = load_config().database_url
     engine = make_engine(database_url)
@@ -436,10 +447,6 @@ def report(
             run = repo.load_run(session, run_id)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from None
-        if run.mode != "backtest":
-            raise typer.BadParameter(
-                f"run {run_id} is a {run.mode} run; only backtests have reports"
-            )
         try:
             cfg = AppConfig.model_validate(
                 json.loads(run.config_json) | {"database_url": database_url}
@@ -449,15 +456,42 @@ def report(
             raise typer.Exit(1) from None
         result = load_result(session, run_id, cfg)
         n_signals = repo.count_signals(session, run_id)
-        base, first, end = cfg.exchange.base_timeframe, history_start(cfg), cfg.backtest.end
+        execution = None
+        first, end = history_start(cfg), cfg.backtest.end
+        if paper := run.mode == Mode.PAPER:
+            signals = repo.load_signal_stamps(session, run_id)
+            decisions = repo.load_risk_decisions(session, run_id)
+            execution = execution_quality(result.log.fills, result.trades, signals, decisions)
+            # a day before the period: its first decision bar, and its first day's market return
+            first, end = result.start - timedelta(days=1), result.end
+        base = cfg.exchange.base_timeframe
         candles = {s: repo.load_candles(session, s, base, first, end) for s in cfg.exchange.symbols}
         funding = {s: repo.load_funding(session, s, first, end) for s in cfg.exchange.symbols}
-    typer.echo("recomputing baselines (buy and hold, random entry) ...")
-    baselines = compute_baselines(
-        result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
-    )
-    path = write_report(result, baselines, Path("reports") / f"run_{run_id}", variants_tried)
+    if paper:
+        baselines = _paper_baselines(result, candles, funding)
+    else:
+        typer.echo("recomputing baselines (buy and hold, random entry) ...")
+        baselines = compute_baselines(
+            result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
+        )
+    out = Path("reports") / f"run_{run_id}"
+    path = write_report(result, baselines, out, variants_tried, execution)
     typer.echo(f"wrote {path}")
+
+
+def _paper_baselines(
+    result: BacktestResult, candles: dict[str, pd.DataFrame], funding: dict[str, pd.Series]
+) -> Baselines:
+    """Buy and hold over a paper run's period (random entry is backtest-only); none, with a
+    note, before its first decision or when a symbol has no stored decision bar in it."""
+    if result.equity.empty:
+        typer.echo("paper run: no decision yet, so no buy-and-hold baseline")
+        return Baselines()
+    try:
+        return compute_baselines(result, candles, funding, 0, seeds=())
+    except ValueError as exc:
+        typer.echo(f"paper run: no buy-and-hold baseline ({exc})")
+        return Baselines()
 
 
 def _say(line: str) -> None:

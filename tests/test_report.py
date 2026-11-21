@@ -17,8 +17,16 @@ from regimebot.config import AppConfig, config_hash, load_config
 from regimebot.db import repo
 from regimebot.db.models import Run
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
-from regimebot.reporting.metrics import active_period, compute_metrics, first_permanent_halt
-from regimebot.reporting.report import RISK_WARNING, write_report
+from regimebot.reporting.metrics import (
+    active_period,
+    breakdown,
+    compute_metrics,
+    expectancy_ci,
+    first_permanent_halt,
+    largest_market_moves,
+    strategy_quality,
+)
+from regimebot.reporting.report import CI_LABEL, RISK_WARNING, write_report
 from regimebot.types import Mode, Regime, RiskEvent, Trade
 
 HEADINGS = [
@@ -28,7 +36,9 @@ HEADINGS = [
     "Breakdown by regime",
     "Breakdown by symbol",
     "Breakdown by strategy",
+    "Breakdown by side",
     "Breakdown by exit reason",
+    "Largest market moves",
     "Slippage: modelled versus realised",
     "Risk-limit events",
     "Result without the best 5% of trades",
@@ -165,6 +175,44 @@ def test_events_always_list_halts_summarise_counts_and_cap_the_rest(
     )  # 50 others: the warm-up and funding events, the escaped event and 47 of these
 
 
+def test_report_adds_side_strategy_quality_market_moves_the_interval_and_seeds_beaten(
+    run: tuple[BacktestResult, Baselines], tmp_path: Path
+) -> None:
+    result, baselines = run
+    text = write_report(result, baselines, tmp_path).read_text("utf-8")
+    initial = result.cfg.backtest.initial_equity
+
+    def active_net(r: BacktestResult) -> float:
+        trades, equity, _ = active_period(r.trades, r.equity, r.log.risk_events)
+        return compute_metrics(trades, equity, initial).net_pnl
+
+    ref, seeds = active_net(result), [active_net(r) for r in baselines.random_entry]
+    beaten, higher = sum(p < ref for p in seeds), sum(p > ref for p in seeds)
+    assert (
+        f"Strategy beat {beaten} of 2 random seeds</strong> on net P&amp;L "
+        f"({higher} had a higher net P&amp;L)"
+    ) in text
+    trades, equity, _ = active_period(result.trades, result.equity, result.log.risk_events)
+    lo, hi = expectancy_ci([t.r_multiple for t in trades])
+    ci = "n/a (under 20 trades)" if math.isnan(lo) else f"{lo:.2f} to {hi:.2f}"
+    assert f"<td>{CI_LABEL}</td><td>{ci}</td><td>n/a</td><td>n/a</td>" in text
+    for side, r in breakdown(result.trades, "side").iterrows():
+        assert (
+            f"<td>{side}</td><td>{int(r.n)}</td>" in text and f"<td>{r.net_pnl:,.2f}</td>" in text
+        )
+    assert "<th>Target hit rate</th><th>Met min reward-to-risk at the entry fill</th>" in text
+    min_rr = {"breakout": 2.5, "trend": 2.5, "mean_reversion": 2.0}
+    hit, met = strategy_quality(result.trades, min_rr).loc["breakout"].tolist()
+    assert f"<td>{hit * 100:.2f}%</td><td>{met * 100:.2f}%</td></tr>" in text
+    assert baselines.closes is not None
+    moves = largest_market_moves(baselines.closes, equity, initial)
+    assert len(moves) >= 1
+    for day, (ret, pnl) in zip(moves.index, moves.to_numpy().tolist(), strict=True):
+        assert (
+            f"<td>{day.date().isoformat()}</td><td>{ret * 100:.2f}%</td><td>{pnl:,.2f}</td>" in text
+        )
+
+
 def test_slippage_table_shows_floor_and_realised_values(
     run: tuple[BacktestResult, Baselines], tmp_path: Path
 ) -> None:
@@ -247,8 +295,14 @@ def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
     leverage = "<td>Max gross leverage seen (gross exposure / equity)</td><td>"
     assert leverage in html_text and leverage + "n/a" not in html_text
     assert runner.invoke(app, ["report", "999"]).exit_code != 0
+    too_many = runner.invoke(app, ["report", str(run.id), "--random-seeds", "51"])
+    assert too_many.exit_code == 2 and "50" in too_many.output  # at most 50 seeds
+    # a paper run is reported too, even open and before its first decision
     with session_scope(engine) as session:
         paper_id = repo.create_run(session, Mode.PAPER, load_config())
-    refused = runner.invoke(app, ["report", str(paper_id)])
-    assert refused.exit_code != 0 and "paper run" in refused.output
+    paper = runner.invoke(app, ["report", str(paper_id)])
+    assert paper.exit_code == 0, paper.output
+    assert "no decision yet, so no buy-and-hold baseline" in paper.output
+    paper_html = (tmp_path / "reports" / f"run_{paper_id}" / "report.html").read_text("utf-8")
+    assert "PAPER TRADING RUN (simulated fills on live data)" in paper_html
     engine.dispose()
