@@ -26,9 +26,12 @@ from regimebot.db import repo
 from regimebot.db.repo import load_candles, load_funding
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.engine.loop import RunLog
+from regimebot.logging import configure_logging
 from regimebot.market_state.features import compute_features
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
+from regimebot.paper.session import PaperSession
+from regimebot.paper.state import latest_status
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
 
@@ -379,3 +382,92 @@ def report(
     )
     path = write_report(result, baselines, Path("reports") / f"run_{run_id}", variants_tried)
     typer.echo(f"wrote {path}")
+
+
+def _say(line: str) -> None:
+    """Human-facing paper-session text goes to stderr: stdout carries the JSON log lines."""
+    typer.echo(line, err=True)
+
+
+paper_app = typer.Typer(
+    help="Paper trading: live market data, simulated fills, no orders.", no_args_is_help=True
+)
+app.add_typer(paper_app, name="paper")
+
+
+@paper_app.command("run")
+def paper_run(
+    resume: Annotated[
+        int | None, typer.Option(help="Continue this open paper run (its id from the banner).")
+    ] = None,
+) -> None:
+    """Paper-trade the configured symbols until Ctrl-C or SIGTERM. Simulated fills only: no
+    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it.
+
+    Logs are JSON lines on stdout; the banner goes to stderr.
+    """
+    cfg = load_config()
+    configure_logging()
+    _say("PAPER TRADING: simulated fills only, no orders are sent to any exchange.")
+    _say(
+        f"warming up {cfg.paper.warmup_bars} {cfg.exchange.decision_timeframe} bars of history ..."
+    )
+    session = PaperSession(
+        cfg, CcxtExchange(cfg.exchange.id), make_engine(cfg.database_url), DEFAULT_KILL_FILE
+    )
+    try:
+        run_id = session.start(resume)
+    except ValueError as exc:  # not a resumable paper run
+        raise typer.BadParameter(str(exc), param_hint="--resume") from None
+    _say(
+        "\n".join(
+            [
+                "=" * 72,
+                "PAPER TRADING - simulated fills only, no orders are sent to any exchange",
+                f"run id:    {run_id} ({'resumed' if resume is not None else 'new'})",
+                f"symbols:   {', '.join(cfg.exchange.symbols)}, polling every "
+                f"{cfg.paper.poll_seconds}s",
+                f"kill file: {DEFAULT_KILL_FILE} (`regimebot kill` flattens and blocks entries)",
+                "stop:      Ctrl-C or SIGTERM (finishes the current poll, positions stay open)",
+                f"resume:    regimebot paper run --resume {run_id}",
+                "=" * 72,
+            ]
+        )
+    )
+    session.run_forever()
+    _say(f"stopped; run {run_id} is open. Resume with: regimebot paper run --resume {run_id}")
+
+
+@paper_app.command("status")
+def paper_status() -> None:
+    """Show the latest paper run: equity, open positions, last regimes, halt, risk events."""
+    engine = make_engine(load_config().database_url)
+    with session_scope(engine) as session:
+        status = latest_status(session)
+    if status is None:
+        typer.echo("no paper runs yet: start one with `regimebot paper run`")
+        return
+    state = (
+        f"open (resume with `regimebot paper run --resume {status.run_id}`)"
+        if status.is_open
+        else "ended"
+    )
+    typer.echo(f"paper run {status.run_id}: {state}, started {status.started_at.isoformat()}")
+    if status.equity is None:
+        typer.echo("equity: no decision yet")
+    else:
+        ts, equity = status.equity
+        typer.echo(f"equity: {equity:.2f} at {ts.isoformat()} (cash {status.cash or 0.0:.2f})")
+    typer.echo(f"halted: {status.halted_reason or 'no'}")
+    typer.echo(f"open positions: {len(status.positions)}")
+    for p in status.positions:
+        typer.echo(
+            f"  {p.symbol} {p.side} qty={p.qty:g} entry={p.entry_price:g} at "
+            f"{p.entry_ts.isoformat()} stop={p.stop:g} target={p.target:g} ({p.strategy})"
+        )
+    typer.echo("last regime:")
+    for symbol, (ts, regime) in status.last_regimes.items():
+        typer.echo(f"  {symbol} {regime} at {ts.isoformat()}")
+    typer.echo(f"last {len(status.risk_events)} risk events:")
+    for e in status.risk_events:
+        typer.echo(f"  {e.ts.isoformat()} {e.kind} -> {e.action}: {e.detail}")

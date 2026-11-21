@@ -1,10 +1,15 @@
 """Test doubles shared across test modules."""
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import ccxt
+import pandas as pd
 
-from regimebot.config import timeframe_minutes
+from regimebot.config import CostsConfig, timeframe_minutes
+from regimebot.data.exchange import CLOSE_GRACE
+from regimebot.execution.fill_model import quote_from_bar_open
 from regimebot.types import Bar, Quote
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -62,3 +67,73 @@ class FakeExchange:
 
     def fetch_quote(self, symbol: str) -> Quote:
         return Quote(symbol, T0, 100.0, 100.1)
+
+
+@dataclass
+class Clock:
+    """A settable clock: tests move ``now`` between polls."""
+
+    now: datetime
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+class ReplayExchange:
+    """A live market replayed from scripted base ``candles`` on a test ``clock``.
+
+    ``fetch_candles`` returns the bars closed at least ``CLOSE_GRACE`` (plus ``lag[symbol]``, a
+    slow feed) before ``clock()``. ``fetch_quote`` prices the bar still forming at ``clock()``
+    exactly as the backtest prices a fill: its open -/+ ``half_spread_bps``. ``fetch_funding``
+    returns the events stamped up to ``clock()``. A ``(method, symbol)`` pair in ``fail`` raises
+    ``ccxt.NetworkError``; ``calls`` records every method called.
+    """
+
+    def __init__(
+        self,
+        candles: Mapping[str, pd.DataFrame],
+        funding: Mapping[str, pd.Series],
+        costs: CostsConfig,
+        clock: Clock,
+    ) -> None:
+        self.candles = candles
+        self.funding = funding
+        self.costs = costs
+        self.clock = clock
+        self.fail: set[tuple[str, str]] = set()
+        self.lag: dict[str, timedelta] = {}
+        self.calls: list[str] = []
+
+    def _call(self, method: str, symbol: str) -> None:
+        self.calls.append(method)
+        if (method, symbol) in self.fail:
+            raise ccxt.NetworkError(f"injected {method} failure for {symbol}")
+
+    def fetch_candles(self, symbol: str, timeframe: str, since: datetime, limit: int) -> list[Bar]:
+        self._call("fetch_candles", symbol)
+        cutoff = self.clock() - CLOSE_GRACE - self.lag.get(symbol, timedelta(0))
+        df = self.candles[symbol]
+        df = df[(df.index >= since) & (df.index <= cutoff)].iloc[:limit]
+        rows = df[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float).tolist()
+        stamps = pd.DatetimeIndex(df.index).to_pydatetime()
+        return [Bar(symbol, ts, *row) for ts, row in zip(stamps, rows, strict=True)]
+
+    def fetch_funding(
+        self, symbol: str, since: datetime, limit: int
+    ) -> list[tuple[datetime, float]]:
+        self._call("fetch_funding", symbol)
+        rates = self.funding.get(symbol)
+        if rates is None:
+            return []
+        rates = rates[(rates.index >= since) & (rates.index <= self.clock())].iloc[:limit]
+        stamps = pd.DatetimeIndex(rates.index).to_pydatetime()
+        return list(zip(stamps, rates.to_numpy(dtype=float).tolist(), strict=True))
+
+    def fetch_quote(self, symbol: str) -> Quote:
+        self._call("fetch_quote", symbol)
+        now = self.clock()
+        df = self.candles[symbol]
+        forming = df[df.index > now]
+        price = forming["open"].iloc[0] if len(forming) else df["close"].iloc[-1]
+        bid, ask = quote_from_bar_open(float(price), self.costs)
+        return Quote(symbol, now, bid, ask)

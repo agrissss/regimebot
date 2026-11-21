@@ -69,7 +69,10 @@ def _dt(ns: int) -> datetime:
     return _EPOCH + timedelta(microseconds=ns // 1000)
 
 
-def _features(cfg: AppConfig, candles: pd.DataFrame, funding: pd.Series | None) -> pd.DataFrame:
+def decision_features(
+    cfg: AppConfig, candles: pd.DataFrame, funding: pd.Series | None
+) -> pd.DataFrame:
+    """Base ``candles`` resampled to the decision timeframe, with ``compute_features`` columns."""
     decision = resample(candles, cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe)
     features = compute_features(decision, cfg.features, cfg.regime.compression_pctile, funding)
     return features.copy()  # copy() consolidates the columns into one block: faster slices
@@ -154,7 +157,7 @@ def run_backtest(
     symbols = list(cfg.exchange.symbols)
     if set(candles) != set(symbols):
         raise ValueError(f"candles cover {sorted(candles)}, config trades {sorted(symbols)}")
-    features = {s: _features(cfg, candles[s], funding.get(s)) for s in symbols}
+    features = {s: decision_features(cfg, candles[s], funding.get(s)) for s in symbols}
     timeline = _timeline([f.index for f in features.values()], start, end)
     feeds = {s: _feed(features[s], candles[s], funding.get(s), timeline) for s in symbols}
     base_width_ns = timeframe_minutes(cfg.exchange.base_timeframe) * 60 * 10**9
