@@ -54,6 +54,9 @@ Strategy, risk, portfolio and persistence code is identical in every mode.
   earlier than the open of the next base bar (1m).
 - Features at row *t* use rows `<= t` only. A prefix-invariance test enforces
   this for every feature column.
+- The percentile features need a full 30-day window: the classifier answers
+  `no_trade` until `warmup_bars` decision bars exist (2,976 by default), and
+  history is loaded from that span before `backtest.start`.
 - Longer horizons are expressed as longer windows on the decision frame, not as
   joined higher-timeframe bars. This removes the most common look-ahead bug.
 - Inside one 1m bar, if both stop and target are touched, the stop is assumed

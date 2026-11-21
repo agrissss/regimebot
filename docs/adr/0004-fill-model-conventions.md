@@ -16,6 +16,7 @@ A backtest flatters a strategy whenever its fills are better than reality. The f
 | Exits | Exits always fill; they are never cut by the participation cap. Volume impact is capped at one full bar's volume, so impact is bounded and an exit is never cheaper on a thin bar. |
 | Stop fills | A stop is a market order once triggered. A gap through the stop fills at the open. It pays the same half spread, slippage and bounded impact as a market exit on that bar, so a stop is never cheaper than a market exit. |
 | Target fills | A target is a resting limit. A touch is not a fill: price must trade through it. If a bar opens beyond the target it still fills at the target price; no price improvement is assumed. Maker fee, no spread, no slippage. |
+| Gap through the stop | An entry whose fill is at or beyond its stop is cancelled (`gapped_through_stop`): the trade would start already stopped out. |
 | Minimum entry | An entry whose filled notional is under 10 USDT is cancelled (`too_small` at sizing, `no_liquidity` at fill time). |
 | Costs | Taker 5 bps, maker 2 bps, half spread 1 bp (backtest, when no live quote), 2 bps slippage plus 1 bp per 1% of bar volume taken. Funding is charged from stored funding rates. |
 

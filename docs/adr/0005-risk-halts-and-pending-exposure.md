@@ -17,6 +17,6 @@ Risk limits protect capital only if they cannot be bypassed by timing, and a res
 
 ## Consequences
 
-- With the default limits the first results run stopped on 2024-02-05 after 60 trades. A full-period study needs the override, and its result must be read as "what happens without the limit", not as achievable performance.
+- With the default limits the first results run stopped on 2024-02-07 after 76 trades. A full-period study needs the override, and its result must be read as "what happens without the limit", not as achievable performance.
 - Exposure caps hold even when many signals arrive together.
 - Because the drawdown halt is sticky, a halted paper session stays halted across restarts until someone runs `clear-halt`; this is deliberate, and an operator is expected to look before trading resumes.

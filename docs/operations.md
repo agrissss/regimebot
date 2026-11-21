@@ -1,6 +1,6 @@
 # Operations: paper trading runbook
 
-Paper trading polls live public market data, runs the same engine as the backtest and simulates every fill. No order is ever sent and no API key is used. All commands run from the repository root.
+Paper trading polls live public market data, runs the same engine as the backtest and simulates every fill. No order is ever sent and no API key is used. All commands run from the repository root. Paper trading needs `fcntl` for its per-run lock, so `paper run` works on macOS and Linux (or in Docker) only.
 
 ## Before you start
 
@@ -9,7 +9,7 @@ Paper trading polls live public market data, runs the same engine as the backtes
 .venv/bin/regimebot data check
 ```
 
-`data check` validates the stored history for the configured backtest range, so it is only needed for backtests. A paper session fetches its own warm-up history (3000 decision bars, about 31 days) on start.
+`data check` validates the stored history for the backtest range plus the 31-day feature warm-up before it, so it is only needed for backtests. A paper session fetches its own warm-up history (`paper.warmup_bars`, 3000 decision bars, about 31 days) on start. That value must be at least the features' warm-up (2,976 with defaults); config validation enforces it. Known limit: the margin is 24 bars, and paper trading does not yet alert when it is under-warmed.
 
 ## Start a session
 
@@ -31,11 +31,11 @@ The session polls every 10 seconds (`paper.poll_seconds`) and decides once per c
 .venv/bin/regimebot paper status
 ```
 
-Shows the latest paper run: `open` (running), or `stopped at <time>` after a clean stop (Ctrl-C or SIGTERM), with the resume command; the age of its last poll; equity and its timestamp, cash, the active halt (or `no`), open positions with stop and target, the last regime per symbol and the last 10 risk events. It reads the database and works while a session runs. It exits 0 for a running run and for a cleanly stopped run. It exits 1 (printing `NOT POLLING`) for an open run with no clean-stop marker whose last poll is older than `--max-age` seconds (default 3 x `poll_seconds` + `stale_after_seconds`, 210 s): the process crashed or hung. See Monitoring.
+Shows the latest paper run: `open` (running, or crashed or hung when `NOT POLLING` also appears), `stopped at <time>` after a clean stop (Ctrl-C or SIGTERM), with the resume command, or `ended` after `paper end`; the age of its last poll; equity and its timestamp, cash, the active halt (or `no`), open positions with stop and target, the last regime per symbol and the last 10 risk events. It reads the database and works while a session runs. It exits 0 for a running run, a cleanly stopped run and an ended run. It exits 1 (printing `NOT POLLING`) for an open run with no clean-stop marker whose last poll is older than `--max-age` seconds (default 3 x `poll_seconds` + `stale_after_seconds`, 210 s): the process crashed or hung. See Monitoring.
 
 ## Stop and resume
 
-Stop with Ctrl-C or SIGTERM. The session finishes the current poll, saves its state, records a clean-stop marker (`stopped_at`) and exits. Positions stay open and the run stays resumable; nothing is flattened.
+Stop with Ctrl-C or SIGTERM. The session finishes the current poll, saves its state, records a clean-stop marker (`stopped_at`) and exits. Positions stay open and the run stays resumable; nothing is flattened. To finish a run for good, use `regimebot paper end RUN_ID`: it refuses while the run is running or holds open positions (unless `--force`, which closes nothing; the simulated positions stay in the last saved state). An ended run cannot be resumed, and `paper status` shows `ended`.
 
 ```bash
 .venv/bin/regimebot paper run --resume 4
@@ -77,8 +77,8 @@ A symbol is stale when its last candle download failed or its newest bar is olde
 
 Timing limits:
 
-- A fill after a decision can lag it by the quote fetches (each up to about 91 s while the exchange retries). An entry not filled within one decision bar expires.
-- Exchange requests are retried per symbol in sequence (up to about 91 s per call). One symbol with hanging requests can therefore make decisions miss for all symbols while it lasts; each miss is alerted as `decision_missed`. This is a known limit.
+- A fill after a decision can lag it by the quote fetches (each bounded at about 11 s: the paper exchange client uses 1 retry and a 5 s timeout). An entry not filled within one decision bar expires.
+- Exchange requests are made per symbol in sequence, but the paper client uses 1 retry and a 5 s timeout (about 11 s per call), so a hanging symbol cannot stall a poll for minutes. History download (`data download`) keeps 5 retries.
 
 ## Alerts
 
@@ -110,13 +110,13 @@ The long SQLite writers are `data download`, the final save of `backtest run`, a
 
 ## Monitoring
 
-`paper status` exits 1 when a run that was not stopped cleanly has not polled recently, so a cron job can watch for a hung or dead session. A generic example that runs every five minutes and sends mail on failure (use whatever notifier you have in place of `mail`):
+`paper status` exits 1 when an open run that was not stopped cleanly has not polled recently, so a cron job can watch for a hung or dead session. A generic example that runs every five minutes and sends mail on failure (use whatever notifier you have in place of `mail`):
 
 ```bash
 */5 * * * * cd /path/to/regimebot && .venv/bin/regimebot paper status >/dev/null || echo "regimebot paper run is stale or hung" | mail -s "regimebot" you@example.com
 ```
 
-Exit code 0 means the latest run is polling or was stopped cleanly with Ctrl-C or SIGTERM. Exit code 1 means an open run with no clean-stop marker has not polled within `--max-age`: it crashed or hung. Pair it with `ALERT_WEBHOOK_URL` for in-session alerts.
+Exit code 0 means the latest run is polling, was stopped cleanly with Ctrl-C or SIGTERM, or has ended. Exit code 1 means an open run with no clean-stop marker has not polled within `--max-age`: it crashed or hung. Pair it with `ALERT_WEBHOOK_URL` for in-session alerts.
 
 ## Docker Compose (untested on the development machine)
 
@@ -130,7 +130,7 @@ docker compose run --rm app data download
 docker compose run -d app paper run
 ```
 
-The image ships `alembic.ini` and creates writable `data/` and `reports/`. Compose mounts named volumes at `/app/data` and `/app/reports`, shared by every `app` container, so `docker compose run --rm app kill` reaches a running session through the shared kill file, and reports persist. The `pgdata` volume holds the Postgres data; back it up (and test a restore) before it holds anything you cannot re-download.
+The image installs with `requirements.lock` as a constraint (`psycopg` is not in the lock yet), has a `.dockerignore`, records the `GIT_SHA` build argument as the run's git sha, and ships `alembic.ini` and creates writable `data/` and `reports/`. Compose mounts named volumes at `/app/data` and `/app/reports`, shared by every `app` container, so `docker compose run --rm app kill` reaches a running session through the shared kill file, and reports persist. The `pgdata` volume holds the Postgres data; back it up (and test a restore) before it holds anything you cannot re-download.
 
 ## API keys for any future live use
 
@@ -143,5 +143,12 @@ Not needed now. If live order placement is ever added (see ADR 0003):
 
 ## Known gaps
 
-- Error reporting (Sentry) and uptime monitoring are not set up; add them before any real deployment.
+- Error reporting (Sentry) is not set up; add it before any real deployment. Uptime monitoring is not set up; see Monitoring for a cron recipe to start from.
 - Structured logs have no request or trace IDs; they are single-process JSON lines.
+
+## Known follow-ups
+
+- Paper trading does not alert when its warm-up window is incomplete.
+- A 15-minute bar with zero volume would block that symbol for 30 days (none in the current data); fix before adding thinner symbols.
+- Raising `features.pctile_window` above about 2,900 in a backtest also requires raising `paper.warmup_bars`.
+- The Postgres CI job and all Docker steps have never been run; `psycopg` is not pinned in the lock.

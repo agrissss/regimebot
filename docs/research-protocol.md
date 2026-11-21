@@ -19,6 +19,7 @@ Rules for testing a strategy without fooling yourself. Most trading backtests th
 
 - Every timestamp is UTC and a bar's `ts` is its close time. A decision at a 15-minute close sees only data up to that close.
 - Orders fill no earlier than the next 1-minute bar's open.
+- The percentile features need a full 30-day window. The classifier answers `no_trade` until `warmup_bars` decision bars exist (2,976 with defaults, 31 days), so history is downloaded and loaded from 31 days before `backtest.start`, while decisions begin at `backtest.start`. A backtest without enough history records a `warmup_incomplete` event per symbol and the CLI warns.
 - Longer horizons are longer windows on the 15-minute frame, not joined higher-timeframe candles (ADR 0001).
 - A test (`tests/test_features.py`, prefix invariance) checks that every feature column computed on a truncated history equals the same rows computed on the full history. A feature that peeks forward fails it.
 - Resampling drops incomplete buckets rather than filling them.
@@ -56,7 +57,7 @@ Each listed parameter is perturbed by +/-20% and the backtest rerun (default par
 
 ### 5. Cost stress
 
-The same command doubles every cost (fees, spread, slippage, impact) and compares gross leverage 1.0 against 1.5. Outputs: `reports/cost_stress.csv`, `reports/leverage_compare.csv`. If doubling costs wipes out the result, the margin is thinner than the cost estimates are accurate. Fees dominate high-frequency results, as the first results show.
+The same command doubles every cost (fees, spread, slippage, impact) and compares effective gross leverage 1.0 against 1.5. Outputs: `reports/cost_stress.csv`, `reports/leverage_compare.csv`. If doubling costs wipes out the result, the margin is thinner than the cost estimates are accurate. Fees dominate high-frequency results, as the first results show.
 
 ### 6. Remove the best 5%
 
@@ -93,21 +94,23 @@ Sharpe and similar ratios are computed on daily equity. They are context, not a 
 
 Data: 2024-01-01 to 2026-01-01, BTC, ETH and SOL perpetuals, 10,000 USDT. Nothing was tuned to improve these.
 
-**Default limits.** 60 trades, net -971.71 USDT (-9.72%). The 10% drawdown limit halted the run on 2024-02-05, so this describes five weeks, not two years.
+Data 2023-11-30 to 2026-01-01 (the first 31 days only warm up the features); trading 2024-01-01 to 2026-01-01; BTC, ETH and SOL; 10,000 USDT. Nothing was tuned to improve these numbers.
 
-Over the same five weeks, buy and hold lost 51.49 and random entries (3 seeds, calibrated to the same trade frequency) had a median of -359.25 (range -982.29 to +103.33). The strategy's -971.71 is at the bad end of the random range, but five weeks and three seeds say little.
+**An implementation detail moved a headline number.** An earlier version of this example, run before a fix to the feature warm-up, reported 60 trades and -9.72% for the default-limits run. The percentile features need a full 30-day window. The fix makes the classifier answer `no_trade` until that window exists and loads the 31 days of history before `backtest.start`, so the early bars of the period are classified differently. The same default-limits run now gives 76 trades and -7.16%. The conclusion did not change, but the number did. Treat any single headline number as a product of the exact code that made it, and rerun everything after changing the code.
 
-**Drawdown halt off** (`--set risk.max_drawdown=1.0`, the documented way to study a full period):
+**Default limits** (run 5). 76 trades, net -715.60 USDT (-7.16%), fees 276.89, max drawdown 10.03%, profit factor 0.66, win rate 26.32%, expectancy -0.28R. The 10% drawdown limit halted the run on 2024-02-07, so this describes five weeks, not two years. Over the same period buy and hold lost 35.53 and random entries (3 seeds, calibrated to the same trade frequency) had a median of -327.34 (range -911.82 to -315.30). The strategy is in the same range as random entries, but five weeks and three seeds say little.
+
+**Drawdown halt off** (run 6; `--set risk.max_drawdown=1.0`, the documented way to study a full period):
 
 ```bash
 .venv/bin/regimebot backtest run --set risk.max_drawdown=1.0
 ```
 
-1,300 trades, net -4,726.92 USDT (-47.27%), profit factor 0.82, max drawdown 48.62%. Buy and hold over the two years: +5,213.78. Random entries with the same exits: median -6,107.72, range -6,471.48 to -4,814.97 (profit factor 0.69). Fees were 3,835.64, so before fees the loss was about 891 (about 838 before fees and funding). Reading: the strategies lose a little before costs and a lot after. Trading 1,300 times is expensive, and cost tuning cannot fix a gross result that is not positive. The entry rules do slightly better than random entries with the same exits, but nowhere near enough to cover costs, and the strategy is far behind buy and hold.
+1,312 trades, net -4,546.86 USDT (-45.47%), profit factor 0.83, win rate 31.86%, expectancy -0.16R, max drawdown 48.64%, max gross leverage seen 1.02x. Fees were 4,031.04 and funding 58.07, so before fees the loss was about 516 (about 458 before fees and funding). Buy and hold over the two years: +5,302.82 (+53.03%, max drawdown 50.52%). Random entries with the same exits: median -6,433.63, range -6,883.03 to -4,263.12, profit factor 0.67. Reading: the strategies lose a little before costs and a lot after. Trading 1,312 times is expensive, and cost tuning cannot fix a gross result that is not positive. The entry rules do somewhat better than random entries with the same exits (though one of the three random seeds lost less than the strategy), nowhere near enough to cover costs, and the strategy is far behind buy and hold.
 
-**Robustness** (two years, drawdown halt off). Moving each of four parameters by +/-20% keeps the net result between -4,279.65 and -5,302.76, so the loss is not an artefact of one parameter value. Doubling all costs gives -6,932.21. A 1.0x versus 1.5x gross leverage cap gives identical results: the cap never binds at 0.5% risk per trade.
+**Robustness** (two years, drawdown halt off). Moving each of four parameters by +/-20% keeps the net result between -4,278.77 and -5,207.16 (profit factor 0.81 to 0.85), so the loss is not an artefact of one parameter value. Doubling all costs gives -6,976.88 (profit factor 0.69). Effective leverage 1.0x versus 1.5x gives -4,546.86 (max drawdown 48.64%, max gross seen 1.02x) versus -5,122.05 (max drawdown 53.19%, max gross seen 1.52x): more leverage made the loss larger. With the default config every symbol is in one group capped at 1.0x, so the configured 1.5x gross cap is unreachable; the comparison raises the group cap together with the gross cap, and reports print both the configured and the effective cap. An earlier sentence in these docs said the cap never binds at 0.5% risk per trade. That was wrong: in the two-year run 243 of 1,312 approved entries were reduced by the asset or group cap.
 
-**Walk-forward, default limits** (drawdown halt on; 9 combinations, 4 windows, 36 variants tried). Every training run hit the halt before the end of its year (first halts 2024-04-07, 2024-07-02, 2024-08-12, 2024-12-03), so training saw only part of each year. The best in-training profit factors were 0.95, 0.93, 0.54 and 0.80, on 174, 184, 82 and 106 trades up to the halt. Out-of-sample: 465 trades, net -554.29 USDT; window nets +1,654.36, -418.84, -858.99, -930.82. Test windows 1, 2 and 3 halted on 2025-04-28, 2025-09-08 and 2025-12-10, so they are short. Reading: windows that stop early cannot support a claim about a full year in either direction.
+**Walk-forward, default limits** (drawdown halt on; 9 combinations, 4 windows, 36 variants tried). The selected training run in every window hit the halt (2024-04-07, 2024-07-02, 2024-08-12, 2024-12-03), so training saw only part of each year. The best in-training profit factors were 0.94, 0.93, 0.54 and 0.80, on 180, 184, 82 and 106 trades up to the halt. Out-of-sample: 463 trades, net -770.05 USDT; window nets +1,438.60, -418.84, -858.99, -930.82. The last three test windows (CSV `window` 1 to 3) halted on 2025-04-28, 2025-09-08 and 2025-12-10, so they are short; the first, winning, window ran in full. Reading: windows that stop early cannot support a claim about a full year in either direction.
 
 **Walk-forward, drawdown halt off** (`--set risk.max_drawdown=1.0`, full windows; same grid, 36 variants):
 
@@ -115,10 +118,10 @@ Over the same five weeks, buy and hold lost 51.49 and random entries (3 seeds, c
 .venv/bin/regimebot backtest walk-forward --set risk.max_drawdown=1.0
 ```
 
-Best in-training profit factors 0.85, 0.96, 0.87 and 0.91 on 659, 647, 627 and 623 trades; training nets -2,143.72, -513.23, -1,827.04 and -1,289.81. Out-of-sample: 630 trades, net -1,976.62 USDT; test profit factors 1.43, 0.65, 0.86, 0.59; window nets +1,586.71, -1,557.25, -508.65, -1,497.43. One quarter won and three lost. Reading: on full windows the best parameter set in the grid lost money in training in every window, and the winning quarter came from parameters that had lost in training, so it is not evidence of an edge.
+Best in-training profit factors 0.84, 0.96, 0.87 and 0.91 on 677, 647, 627 and 623 trades; training nets -2,434.49, -513.23, -1,827.04 and -1,289.81. Out-of-sample: 636 trades, net -2,234.05 USDT; test profit factors 1.36, 0.65, 0.86, 0.59; window nets +1,329.28, -1,557.25, -508.65, -1,497.43. One quarter won and three lost. Reading: the best parameter set in the grid lost money in training in every window, and the winning quarter came from parameters that had lost in training, so it is not evidence of an edge.
 
-**Regime study** (`regimebot regimes study`). A 5% move within 24 hours followed 23% / 37% / 59% of high-volatility-expansion bars on BTC / ETH / SOL, against 6% / 16% / 29% after compression. Regimes tell you how big the next move may be, not which way it goes. The breakout and trend strategies need the direction.
+**Regime study** (`regimebot regimes study`, fully warmed classifier). A 5% move within 24 hours followed 22% / 37% / 60% of high-volatility-expansion bars on BTC / ETH / SOL, against 6% / 16% / 30% after compression. The mean 24-hour return after a "trending up" bar on BTC was +0.27% against a standard deviation of 2.2%. Regimes tell you how big the next move may be, not which way it goes. The breakout and trend strategies need the direction.
 
-**Artefacts.** `reports/run_2/report.html`, `reports/run_3/report.html`, `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv` (halt off, the last run), `reports/walk_forward_windows_default_limits.csv` and `reports/walk_forward_oos_trades_default_limits.csv` (copies of the default-limits run), `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`. The `reports/` directory is git-ignored; the commands regenerate it.
+**Artefacts.** `reports/run_5/report.html` (default limits), `reports/run_6/report.html` (halt off), `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv` (halt off, the last run), `reports/walk_forward_windows_default_limits.csv` and `reports/walk_forward_oos_trades_default_limits.csv` (copies of the default-limits run, made by hand), `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`. The `reports/` directory is git-ignored; the commands regenerate it. Runs 1 to 3 in the development database predate the warm-up fix and are superseded.
 
 **Conclusion.** As specified, these strategies show no edge on this data. The system's job is to say so, and it does. Possible next steps, each of which would count as new trials: a strategy that uses regime for sizing or volatility rather than direction, lower trade frequency, or different data. None of these is a promise of an edge.
