@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: regimebot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-regimebot}
+      POSTGRES_DB: regimebot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U regimebot -d regimebot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      args:
+        EXTRAS: postgres
+    environment:
+      DATABASE_URL: postgresql+psycopg://regimebot:${POSTGRES_PASSWORD:-regimebot}@db/regimebot
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

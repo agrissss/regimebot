@@ -49,51 +49,118 @@ mypy and pytest passing is required regardless of score.
 `@dataclass(frozen=True, slots=True)` unless stated):
 
 ```python
-class Side(StrEnum):        LONG = "long"; SHORT = "short"
-class OrderSide(StrEnum):   BUY = "buy"; SELL = "sell"
-class Regime(StrEnum):
-    TREND_UP = "trend_up"; TREND_DOWN = "trend_down"; RANGE = "range"
-    COMPRESSION = "compression"; EXPANSION = "expansion"
-    LIQUIDITY_STRESS = "liquidity_stress"; EVENT_RISK = "event_risk"
-    NO_TRADE = "no_trade"
-class Mode(StrEnum):        BACKTEST = "backtest"; PAPER = "paper"
-class ExitReason(StrEnum):
-    STOP = "stop"; TARGET = "target"; TRAIL = "trail"; TIME = "time"
-    REGIME = "regime"; KILL = "kill"; END_OF_DATA = "end_of_data"
+class Side(StrEnum):
+    LONG = "long"
+    SHORT = "short"
 
-class Bar:      symbol: str; ts: datetime; open: float; high: float; low: float; close: float; volume: float
-class Quote:    symbol: str; ts: datetime; bid: float; ask: float
+
+class OrderSide(StrEnum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class Regime(StrEnum):
+    TREND_UP = "trend_up"
+    TREND_DOWN = "trend_down"
+    RANGE = "range"
+    COMPRESSION = "compression"
+    EXPANSION = "expansion"
+    LIQUIDITY_STRESS = "liquidity_stress"
+    EVENT_RISK = "event_risk"
+    NO_TRADE = "no_trade"
+
+
+class Mode(StrEnum):
+    BACKTEST = "backtest"
+    PAPER = "paper"
+
+
+class ExitReason(StrEnum):
+    STOP = "stop"
+    TARGET = "target"
+    TRAIL = "trail"
+    TIME = "time"
+    REGIME = "regime"
+    KILL = "kill"
+    END_OF_DATA = "end_of_data"
+
+
+class Bar:
+    symbol: str
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class Quote:
+    symbol: str
+    ts: datetime
+    bid: float
+    ask: float
+
+
 class Signal:
-    strategy: str; symbol: str; ts: datetime; side: Side
-    entry: float      # reference price: decision-bar close
-    stop: float; target: float
-    atr: float        # ATR at signal time, price units
+    strategy: str
+    symbol: str
+    ts: datetime
+    side: Side
+    entry: float  # reference price: decision-bar close
+    stop: float
+    target: float
+    atr: float  # ATR at signal time, price units
     regime: Regime
-    max_hold_bars: int            # decision bars
+    max_hold_bars: int  # decision bars
     trail_atr_mult: float | None  # None = no trailing stop
+
+
 class RiskDecision:
-    approved: bool; qty: float    # qty in base units, 0.0 when rejected
-    rule: str                     # machine name of the rule that decided, "ok" when approved unchanged
+    approved: bool
+    qty: float  # qty in base units, 0.0 when rejected
+    rule: str  # machine name of the rule that decided, "ok" when approved unchanged
     detail: str
+
+
 class Fill:
-    symbol: str; ts: datetime; side: OrderSide; qty: float
-    price: float                  # executed price
-    ref_price: float              # intended price (decision close, stop level or target level)
-    fee: float                    # quote currency, positive = cost
-    slippage_bps: float           # signed, positive = worse than ref_price
-    liquidity: str                # "taker" | "maker"
-class Trade:                      # one closed position
-    symbol: str; strategy: str; side: Side; regime: Regime
-    qty: float; entry_ts: datetime; exit_ts: datetime
-    entry_price: float; exit_price: float
-    initial_stop: float; target: float
-    gross_pnl: float; fees: float; funding: float; net_pnl: float
+    symbol: str
+    ts: datetime
+    side: OrderSide
+    qty: float
+    price: float  # executed price
+    ref_price: float  # intended price (decision close, stop level or target level)
+    fee: float  # quote currency, positive = cost
+    slippage_bps: float  # signed, positive = worse than ref_price
+    liquidity: str  # "taker" | "maker"
+
+
+class Trade:  # one closed position
+    symbol: str
+    strategy: str
+    side: Side
+    regime: Regime
+    qty: float
+    entry_ts: datetime
+    exit_ts: datetime
+    entry_price: float
+    exit_price: float
+    initial_stop: float
+    target: float
+    gross_pnl: float
+    fees: float
+    funding: float
+    net_pnl: float
     exit_reason: ExitReason
-    r_multiple: float             # net_pnl / (qty * |entry_price - initial_stop|)
+    r_multiple: float  # net_pnl / (qty * |entry_price - initial_stop|)
     bars_held: int
+
+
 class RiskEvent:
-    ts: datetime; kind: str; detail: str
-    action: str                   # what the system did, e.g. "halt", "flatten", "skip_symbol"
+    ts: datetime
+    kind: str
+    detail: str
+    action: str  # what the system did, e.g. "halt", "flatten", "skip_symbol"
 ```
 
 `side_sign(side: Side) -> int` returns +1 for LONG and -1 for SHORT.
