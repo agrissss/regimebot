@@ -9,6 +9,7 @@ slippage 2 bps, impact 1 bp per 1% of bar volume, max participation 5%.
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -440,10 +441,15 @@ def test_engine_state_round_trips_queued_exits_and_last_closes(tmp_path: Path) -
         ({"queued_exits": {BTC: "time"}, "last_close": {}}, "no last close"),
         ({"queued_exits": {}, "last_close": {BTC: float("nan")}}, "positive"),
         ({"queued_exits": {}}, "missing keys"),
+        ({"queued_exits": None, "last_close": {}}, "queued_exits must be a mapping"),
+        ({"queued_exits": {}, "last_close": [100.0]}, "last_close must be a mapping"),
+        ({"queued_exits": {}, "last_close": {BTC: None}}, "engine state"),
+        ({"queued_exits": {BTC: ["time"]}, "last_close": {BTC: 1.0}}, "engine state"),
+        (None, "must be a mapping"),
     ],
 )
 def test_engine_load_state_rejects_bad_state_and_changes_nothing(
-    tmp_path: Path, state: dict[str, object], error: str
+    tmp_path: Path, state: Any, error: str
 ) -> None:
     engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
     decide(engine, T2, {BTC: 100.5})

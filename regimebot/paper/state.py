@@ -102,8 +102,15 @@ def lock_run(lock_dir: Path, run_id: int) -> int:
 # --- save and restore -----------------------------------------------------------------------
 
 
-def save_state(session: Session, run_id: int, engine: Engine, cursors: Cursors) -> None:
-    """Write the resumable state rows (a closed position's row is deleted)."""
+def save_state(
+    session: Session,
+    run_id: int,
+    engine: Engine,
+    cursors: Cursors,
+    stopped_at: datetime | None = None,
+) -> None:
+    """Write the resumable state rows (a closed position's row is deleted). ``stopped_at`` marks
+    a clean stop; a running session writes None."""
     portfolio = engine.portfolio
     for symbol in engine.cfg.exchange.symbols:
         position = portfolio.positions.get(symbol)
@@ -118,6 +125,7 @@ def save_state(session: Session, run_id: int, engine: Engine, cursors: Cursors) 
         "last_decision": cursors.last_decision.isoformat(),
         "last_bar": {s: ts.isoformat() for s, ts in cursors.last_bar.items()},
         "last_funding": {s: ts.isoformat() for s, ts in cursors.last_funding.items()},
+        "stopped_at": None if stopped_at is None else stopped_at.isoformat(),
     }
     repo.save_open_position(session, run_id, PORTFOLIO_KEY, saved)
 
@@ -138,8 +146,8 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
     """Load ``run_id``'s saved state into a fresh ``engine`` (its portfolio, risk manager and
     queued exits) and return the session cursors.
 
-    Raises ValueError when the run cannot be resumed or its state is missing or malformed; the
-    portfolio is only assigned once everything else has loaded.
+    Raises ValueError, before changing anything, when the run cannot be resumed or its state is
+    missing or malformed.
     """
     check_resumable(session, run_id, engine.cfg)
     rows = repo.load_open_positions(session, run_id)
@@ -156,8 +164,9 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
         {s: _utc(v) for s, v in saved["last_funding"].items()},
     )
     cash, peak = float(saved["cash"]), float(saved["peak_equity"])
-    engine.load_state({key: saved[key] for key in ("queued_exits", "last_close")})
-    engine.risk.load_state(risk_state)  # both validate before assigning anything
+    RiskManager(engine.cfg, engine.risk.kill_file).load_state(risk_state)  # validate it first
+    engine.load_state({key: saved[key] for key in ("queued_exits", "last_close")})  # or raise
+    engine.risk.load_state(risk_state)  # cannot fail now
     portfolio = engine.portfolio
     portfolio.cash, portfolio.peak_equity = cash, peak
     portfolio.last_prices, portfolio.positions = last_prices, positions
@@ -201,6 +210,7 @@ class PaperStatus:
     started_at: datetime
     is_open: bool  # never ended: ``paper run --resume`` continues it
     last_poll: datetime | None  # the session rewrites its state row on every poll
+    stopped_at: datetime | None  # a clean stop (Ctrl-C, SIGTERM); None while running or crashed
     equity: tuple[datetime, float] | None  # last snapshot (one per decision)
     cash: float | None
     positions: list[Position]
@@ -253,6 +263,9 @@ def latest_status(session: Session) -> PaperStatus | None:
         started_at=run.started_at,
         is_open=run.ended_at is None,
         last_poll=last_poll,
+        stopped_at=None
+        if saved is None or not saved.get("stopped_at")
+        else _utc(saved["stopped_at"]),
         equity=None if equity is None else (equity[0], equity[1]),
         cash=None if saved is None else float(saved["cash"]),
         positions=[Position.from_state(state) for state in rows.values()],

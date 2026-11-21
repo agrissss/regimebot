@@ -146,12 +146,20 @@ class Engine:
 
     def load_state(self, state: Mapping[str, Any]) -> None:
         """Restore a ``to_state`` snapshot. Raises ValueError, changing nothing, on a missing
-        key, an unknown exit reason or symbol, a close that is not finite and positive, or a
-        queued exit without a last close (it could not be priced)."""
+        key or a wrong type, an unknown exit reason or symbol, a close that is not finite and
+        positive, or a queued exit without a last close (it could not be priced)."""
+        if not isinstance(state, Mapping):
+            raise ValueError(f"engine state must be a mapping, got {type(state).__name__}")
         if missing := sorted({"queued_exits", "last_close"} - set(state)):
             raise ValueError(f"engine state: missing keys {missing}")
-        exits = {str(s): ExitReason(r) for s, r in state["queued_exits"].items()}
-        closes = {str(s): float(v) for s, v in state["last_close"].items()}
+        for key in ("queued_exits", "last_close"):
+            if not isinstance(state[key], Mapping):
+                raise ValueError(f"engine state: {key} must be a mapping")
+        try:
+            exits = {str(s): ExitReason(r) for s, r in state["queued_exits"].items()}
+            closes = {str(s): float(v) for s, v in state["last_close"].items()}
+        except (TypeError, ValueError) as exc:  # e.g. an unknown reason, a None close
+            raise ValueError(f"engine state: {exc}") from None
         if unknown := sorted((set(exits) | set(closes)) - set(self.cfg.exchange.symbols)):
             raise ValueError(f"engine state: unknown symbols {unknown}")
         if bad := sorted(s for s, c in closes.items() if not (math.isfinite(c) and c > 0)):

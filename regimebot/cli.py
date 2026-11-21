@@ -441,7 +441,9 @@ def paper_run(
                 "flattens and stops this run's trading;",
                 "           after a manual kill: `regimebot unkill`, then "
                 f"`regimebot paper clear-halt {run_id}`;",
-                "           a drawdown halt ends the run (start a new one)",
+                "           a drawdown halt ends the run (start a new one); daily and weekly "
+                "loss halts",
+                "           also flatten, and clear at the next UTC day / ISO week",
                 "stop:      Ctrl-C or SIGTERM (finishes the current poll, positions stay open)",
                 f"resume:    regimebot paper run --resume {run_id}",
                 "=" * 72,
@@ -490,7 +492,8 @@ def paper_status(
     ] = None,
 ) -> None:
     """Show the latest paper run: liveness, equity, open positions, last regimes, halt, risk
-    events. Exits 1 when an open run has not polled within --max-age (for uptime checks)."""
+    events. Exits 1 when an open run that was not stopped cleanly has not polled within --max-age
+    (crashed or hung: for uptime checks); a run stopped with Ctrl-C or SIGTERM exits 0."""
     cfg = load_config()
     limit = (
         max_age
@@ -502,11 +505,13 @@ def paper_status(
     if status is None:
         typer.echo("no paper runs yet: start one with `regimebot paper run`")
         return
-    state = (
-        f"open (resume with `regimebot paper run --resume {status.run_id}`)"
-        if status.is_open
-        else "ended"
-    )
+    resume = f"(resume with `regimebot paper run --resume {status.run_id}`)"
+    if not status.is_open:
+        state = "ended"
+    elif status.stopped_at is not None:
+        state = f"stopped at {status.stopped_at.isoformat()} {resume}"
+    else:
+        state = f"open {resume}"
     typer.echo(f"paper run {status.run_id}: {state}, started {status.started_at.isoformat()}")
     age = None if status.last_poll is None else (datetime.now(UTC) - status.last_poll)
     typer.echo("last poll: never" if age is None else f"last poll: {age.total_seconds():.0f} s ago")
@@ -528,6 +533,7 @@ def paper_status(
     typer.echo(f"last {len(status.risk_events)} risk events:")
     for e in status.risk_events:
         typer.echo(f"  {e.ts.isoformat()} {e.kind} -> {e.action}: {e.detail}")
-    if status.is_open and (age is None or age.total_seconds() > limit):
-        typer.echo(f"NOT POLLING: no poll in the last {limit} s (hung or stopped?)", err=True)
+    hung = age is None or age.total_seconds() > limit
+    if status.is_open and status.stopped_at is None and hung:
+        typer.echo(f"NOT POLLING: no poll in the last {limit} s (crashed or hung?)", err=True)
         raise typer.Exit(1)

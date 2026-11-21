@@ -66,8 +66,10 @@ class PaperSession:
     symbol has its base bar T stored or is stale. A symbol is stale when its last candle download
     failed, it has no bars, or its newest bar is older than ``stale_after_seconds``; a symbol
     missing bar T therefore turns stale before T + ``stale_after_seconds``. A decision still
-    unprocessed at T + ``stale_after_seconds`` (by a fresh clock read) is missed: skipped for
-    good and alerted as ``decision_missed``, never processed late. Only symbols with bar T stored
+    unprocessed at T + ``stale_after_seconds`` (by a fresh clock read, taken again after the
+    spread quotes, just before ``on_decision``) is missed: skipped for good, never processed late,
+    and alerted as ``decision_missed`` unless it closed before this process started (a routine
+    start or resume, logged at info). Only symbols with bar T stored
     get a window; the others are recorded as ``stale_data`` by the engine and not traded.
     ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends.
 
@@ -76,8 +78,8 @@ class PaperSession:
     closed bar's volume for participation. A failed quote means no spread and no fill for that
     symbol at this decision: a queued entry then expires at the next decision (the engine's
     rule), a queued exit is retried on every poll until it fills. The kill file is checked on
-    every poll: it halts and flattens at once, not only at the next decision. Every halt is
-    alerted, and so is a halt that clears.
+    every poll: it halts (open or flat) and flattens at once, not only at the next decision.
+    Every halt is alerted, and so is a halt that clears.
     """
 
     def __init__(
@@ -116,6 +118,8 @@ class PaperSession:
         self._halts: set[str] = set()  # active halts last seen (alerted on change)
         self._events_alerted = 0  # risk events already scanned for halts
         self._stop_signal: int | None = None
+        self._started_at = _EPOCH  # this process's start: earlier missed decisions are routine
+        self._stopped_at: datetime | None = None  # set by a clean stop, cleared by a resume
 
     # --- lifecycle ---------------------------------------------------------------------------
 
@@ -137,7 +141,22 @@ class PaperSession:
         saved: ``run_forever`` cancels them on a clean stop, while after a hard kill (SIGKILL)
         an approved entry is left without a closing decision row.
         """
-        now = self._clock()
+        try:
+            run_id = self._start(resume_run_id)
+        except BaseException:
+            self.close()  # a failed start keeps no lock
+            raise
+        log.info(
+            "paper_started",
+            run_id=run_id,
+            resumed=resume_run_id is not None,
+            positions=sorted(self.portfolio.positions),
+            last_decision=self._last_decision.isoformat(),
+        )
+        return run_id
+
+    def _start(self, resume_run_id: int | None) -> int:
+        now = self._started_at = self._clock()
         if resume_run_id is not None:
             with Session(self._db) as session:
                 state.check_resumable(session, resume_run_id, self.cfg)  # fail before warm-up
@@ -159,13 +178,6 @@ class PaperSession:
                 self._last_decision = cursors.last_decision
             self._halts = set(self.risk.to_state()["halts"])
             self._marks = self._save(session)
-        log.info(
-            "paper_started",
-            run_id=self.run_id,
-            resumed=resume_run_id is not None,
-            positions=sorted(self.portfolio.positions),
-            last_decision=self._last_decision.isoformat(),
-        )
         return self.run_id
 
     def close(self) -> None:
@@ -181,9 +193,10 @@ class PaperSession:
         """Poll every ``poll_seconds`` until SIGINT or SIGTERM (or a KeyboardInterrupt in sleep).
 
         A signal only records itself, so the current poll always finishes and is flushed. The
-        session then cancels queued entries (each gets a closing decision), flushes and returns
-        without flattening; the run stays open for a resume. An exception in a poll is logged and
-        alerted once per incident, and the next poll runs as usual.
+        session then cancels queued entries (each gets a closing decision), stores ``stopped_at``
+        (so ``paper status`` tells a clean stop from a hung session), flushes and returns without
+        flattening; the run stays open for a resume. An exception in a poll is logged and alerted
+        once per incident, and the next poll runs as usual.
         """
         self._stop_signal = None
         previous = {
@@ -203,7 +216,8 @@ class PaperSession:
                 signal.signal(sig, signal.SIG_DFL if handler is None else handler)
         if self._stop_signal is not None:
             log.info("paper_stop_requested", signal=signal.Signals(self._stop_signal).name)
-        self.engine.cancel_queued_entries(self._clock())
+        self._stopped_at = self._clock()
+        self.engine.cancel_queued_entries(self._stopped_at)
         try:
             self.flush()
         except Exception:
@@ -230,7 +244,9 @@ class PaperSession:
         it once ready, then replay the rest; act on the kill file; fill queued orders; alert
         halts; flush. While a decision waits for a late symbol, later events are held back so
         that every bar after T is checked against the stops as the decision at T left them.
-        Exchange errors are contained per symbol and call."""
+        Residual: during that wait a retried exit (or a KILL exit) fills at the live quote before
+        its symbol's held-back bars are replayed, so a stop in them can be missed; the wait bounds
+        this to under ``stale_after_seconds``. Exchange errors are contained per symbol and call."""
         now = self._clock()
         downloaded = {}
         for symbol in self._symbols:
@@ -246,7 +262,7 @@ class PaperSession:
         else:  # events after an open decision wait for it: they stay stored and come back
             self._feed(e for e in events if e[0] <= ts)
             if ready:
-                quotes = self._decide(ts, latest)
+                quotes = self._decide(ts, latest)  # None when it turned out late: missed
                 self._feed(e for e in events if e[0] > ts)
         self._check_kill_file(now)
         self._fill_queued(quotes)
@@ -268,7 +284,7 @@ class PaperSession:
             {s: bar.ts for s, bar in self._newest.items()},
             dict(self._last_funding),
         )
-        state.save_state(session, self.run_id, self.engine, cursors)
+        state.save_state(session, self.run_id, self.engine, cursors, self._stopped_at)
         return marks
 
     def _download(self, symbol: str, since: datetime, now: datetime) -> bool:
@@ -387,26 +403,40 @@ class PaperSession:
     ) -> tuple[datetime | None, bool]:
         """The unprocessed decision bar closing at or before ``now`` (None when there is none)
         and whether it is ready: every symbol has its bar or is stale. One whose wait has ended
-        is marked missed and alerted, so it is never processed late."""
+        is missed (``_missed``), so it is never processed late."""
         ts = _floor(now, self._width)
-        if ts <= self._last_decision:
-            return None, False
-        late = self._clock() - ts  # fresh: downloads (or a warm-up) may have taken a while
-        if late >= self._stale_after:
-            self._last_decision = ts
-            detail = f"decision at {ts.isoformat()} reached {late.total_seconds():.0f}s late"
-            log.warning("decision_missed", ts=ts.isoformat(), late_s=late.total_seconds())
-            alert("decision_missed", f"{detail}: skipped")
+        if ts <= self._last_decision or self._missed(ts):
             return None, False
         waiting = [s for s in self._symbols if s not in stale and latest[s] < ts]
         return ts, not waiting
 
-    def _decide(self, ts: datetime, latest: dict[str, datetime]) -> dict[str, Quote]:
+    def _missed(self, ts: datetime) -> bool:
+        """True, with ``ts`` marked processed so this happens once, when its wait has ended by a
+        fresh clock read (downloads, a warm-up or quotes may have taken a while). Alerted, unless
+        ``ts`` closed before this process started: that is a routine start or resume."""
+        late = (self._clock() - ts).total_seconds()
+        if late < self._stale_after.total_seconds():
+            return False
+        self._last_decision = ts
+        if ts < self._started_at:
+            reason = "before session start"
+            log.info("decision_missed", ts=ts.isoformat(), late_s=late, reason=reason)
+        else:
+            log.warning("decision_missed", ts=ts.isoformat(), late_s=late)
+            alert(
+                "decision_missed", f"decision at {ts.isoformat()} reached {late:.0f}s late: skipped"
+            )
+        return True
+
+    def _decide(self, ts: datetime, latest: dict[str, datetime]) -> dict[str, Quote] | None:
         """Run the decision at ``ts`` with a window for every symbol whose bar ``ts`` is stored;
-        returns the pre-decision quotes (a symbol without one gets no fill this poll)."""
+        returns the pre-decision quotes (a symbol without one gets no fill this poll), or None
+        when building windows and quotes took it past its wait (missed, not run)."""
         with_bar = [s for s in self._symbols if s in latest and latest[s] >= ts]
         windows = self._windows(ts, with_bar)
         quotes = {s: q for s in self._symbols if (q := self._quote(s)) is not None}
+        if self._missed(ts):  # each quote may have retried for half a minute
+            return None
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice
         self.engine.on_decision(ts, windows, spreads)
@@ -437,10 +467,9 @@ class PaperSession:
         return windows
 
     def _check_kill_file(self, now: datetime) -> None:
-        """With the kill file present and anything open, halt now (the risk manager records
-        ``manual_kill`` once) and queue KILL exits, which fill on this poll."""
-        active = any(self.engine.is_active(s) for s in self._symbols)
-        if not (active and self.risk.kill_file.exists()):
+        """With the kill file present, halt now, open or flat (the risk manager records
+        ``manual_kill`` once), and queue KILL exits, which fill on this poll."""
+        if not self.risk.kill_file.exists():
             return
         self.log.risk_events.extend(self.risk.check_limits(self.portfolio, now))
         if self.risk.must_flatten:

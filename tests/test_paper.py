@@ -311,11 +311,11 @@ def test_a_poll_that_comes_after_the_wait_skips_the_decision(
 
 
 class SlowWarmUp:
-    """The first candle download takes 95 s of test time, like the live 94.5 s warm-up."""
+    """The first candle download takes ``delay`` of test time, like the live 94.5 s warm-up."""
 
-    def __init__(self, inner: ReplayExchange) -> None:
+    def __init__(self, inner: ReplayExchange, delay: timedelta) -> None:
         self.inner = inner
-        self.delay = timedelta(seconds=95)
+        self.delay = delay
 
     def fetch_candles(self, *args: Any) -> Any:
         self.inner.clock.now += self.delay
@@ -326,18 +326,74 @@ class SlowWarmUp:
         return getattr(self.inner, name)
 
 
+@pytest.mark.parametrize(
+    ("started", "warm_up", "alerted"),
+    [
+        (T1 + 2 * MINUTE, timedelta(seconds=95), False),  # T1 closed before the process started
+        (T1 - MINUTE, timedelta(minutes=5), True),  # T1 closed during the warm-up: an incident
+    ],
+    ids=["closed_before_start", "closed_during_warm_up"],
+)
 def test_a_start_whose_warm_up_outlasts_the_wait_skips_that_decision(
+    tmp_path: Path,
+    alerts: list[tuple[str, str]],
+    started: datetime,
+    warm_up: timedelta,
+    alerted: bool,
+) -> None:
+    rig = make_rig(tmp_path)
+    rig.clock.now = started
+    session = rig.session(exchange=SlowWarmUp(rig.exchange, warm_up))
+    with structlog.testing.capture_logs() as logs:
+        run_id = session.start()
+        assert rig.clock.now == started + warm_up
+        rig.poll(session, T1 + D + MINUTE)
+    assert [ts for ts, _ in stored(rig.db, run_id)["equity"]] == [T1 + D]
+    assert session.log.signals == []  # no T1 entry minutes after its signal
+    (missed,) = [e for e in logs if e["event"] == "decision_missed"]
+    assert missed["ts"] == T1.isoformat()
+    if alerted:
+        assert [kind for kind, _ in alerts] == ["decision_missed"]
+        assert missed["log_level"] == "warning"
+    else:  # a routine start more than 3 minutes into a bar: logged, not alerted
+        assert alerts == []
+        assert (missed["log_level"], missed["reason"]) == ("info", "before session start")
+
+
+class SlowQuotes:
+    """Every quote takes ``delay`` of test time (an exchange that keeps retrying)."""
+
+    def __init__(self, inner: ReplayExchange) -> None:
+        self.inner = inner
+        self.delay = timedelta(0)
+
+    def fetch_quote(self, symbol: str) -> Any:
+        self.inner.clock.now += self.delay
+        return self.inner.fetch_quote(symbol)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+def test_a_decision_that_turns_late_while_quoting_is_skipped(
     tmp_path: Path, alerts: list[tuple[str, str]]
 ) -> None:
     rig = make_rig(tmp_path)
-    rig.clock.now = T1 + 2 * MINUTE  # within T1's wait, but the warm-up takes 95 s
-    session = rig.session(exchange=SlowWarmUp(rig.exchange))
+    exchange = SlowQuotes(rig.exchange)
+    session = rig.session(exchange=exchange)
     run_id = session.start()
-    assert rig.clock.now == T1 + 3 * MINUTE + 35 * timedelta(seconds=1)
-    rig.poll(session, T1 + D + MINUTE)
-    assert [ts for ts, _ in stored(rig.db, run_id)["equity"]] == [T1 + D]
-    assert session.log.signals == []  # no T1 entry 3.5 minutes after its signal
-    assert [kind for kind, _ in alerts] == ["decision_missed"]
+    rig.poll(session, T1 - 2 * MINUTE)
+    rig.clock.now = T1 + 170 * timedelta(seconds=1)  # within the wait, but quotes take 60 s
+    exchange.delay = timedelta(seconds=60)
+    session.run_once()  # two spread quotes: on_decision would run at T1 + 290 s
+    exchange.delay = timedelta(0)
+    rig.clock.now = T1 + 5 * MINUTE + LAG
+    rig.poll(session, T1 + D)
+    assert [ts for ts, _ in stored(rig.db, run_id)["equity"]] == [START, T1 + D]
+    assert session.log.signals == [] and session.log.fills == []
+    assert alerts == [
+        ("decision_missed", f"decision at {T1.isoformat()} reached 290s late: skipped")
+    ]
 
 
 def test_bars_after_a_late_decision_see_the_stop_it_trailed(tmp_path: Path) -> None:
@@ -601,6 +657,35 @@ def test_a_run_cannot_be_run_by_two_sessions_at_once(tmp_path: Path) -> None:
     second.close()
 
 
+@pytest.mark.parametrize(
+    ("row", "corruption", "error"),
+    [
+        (state.PORTFOLIO_KEY, {"queued_exits": {BTC: "soon"}}, "soon"),
+        (state.RISK_KEY, {"halts": ["bogus"]}, "unknown halt kinds"),
+    ],
+    ids=["bad_engine_state", "bad_risk_state"],
+)
+def test_a_failed_restore_changes_nothing_and_keeps_no_lock(
+    tmp_path: Path, row: str, corruption: dict[str, Any], error: str
+) -> None:
+    rig = make_rig(tmp_path)
+    first = rig.session()
+    run_id = first.start()
+    rig.poll(first, T1 + D, every=EVERY_5M)  # ETH lost: the stored risk state is not empty
+    first.close()
+    with session_scope(rig.db) as s:
+        saved = repo.load_open_positions(s, run_id)[row]
+        repo.save_open_position(s, run_id, row, saved | corruption)
+    fresh = rig.session()
+    pristine = resumable_state(fresh)
+    with pytest.raises(ValueError, match=error):
+        fresh.start(resume_run_id=run_id)
+    assert resumable_state(fresh) == pristine  # neither risk nor engine nor portfolio assigned
+    again = rig.session()  # the failed start released the run's lock
+    with pytest.raises(ValueError, match=error):
+        again.start(resume_run_id=run_id)
+
+
 # --- exits, the kill switch and halts ---------------------------------------------------------
 
 
@@ -657,6 +742,26 @@ def test_the_kill_file_flattens_within_one_poll_and_retries_a_failed_quote(
     ]
     assert [kind for kind, _ in alerts] == ["manual_kill"]
     assert rows["open_positions"] == [state.PORTFOLIO_KEY, state.RISK_KEY]
+
+
+def test_the_kill_file_halts_a_flat_book_within_one_poll(
+    tmp_path: Path, alerts: list[tuple[str, str]]
+) -> None:
+    rig = make_rig(tmp_path)
+    session = rig.session()
+    run_id = session.start()
+    rig.poll(session, START + 5 * MINUTE)  # nothing open or queued
+    rig.kill_file.touch()
+    rig.poll(session, START + 6 * MINUTE)
+    halt = (START + 6 * MINUTE + LAG, "manual_kill", "halt")
+    assert [(e.ts, e.kind, e.action) for e in session.log.risk_events] == [halt]
+    assert [kind for kind, _ in alerts] == ["manual_kill"]
+    with Session(rig.db) as s:  # `paper status` shows it at once
+        status = state.latest_status(s)
+    assert status is not None and status.halted_reason == "manual_kill"
+    rig.poll(session, T1 + 2 * MINUTE)  # the T1 decision neither re-records it nor enters
+    assert [(e.ts, e.kind, e.action) for e in session.log.risk_events] == [halt]
+    assert session.log.signals == [] and stored(rig.db, run_id)["fills"] == []
 
 
 def test_halts_are_alerted_and_so_is_a_daily_halt_clearing(
@@ -731,7 +836,13 @@ def test_run_forever_survives_a_failing_poll_and_stops_without_flattening(
         assert run is not None and run.ended_at is None  # left open for a resume
         saved = repo.load_open_positions(s, run_id)[state.PORTFOLIO_KEY]
     assert saved["last_bar"][BTC] == (T1 + 3 * MINUTE).isoformat()  # the last poll's bar
+    assert saved["stopped_at"] == (T1 + 4 * MINUTE + LAG).isoformat()  # a clean stop
     session.close()
+    resumed = rig.session()
+    resumed.start(resume_run_id=run_id)
+    with Session(rig.db) as s:  # resuming clears it
+        assert repo.load_open_positions(s, run_id)[state.PORTFOLIO_KEY]["stopped_at"] is None
+    resumed.close()
 
 
 # --- CLI --------------------------------------------------------------------------------------
@@ -857,3 +968,35 @@ def test_cli_paper_clear_halt_clears_a_manual_kill_only_when_safe(
     with session_scope(cli_db) as s:
         backtest_id = repo.create_run(s, Mode.BACKTEST, rig.cfg)
     assert "not a paper run" in clear(backtest_id).output
+
+
+def test_cli_paper_status_tells_a_clean_stop_from_a_hung_session(
+    tmp_path: Path, cli_db: Database
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+
+    def stop(seconds: float) -> None:  # Ctrl-C after the first poll
+        raise KeyboardInterrupt
+
+    session = rig.session(sleep=stop)
+    run_id = session.start()
+    session.run_forever()
+    session.close()
+
+    def status_after_an_hour() -> Any:
+        with session_scope(cli_db) as s:
+            s.execute(update(OpenPosition).values(updated_at=datetime.now(UTC) - HOUR))
+        return CliRunner().invoke(app, ["paper", "status"])
+
+    stopped = status_after_an_hour()
+    assert stopped.exit_code == 0, stopped.output  # deliberately stopped: not an outage
+    header = stopped.output.splitlines()[0]
+    assert header.startswith(f"paper run {run_id}: stopped at {(START + LAG).isoformat()} (resume")
+    assert "NOT POLLING" not in stopped.output
+
+    resumed = rig.session()
+    resumed.start(resume_run_id=run_id)  # clears stopped_at; then the process dies silently
+    resumed.close()
+    crashed = status_after_an_hour()
+    assert crashed.exit_code == 1 and "NOT POLLING" in crashed.output
+    assert crashed.output.startswith(f"paper run {run_id}: open (resume")
