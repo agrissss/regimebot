@@ -9,7 +9,7 @@ COPY config ./config
 COPY alembic.ini ./
 ARG EXTRAS=postgres
 # editable: the default config is located relative to the package source; the lock pins the
-# versions CI tested (psycopg, from the postgres extra, is not in it)
+# versions CI tested (psycopg and psycopg-binary too, for the postgres extra)
 RUN pip install -c requirements.lock -e ".[${EXTRAS}]"
 
 # the image has no .git: runs record this as their git_sha (docker compose passes it through)

@@ -1,5 +1,6 @@
 """Download history from an exchange into the database; safe to re-run, resumes."""
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import timeframe_minutes
 from regimebot.data.exchange import Exchange
-from regimebot.data.validate import gap_ranges
+from regimebot.data.validate import bad_bars, funding_gaps, gap_ranges
 from regimebot.db import repo
 
 log = structlog.get_logger(__name__)
@@ -18,7 +19,6 @@ log = structlog.get_logger(__name__)
 CANDLE_PAGE = 1000
 FUNDING_PAGE = 1000  # Binance funding-rate history maximum
 FUNDING_STEP = timedelta(milliseconds=1)  # ccxt timestamps are ms; `since` is inclusive
-FUNDING_INTERVAL = timedelta(hours=8)  # Binance perpetual funding cadence
 
 
 def download_candles(
@@ -28,6 +28,7 @@ def download_candles(
     timeframe: str,
     start: datetime,
     end: datetime,
+    on_reject: Callable[[pd.DataFrame], None] | None = None,
 ) -> int:
     """Store closed bars with ``start <= ts <= end``; returns the number of bars written.
 
@@ -37,6 +38,9 @@ def download_candles(
     arguments. A fully stored range makes no request. A hole the exchange has no data for (outage,
     pre-listing) costs one empty request per run and never loops. Commits after every page (the
     one place outside ``session_scope``) so progress survives an interruption.
+
+    ``on_reject`` (a paper poll): bars that break an OHLC sanity rule (``bad_bars``) are not
+    stored but handed to it, as a frame like the stored ones; paging goes on past them.
     """
     width = pd.Timedelta(minutes=timeframe_minutes(timeframe))
     first, last = pd.Timestamp(start).ceil(width), pd.Timestamp(end).floor(width)
@@ -47,7 +51,14 @@ def download_candles(
     total = 0
     for hole_start, hole_end in gap_ranges(grid.difference(stored), width):
         total += _fill_candles(
-            exchange, session, symbol, timeframe, hole_start, hole_end, width.to_pytimedelta()
+            exchange,
+            session,
+            symbol,
+            timeframe,
+            hole_start,
+            hole_end,
+            width.to_pytimedelta(),
+            on_reject,
         )
     return total
 
@@ -60,6 +71,7 @@ def _fill_candles(
     cursor: datetime,
     stop: datetime,
     width: timedelta,
+    on_reject: Callable[[pd.DataFrame], None] | None,
 ) -> int:
     """Page ``[cursor, stop]``, committing each page; ends on an empty page or no progress."""
     total = 0
@@ -76,6 +88,9 @@ def _fill_candles(
             columns=repo.CANDLE_COLUMNS,
             index=pd.DatetimeIndex([b.ts for b in bars], name="ts"),
         )
+        if on_reject is not None and (bad := bad_bars(frame)).any():
+            on_reject(frame[bad])
+            frame = frame[~bad]
         total += repo.upsert_candles(session, symbol, timeframe, frame)
         session.commit()  # each page is durable, so an interruption resumes here
         log.info(
@@ -89,34 +104,55 @@ def _fill_candles(
 
 
 def download_funding(
-    exchange: Exchange, session: Session, symbol: str, start: datetime, end: datetime
+    exchange: Exchange,
+    session: Session,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    *,
+    live: bool = False,
 ) -> int:
     """Store funding events with ``start <= ts <= end``; returns the number of rows written.
 
-    Stamps are irregular, so there is no grid: if the earliest stored stamp is later than
-    ``start`` + 8h, the range before it is backfilled; then everything after the latest stamp is
-    fetched. The backfill is all-or-nothing (one commit at its end, rollback on error), so an
-    interrupted backfill leaves no half range that bounds-based resuming would never repair; the
-    forward segment commits per page. With no data before listing, the backfill costs one empty
-    request per run.
+    Fetches only the holes: every stretch of the range without a stored stamp that is longer than
+    ``FUNDING_GAP_TOLERANCE`` (before the first stamp, between two, after the last), so an
+    interrupted run, an interior hole or the gap behind a paper session's recent window is
+    repaired by re-running with the same arguments. A range with no stored stamp is fetched
+    whole; a covered range makes no request. The stretch after the last stamp commits per page
+    (an interruption leaves it a shorter stretch at the end); every other hole is all-or-nothing
+    (one commit, rollback on error), so an interrupted fill never leaves a new interior hole. A
+    hole the exchange has no data for costs one request per run and never loops.
+
+    ``live`` (a paper poll): the stretch after the last stamp is always fetched, so a new event is
+    stored as soon as the exchange has it, not once the stretch passes the tolerance.
     """
-    bounds = repo.funding_ts_bounds(session, symbol)
-    if bounds is None:
+    stamps = list(repo.funding_timestamps(session, symbol, start, end).to_pydatetime())
+    if not stamps:
         return _fill_funding(exchange, session, symbol, start, end, commit_pages=True)
-    first, last = bounds
+    # Bounds one step outside the range: each gap's fetch is then (after + step, before - step).
+    gaps = funding_gaps(stamps, start - FUNDING_STEP, end + FUNDING_STEP)
     total = 0
-    if first > start + FUNDING_INTERVAL:
+    for after, before in gaps:
+        if before > end:  # the stretch after the last stamp: below
+            continue
         try:
             total += _fill_funding(
-                exchange, session, symbol, start, min(end, first - FUNDING_STEP), commit_pages=False
+                exchange,
+                session,
+                symbol,
+                after + FUNDING_STEP,
+                before - FUNDING_STEP,
+                commit_pages=False,
             )
             session.commit()
         except BaseException:
             session.rollback()
             raise
-    return total + _fill_funding(
-        exchange, session, symbol, max(start, last + FUNDING_STEP), end, commit_pages=True
-    )
+    if live or (gaps and gaps[-1][1] > end):
+        total += _fill_funding(
+            exchange, session, symbol, stamps[-1] + FUNDING_STEP, end, commit_pages=True
+        )
+    return total
 
 
 def _fill_funding(

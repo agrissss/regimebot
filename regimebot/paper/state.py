@@ -48,11 +48,14 @@ class FlushMarks:
 @dataclass(frozen=True)
 class Cursors:
     """Where a session stands: the last decision processed and, per symbol, the newest base bar
-    and funding event the engine has seen (anything later is replayed after a restart)."""
+    and funding event the engine has seen (anything later is replayed after a restart), and the
+    count and newest of the polled bars it dropped for breaking an OHLC sanity rule."""
 
     last_decision: datetime
     last_bar: dict[str, datetime]
     last_funding: dict[str, datetime]
+    rejected_bars: dict[str, int] = field(default_factory=dict)
+    last_rejected: dict[str, datetime] = field(default_factory=dict)
 
 
 def append_log(session: Session, run_id: int, log: RunLog, marks: FlushMarks) -> FlushMarks:
@@ -134,6 +137,8 @@ def save_state(
         "last_decision": cursors.last_decision.isoformat(),
         "last_bar": {s: ts.isoformat() for s, ts in cursors.last_bar.items()},
         "last_funding": {s: ts.isoformat() for s, ts in cursors.last_funding.items()},
+        "rejected_bars": dict(cursors.rejected_bars),
+        "last_rejected": {s: ts.isoformat() for s, ts in cursors.last_rejected.items()},
         "stopped_at": None if stopped_at is None else stopped_at.isoformat(),
     }
     repo.save_open_position(session, run_id, PORTFOLIO_KEY, saved)
@@ -174,6 +179,9 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
             _utc(saved["last_decision"]),
             {s: _utc(v) for s, v in saved["last_bar"].items()},
             {s: _utc(v) for s, v in saved["last_funding"].items()},
+            # states saved before rejected bars were counted have neither key
+            {s: int(n) for s, n in saved.get("rejected_bars", {}).items()},
+            {s: _utc(v) for s, v in saved.get("last_rejected", {}).items()},
         )
         cash, peak = float(saved["cash"]), float(saved["peak_equity"])
         engine_state = {key: saved[key] for key in ("queued_exits", "last_close")}
@@ -275,6 +283,17 @@ class PaperStatus:
     last_regimes: dict[str, tuple[datetime, str]]
     halted_reason: str | None
     risk_events: list[RiskEvent]  # the last STATUS_EVENTS, oldest first
+    rejected_bars: dict[str, int]  # polled bars dropped by the OHLC sanity rules, per symbol
+
+
+def latest_open_run(session: Session) -> int | None:
+    """Id of the most recent paper run that has not ended, or None."""
+    return session.scalar(
+        select(Run.id)
+        .where(Run.mode == str(Mode.PAPER), Run.ended_at.is_(None))
+        .order_by(Run.id.desc())
+        .limit(1)
+    )
 
 
 def latest_status(session: Session) -> PaperStatus | None:
@@ -330,4 +349,5 @@ def latest_status(session: Session) -> PaperStatus | None:
         last_regimes={symbol: (ts, regime) for symbol, ts, regime in regimes},
         halted_reason=next((kind for kind in HALT_SEVERITY if kind in halts), None),
         risk_events=[RiskEvent(e.ts, e.kind, e.detail, e.action) for e in reversed(events)],
+        rejected_bars={} if saved is None else dict(saved.get("rejected_bars", {})),
     )

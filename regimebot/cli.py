@@ -6,6 +6,7 @@ import tempfile
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as package_version
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated
 
@@ -13,16 +14,22 @@ import pandas as pd
 import typer
 import yaml
 from pydantic import ValidationError
+from sqlalchemy import Engine
 
-from regimebot.backtest.baselines import compute_baselines
+from regimebot.backtest.baselines import Baselines, compute_baselines
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
-from regimebot.backtest.runner import load_result, persist_result, run_backtest
+from regimebot.backtest.runner import BacktestResult, load_result, persist_result, run_backtest
 from regimebot.backtest.walk_forward import walk_forward
 from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
-from regimebot.data.validate import ValidationReport, validate_candles
+from regimebot.data.validate import (
+    FUNDING_GAP_TOLERANCE,
+    ValidationReport,
+    funding_gaps,
+    validate_candles,
+)
 from regimebot.db import repo
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.logging import configure_logging
@@ -30,10 +37,17 @@ from regimebot.market_state.features import compute_features, warmup_bars
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
 from regimebot.paper.session import EXCHANGE_MAX_RETRIES, EXCHANGE_TIMEOUT_MS, PaperSession
-from regimebot.paper.state import clear_halts, end_paper_run, latest_status, lock_run
-from regimebot.reporting.metrics import compute_metrics, first_permanent_halt
+from regimebot.paper.state import (
+    clear_halts,
+    end_paper_run,
+    latest_open_run,
+    latest_status,
+    lock_run,
+)
+from regimebot.reporting.metrics import compute_metrics, execution_quality, first_permanent_halt
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
+from regimebot.types import Mode
 
 app = typer.Typer(help="Regime-aware crypto trading research system.", no_args_is_help=True)
 
@@ -145,34 +159,69 @@ def _report_lines(report: ValidationReport, df: pd.DataFrame, short: bool) -> li
     return lines
 
 
+def _hours(span: timedelta) -> str:
+    return f"{span / timedelta(hours=1):.1f} h"
+
+
+def _funding_lines(
+    stamps: list[datetime], gaps: list[tuple[datetime, datetime]], start: datetime, end: datetime
+) -> list[str]:
+    """Row count, first and last stamp, the largest stretch without a stamp (range edges
+    included), and every stretch over the tolerance (at most ``MAX_GAPS_SHOWN``)."""
+    largest = max(b - a for a, b in pairwise([start, *stamps, end]))
+    head = f"funding rows={len(stamps)}"
+    if stamps:
+        head += f" first={stamps[0].isoformat()} last={stamps[-1].isoformat()}"
+    lines = [f"{head} largest_gap={_hours(largest)}"]
+    lines += [
+        f"funding gap {a.isoformat()} .. {b.isoformat()} ({_hours(b - a)})"
+        for a, b in gaps[:MAX_GAPS_SHOWN]
+    ]
+    if len(gaps) > MAX_GAPS_SHOWN:
+        lines.append(f"... and {len(gaps) - MAX_GAPS_SHOWN} more funding gaps")
+    return lines
+
+
 @data_app.command("check")
 def data_check() -> None:
-    """Validate stored candles per symbol over the backtest range and the feature warm-up before
-    it (``history_start`` to the backtest end); exit 1 if any symbol is not ok."""
+    """Validate stored candles and funding per symbol over the backtest range and the feature
+    warm-up before it (``history_start`` to the backtest end); exit 1 if any symbol is not ok.
+    Funding fails on any stretch without a stamp longer than ``FUNDING_GAP_TOLERANCE``."""
     cfg = load_config()
     tf = cfg.exchange.base_timeframe
     width = pd.Timedelta(minutes=timeframe_minutes(tf))
-    start = history_start(cfg)
+    start, end = history_start(cfg), cfg.backtest.end
     engine = make_engine(cfg.database_url)
-    all_ok = True
+    candles_ok = funding_ok = True
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            df = repo.load_candles(session, symbol, tf, start, cfg.backtest.end)
+            df = repo.load_candles(session, symbol, tf, start, end)
             report = validate_candles(df, tf)
             # exact: first bar closes at the first grid point >= start, last at the one before end
             short = report.bars == 0 or (
                 df.index[0] > pd.Timestamp(start).ceil(width)
-                or df.index[-1] < pd.Timestamp(cfg.backtest.end).ceil(width) - width
+                or df.index[-1] < pd.Timestamp(end).ceil(width) - width
             )
-            all_ok &= report.ok and not short
-            typer.echo(f"{symbol}: {'OK' if report.ok and not short else 'FAIL'}")
-            for line in _report_lines(report, df, short):
+            stamps = list(repo.funding_timestamps(session, symbol, start, end).to_pydatetime())
+            gaps = funding_gaps(stamps, start, end)
+            ok = report.ok and not short
+            candles_ok &= ok
+            funding_ok &= not gaps
+            typer.echo(f"{symbol}: {'OK' if ok and not gaps else 'FAIL'}")
+            for line in _report_lines(report, df, short) + _funding_lines(stamps, gaps, start, end):
                 typer.echo(f"  {line}")
-    if not all_ok:
+    if not candles_ok:
         typer.echo(
             f"the backtest needs {tf} history from {start.isoformat()} (feature warm-up) to "
-            f"{cfg.backtest.end.isoformat()}: run `regimebot data download` to fetch it"
+            f"{end.isoformat()}: run `regimebot data download` to fetch it"
         )
+    if not funding_ok:
+        typer.echo(
+            f"funding has stretches over {FUNDING_GAP_TOLERANCE / timedelta(hours=1):.0f} h "
+            f"without a stamp between {start.isoformat()} and {end.isoformat()}: "
+            "run `regimebot data download` to fetch them"
+        )
+    if not (candles_ok and funding_ok):
         raise typer.Exit(1)
 
 
@@ -289,6 +338,12 @@ def backtest_run(
             f"warning: under-warmed start, no trades until warm ({'; '.join(cold)}): "
             "run `regimebot data download` for the warm-up history"
         )
+    if holes := [e.detail for e in events if e.kind == "funding_missing"]:
+        more = f" (+{len(holes) - 1} more, see risk events)" if len(holes) > 1 else ""
+        typer.echo(
+            f"warning: funding missing, not charged there ({holes[0]}{more}): "
+            "run `regimebot data download` for the funding history"
+        )
     typer.echo(f"run {run_id}")
 
 
@@ -346,8 +401,8 @@ def backtest_robustness(
     end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
     set_: _SetOption = None,
 ) -> None:
-    """Parameter sensitivity, doubled costs, and effective leverage (gross and group caps) 1.0
-    vs 1.5."""
+    """Parameter sensitivity, costs x0.5 / x1 / x2, and effective leverage (gross and group caps)
+    1.0 vs 1.5."""
     out = Path("reports")
     out.mkdir(parents=True, exist_ok=True)  # before the long computation, so it fails fast
     cfg, candles, funding = _research_inputs(start, end, set_)
@@ -361,6 +416,9 @@ def backtest_robustness(
     _show(leverage_compare(cfg, candles, funding, a, b), out / "leverage_compare.csv")
 
 
+MAX_RANDOM_SEEDS = 50
+
+
 @app.command()
 def report(
     run_id: Annotated[int, typer.Argument(help="Run id printed by `backtest run`.")],
@@ -368,13 +426,20 @@ def report(
         int | None, typer.Option(help="Parameter variants tried before this one (shown).")
     ] = None,
     random_seeds: Annotated[
-        int, typer.Option(min=0, help="Number of random-entry seeds (0, 1, ... N-1); 0 skips.")
+        int,
+        typer.Option(
+            min=0,
+            max=MAX_RANDOM_SEEDS,
+            help="Number of random-entry seeds (0, 1, ... N-1), at most 50; 0 skips. Backtests.",
+        ),
     ] = 3,
 ) -> None:
-    """Rebuild the HTML report for a stored backtest into reports/run_<id>/.
+    """Rebuild the HTML report for a stored run into reports/run_<id>/.
 
     Trades, fills, risk events and equity come from the database; the baselines are recomputed
     from stored candles with the run's stored config (the random-entry rerun takes a minute or two).
+    A paper run, open or ended, gets the same report over its period (first to last equity
+    snapshot) with buy and hold as its only baseline and an execution-quality section.
     """
     database_url = load_config().database_url
     engine = make_engine(database_url)
@@ -383,10 +448,6 @@ def report(
             run = repo.load_run(session, run_id)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from None
-        if run.mode != "backtest":
-            raise typer.BadParameter(
-                f"run {run_id} is a {run.mode} run; only backtests have reports"
-            )
         try:
             cfg = AppConfig.model_validate(
                 json.loads(run.config_json) | {"database_url": database_url}
@@ -396,15 +457,42 @@ def report(
             raise typer.Exit(1) from None
         result = load_result(session, run_id, cfg)
         n_signals = repo.count_signals(session, run_id)
-        base, first, end = cfg.exchange.base_timeframe, history_start(cfg), cfg.backtest.end
+        execution = None
+        first, end = history_start(cfg), cfg.backtest.end
+        if paper := run.mode == Mode.PAPER:
+            signals = repo.load_signal_stamps(session, run_id)
+            decisions = repo.load_risk_decisions(session, run_id)
+            execution = execution_quality(result.log.fills, result.trades, signals, decisions)
+            # a day before the period: its first decision bar, and its first day's market return
+            first, end = result.start - timedelta(days=1), result.end
+        base = cfg.exchange.base_timeframe
         candles = {s: repo.load_candles(session, s, base, first, end) for s in cfg.exchange.symbols}
         funding = {s: repo.load_funding(session, s, first, end) for s in cfg.exchange.symbols}
-    typer.echo("recomputing baselines (buy and hold, random entry) ...")
-    baselines = compute_baselines(
-        result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
-    )
-    path = write_report(result, baselines, Path("reports") / f"run_{run_id}", variants_tried)
+    if paper:
+        baselines = _paper_baselines(result, candles, funding)
+    else:
+        typer.echo("recomputing baselines (buy and hold, random entry) ...")
+        baselines = compute_baselines(
+            result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
+        )
+    out = Path("reports") / f"run_{run_id}"
+    path = write_report(result, baselines, out, variants_tried, execution)
     typer.echo(f"wrote {path}")
+
+
+def _paper_baselines(
+    result: BacktestResult, candles: dict[str, pd.DataFrame], funding: dict[str, pd.Series]
+) -> Baselines:
+    """Buy and hold over a paper run's period (random entry is backtest-only); none, with a
+    note, before its first decision or when a symbol has no stored decision bar in it."""
+    if result.equity.empty:
+        typer.echo("paper run: no decision yet, so no buy-and-hold baseline")
+        return Baselines()
+    try:
+        return compute_baselines(result, candles, funding, 0, seeds=())
+    except ValueError as exc:
+        typer.echo(f"paper run: no buy-and-hold baseline ({exc})")
+        return Baselines()
 
 
 def _say(line: str) -> None:
@@ -418,14 +506,40 @@ paper_app = typer.Typer(
 app.add_typer(paper_app, name="paper")
 
 
+def _resume_target(resume: str | None, db: Engine) -> int | None:
+    """The run ``paper run --resume`` continues: a run id, or for ``latest`` the most recent
+    open paper run (None, a new run, when there is none)."""
+    if resume is None:
+        return None
+    if resume == "latest":
+        with session_scope(db) as session:
+            run_id = latest_open_run(session)
+        if run_id is None:
+            _say("--resume latest: no open paper run, starting a new one")
+        else:
+            _say(f"--resume latest: resuming open paper run {run_id}")
+        return run_id
+    try:
+        return int(resume)
+    except ValueError:
+        raise typer.BadParameter(
+            f"expected a run id or `latest`, got {resume!r}", param_hint="--resume"
+        ) from None
+
+
 @paper_app.command("run")
 def paper_run(
     resume: Annotated[
-        int | None, typer.Option(help="Continue this open paper run (its id from the banner).")
+        str | None,
+        typer.Option(
+            help="Continue this open paper run (its id from the banner), or `latest`: the most "
+            "recent open paper run, else a new one (safe for a supervisor to restart)."
+        ),
     ] = None,
 ) -> None:
     """Paper-trade the configured symbols until Ctrl-C or SIGTERM. Simulated fills only: no
-    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it and
+    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it,
+    `--resume latest` continues the most recent open run (or starts one when none is open), and
     `paper end RUN_ID` ends it for good.
 
     Logs are JSON lines on stdout; the banner goes to stderr.
@@ -433,6 +547,8 @@ def paper_run(
     cfg = load_config()
     configure_logging()
     _say("PAPER TRADING: simulated fills only, no orders are sent to any exchange.")
+    db = make_engine(cfg.database_url)
+    resume_id = _resume_target(resume, db)
     _say(
         f"warming up {cfg.paper.warmup_bars} {cfg.exchange.decision_timeframe} bars of history ..."
     )
@@ -440,17 +556,25 @@ def paper_run(
     exchange = CcxtExchange(
         cfg.exchange.id, max_retries=EXCHANGE_MAX_RETRIES, timeout_ms=EXCHANGE_TIMEOUT_MS
     )
-    session = PaperSession(cfg, exchange, make_engine(cfg.database_url), DEFAULT_KILL_FILE)
+    session = PaperSession(cfg, exchange, db, DEFAULT_KILL_FILE)
     try:
-        run_id = session.start(resume)
+        run_id = session.start(resume_id)
     except ValueError as exc:  # not a resumable paper run
         raise typer.BadParameter(str(exc), param_hint="--resume") from None
+    try:
+        _run_session(cfg, session, run_id, resumed=resume_id is not None)
+    finally:
+        session.close()  # release the run lock (process exit would too)
+
+
+def _run_session(cfg: AppConfig, session: PaperSession, run_id: int, resumed: bool) -> None:
+    """Print the banner, poll until stopped, then say how to resume or end the run."""
     _say(
         "\n".join(
             [
                 "=" * 72,
                 "PAPER TRADING - simulated fills only, no orders are sent to any exchange",
-                f"run id:    {run_id} ({'resumed' if resume is not None else 'new'})",
+                f"run id:    {run_id} ({'resumed' if resumed else 'new'})",
                 f"symbols:   {', '.join(cfg.exchange.symbols)}, polling every "
                 f"{cfg.paper.poll_seconds}s",
                 f"kill file: {DEFAULT_KILL_FILE} (`regimebot kill` flattens at the next poll)",
@@ -571,6 +695,8 @@ def paper_status(
         ts, equity = status.equity
         typer.echo(f"equity: {equity:.2f} at {ts.isoformat()} (cash {status.cash or 0.0:.2f})")
     typer.echo(f"halted: {status.halted_reason or 'no'}")
+    rejected = ", ".join(f"{s} {n}" for s, n in sorted(status.rejected_bars.items()) if n)
+    typer.echo(f"rejected bars: {rejected or 0}")
     typer.echo(f"open positions: {len(status.positions)}")
     for p in status.positions:
         typer.echo(

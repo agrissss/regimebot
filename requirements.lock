@@ -37,6 +37,8 @@ pathspec==1.1.1
 pillow==13.0.0
 pluggy==1.7.0
 propcache==0.5.4
+psycopg==3.3.9
+psycopg-binary==3.3.9
 pycares==5.2.1
 pycparser==3.12
 pydantic==2.14.4

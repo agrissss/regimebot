@@ -1,4 +1,4 @@
-"""Robustness checks: parameter sensitivity, doubled costs, effective leverage 1.0 vs 1.5.
+"""Robustness checks: parameter sensitivity, costs x0.5 / x1 / x2, effective leverage 1.0 vs 1.5.
 
 Each function re-runs the backtest on ``[start, end)`` with a modified config; all other
 settings stay at ``cfg``. ``strategies`` is an optional pass-through to ``run_backtest``.
@@ -112,24 +112,33 @@ def sensitivity(
     return pd.DataFrame(rows, columns=cols)
 
 
+COST_MULTS = (0.5, 1.0, 2.0)
+
+
 def cost_stress(
     cfg: AppConfig,
     candles: Mapping[str, pd.DataFrame],
     funding: Mapping[str, pd.Series],
     start: datetime,
     end: datetime,
-    mult: float = 2.0,
+    mults: Sequence[float] = COST_MULTS,
     strategies: Sequence[Strategy] | None = None,
 ) -> pd.DataFrame:
-    """Rows ``base`` and ``stressed`` (every cost bps field times ``mult``)."""
-    stressed = with_overrides(cfg, {f"costs.{k}": getattr(cfg.costs, k) * mult for k in COST_KEYS})
+    """One row per multiplier (default x0.5, x1, x2): every cost bps field times it; x1 runs
+    ``cfg`` itself and is labelled ``base``. Columns: variant, cost_mult, net_pnl,
+    profit_factor, n_trades, fees, halted_at."""
     rows = []
-    for label, c in (("base", cfg), ("stressed", stressed)):
+    for mult in mults:
+        c = cfg
+        if mult != 1.0:
+            c = with_overrides(cfg, {f"costs.{k}": getattr(cfg.costs, k) * mult for k in COST_KEYS})
+        label = "base" if mult == 1.0 else f"x{mult:g}"
         m, _, halted = run_metrics(c, candles, funding, start, end, strategies)
         log.info("cost_stress", variant=label)
         rows.append(
             {
                 "variant": label,
+                "cost_mult": mult,
                 "net_pnl": m.net_pnl,
                 "profit_factor": m.profit_factor,
                 "n_trades": m.n_trades,

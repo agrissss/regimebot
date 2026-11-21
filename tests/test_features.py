@@ -72,7 +72,7 @@ def test_prefix_invariance_every_column() -> None:
         ema_fast=10, ema_slow=30, volume_window=20, donchian_window=20, zscore_window=20,
     )  # fmt: skip
     candles = random_walk(4000)
-    # Two zero-volume bars, not 1%: a NaN Amihud blanks illiq_pctile for a whole window
+    # Two zero-volume bars: they rank as the most illiquid, at the cut and in later windows
     volume = candles.columns.get_loc("volume")
     candles.iloc[:, volume] = candles["volume"] + 1.0
     candles.iloc[[600, 2700], volume] = 0.0
@@ -85,8 +85,8 @@ def test_prefix_invariance_every_column() -> None:
     assert full["bars_since_compression"].isna().any()
     # the percentile ranks (valid from rows 219 and 200) are valid before the cut at 250
     assert full[["vol_pctile", "illiq_pctile"]].iloc[:250].notna().all(axis=1).any()
-    assert full["illiq_pctile"].iloc[600:800].isna().all()  # the zero-volume bar's window
-    for k in (1, 5, 15, 30, 250, 1001, 2500, 3999):
+    assert full["illiq_pctile"].iloc[600] == 1.0 and full["illiq_pctile"].iloc[200:].notna().all()
+    for k in (1, 5, 15, 30, 250, 601, 1001, 2500, 2701, 3999):
         known = funding[funding.index <= candles.index[k - 1]]  # only what exists at the cut
         prefix = compute_features(candles.iloc[:k], cfg, COMPRESSION, known)
         pd.testing.assert_frame_equal(
@@ -166,11 +166,11 @@ def test_warmup_nan_never_filled() -> None:
     assert out["funding"].isna().all()  # none supplied
 
 
-def test_zero_volume_gives_nan_not_inf() -> None:
-    c = random_walk(200)
+def test_zero_volume_ranks_most_illiquid_and_gives_no_inf() -> None:
+    c = random_walk(200).assign(volume=5.0)
     c.iloc[150, c.columns.get_loc("volume")] = 0.0
     out = compute_features(c, make_cfg(volume_window=5), COMPRESSION)
-    assert np.isnan(out["illiq_pctile"].iloc[150])
+    assert out["illiq_pctile"].iloc[150] == 1.0  # the window's maximum
     assert not np.isinf(out.to_numpy(dtype=float)).any()
 
 
@@ -182,13 +182,17 @@ def test_illiq_pctile_first_valid_index() -> None:
     assert out["illiq_pctile"].iloc[cfg.pctile_window :].notna().all()
 
 
-def test_a_zero_volume_bar_keeps_illiq_pctile_nan_while_in_the_window() -> None:
+def test_a_zero_volume_bar_keeps_the_illiquidity_window_full() -> None:
     cfg = make_cfg()
     c = random_walk(100, seed=3).assign(volume=5.0)
-    c.iloc[50, c.columns.get_loc("volume")] = 0.0  # Amihud NaN at row 50
-    illiq = compute_features(c, cfg, COMPRESSION)["illiq_pctile"]
-    assert illiq.iloc[50 : 50 + cfg.pctile_window].isna().all()
-    assert illiq.iloc[50 + cfg.pctile_window :].notna().all()
+    c.iloc[50, c.columns.get_loc("volume")] = 0.0  # no trades, but a valid return
+    out = compute_features(c, cfg, COMPRESSION)
+    illiq = out["illiq_pctile"]
+    assert illiq.iloc[cfg.pctile_window :].notna().all()  # no NaN gap behind the bar
+    assert illiq.iloc[50] == 1.0
+    # while it is in the window it outranks every later bar: they rank one step lower
+    later = illiq.iloc[51 : 50 + cfg.pctile_window]
+    assert (later <= 1.0 - 1.0 / cfg.pctile_window).all()
 
 
 def well_behaved(n: int) -> tuple[pd.DataFrame, pd.Series]:

@@ -35,11 +35,12 @@ from regimebot.db import repo
 from regimebot.db.session import session_scope
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
+from regimebot.market_state.features import warm_rows
 from regimebot.paper import state
 from regimebot.reporting.alerts import alert
 from regimebot.risk.manager import RiskManager
 from regimebot.strategy import Strategy, build_strategies
-from regimebot.types import Bar, Mode, Quote
+from regimebot.types import Bar, Mode, Quote, RiskEvent
 
 log = structlog.get_logger(__name__)
 
@@ -76,7 +77,9 @@ class PaperSession:
     and alerted as ``decision_missed`` unless it closed before this process started (a routine
     start or resume, logged at info). Only symbols with bar T stored
     get a window; the others are recorded as ``stale_data`` by the engine and not traded.
-    ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends.
+    ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends. A
+    window whose last row is not fully valid (too little warm history) records
+    ``warmup_incomplete`` at every decision and is alerted the same way.
 
     Fills: spreads come from quotes fetched just before ``on_decision``; after it, each symbol
     with a queued order fills at a fresh quote, stamped with the session clock, with the last
@@ -120,6 +123,8 @@ class PaperSession:
         self._marks = state.FlushMarks()
         self._newest: dict[str, Bar] = {}  # newest bar fed to the engine, per symbol
         self._last_funding: dict[str, datetime] = {}  # newest funding event fed, per symbol
+        self._rejected: dict[str, int] = {}  # polled bars dropped by the OHLC sanity rules
+        self._last_rejected: dict[str, datetime] = {}  # newest of them, per symbol
         self._last_decision = _EPOCH
         self._incidents: set[str] = set()  # open alert incidents, "kind:subject"
         self._halts: set[str] = set()  # active halts last seen (alerted on change)
@@ -187,6 +192,8 @@ class PaperSession:
                     self._newest[symbol] = self._stored_bar(session, symbol, ts)
                 self._last_funding = dict(cursors.last_funding)
                 self._last_decision = cursors.last_decision
+                self._rejected = dict(cursors.rejected_bars)
+                self._last_rejected = dict(cursors.last_rejected)
             self._halts = set(self.risk.to_state()["halts"])
             self._marks = self._save(session)
         return self.run_id
@@ -295,26 +302,57 @@ class PaperSession:
             self._last_decision,
             {s: bar.ts for s, bar in self._newest.items()},
             dict(self._last_funding),
+            dict(self._rejected),
+            dict(self._last_rejected),
         )
         state.save_state(session, self.run_id, self.engine, cursors, self._stopped_at)
         return marks
 
     def _download(self, symbol: str, since: datetime, now: datetime) -> bool:
-        """Store ``symbol``'s closed base bars in ``[since, now]`` and its new funding events;
-        False when the candle download failed."""
+        """Store ``symbol``'s closed base bars in ``[since, now]`` (dropping any that break an
+        OHLC sanity rule: ``_reject``) and its new funding events; False when the candle download
+        failed."""
         ok = True
         try:
             with session_scope(self._db) as session:
-                download_candles(self.exchange, session, symbol, self._tf, since, now)
+                download_candles(
+                    self.exchange,
+                    session,
+                    symbol,
+                    self._tf,
+                    since,
+                    now,
+                    on_reject=lambda rows: self._reject(symbol, rows),
+                )
         except Exception as exc:  # any exchange or data error: the symbol is stale this poll
             log.warning("paper_download_failed", symbol=symbol, data="candles", error=repr(exc))
             ok = False
         try:
             with session_scope(self._db) as session:
-                download_funding(self.exchange, session, symbol, now - self._history, now)
+                download_funding(
+                    self.exchange, session, symbol, now - self._history, now, live=True
+                )
         except Exception as exc:  # retried next poll
             log.warning("paper_download_failed", symbol=symbol, data="funding", error=repr(exc))
         return ok
+
+    def _reject(self, symbol: str, rows: pd.DataFrame) -> None:
+        """Log and count the bars a download dropped for breaking an OHLC sanity rule (they are
+        not stored, so the symbol misses them like any gap). Each bar counts once: one at or
+        before the newest already counted (fetched again by a later poll) is skipped. A resume's
+        warm-up runs before the saved counts are restored, so it may log an old bar again, but
+        the counts ``paper status`` shows as rejected bars come back from the saved state."""
+        last = self._last_rejected.get(symbol)
+        stamps = pd.DatetimeIndex(rows.index).to_pydatetime()
+        values = rows[repo.CANDLE_COLUMNS].to_numpy(dtype=float).tolist()
+        for ts, bar in zip(stamps, values, strict=True):
+            if last is not None and ts <= last:
+                continue
+            last = ts
+            self._rejected[symbol] = self._rejected.get(symbol, 0) + 1
+            self._last_rejected[symbol] = ts
+            ohlcv = dict(zip(repo.CANDLE_COLUMNS, bar, strict=True))
+            log.warning("paper_bar_rejected", symbol=symbol, ts=ts.isoformat(), **ohlcv)
 
     def _new_events(self, now: datetime) -> tuple[list[Event], dict[str, datetime]]:
         """Stored bars and funding events newer than the engine has seen, all symbols in time
@@ -451,6 +489,7 @@ class PaperSession:
             return None
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice
+        self._check_warm(ts, windows)
         self.engine.on_decision(ts, windows, spreads)
         log.info(
             "paper_decision",
@@ -460,6 +499,21 @@ class PaperSession:
             positions=sorted(self.portfolio.positions),
         )
         return quotes
+
+    def _check_warm(self, ts: datetime, windows: dict[str, pd.DataFrame]) -> None:
+        """Record a ``warmup_incomplete`` risk event at ``ts`` for every symbol whose window's
+        last row is not fully valid (it cannot be classified: no trade), alerted once per
+        incident like ``stale_data``. A symbol without a window keeps its incident as it was."""
+        for symbol in self._symbols:
+            if (window := windows.get(symbol)) is None:
+                continue
+            problem = None
+            if not warm_rows(window).iloc[-1]:
+                problem = f"features not fully valid at {ts.isoformat()}"
+                detail = f"{symbol}: {problem}"
+                event = RiskEvent(ts, "warmup_incomplete", detail, "no_trade_until_warm")
+                self.log.risk_events.append(event)
+            self._track("warmup_incomplete", symbol, problem)
 
     def _windows(self, ts: datetime, symbols: list[str]) -> dict[str, pd.DataFrame]:
         """Trailing ``WINDOW_ROWS`` feature rows of ``symbols`` from the stored history, exactly

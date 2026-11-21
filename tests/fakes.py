@@ -20,7 +20,8 @@ class FakeExchange:
 
     ``n_bars`` bars exist in total; pages hold at most ``page_size`` bars. Bar ``i`` (1-based)
     closes at ``T0 + i*step`` with ``close = 100 + i``. Funding events occur every 8h from
-    ``T0`` (``n_funding`` of them, rate ``0.0001 * k``). The ``fetch_candles`` (and, separately,
+    ``T0`` (``n_funding`` of them, rate ``0.0001 * k``), except the ``k`` in ``funding_missing``
+    (the exchange has no record for them). The ``fetch_candles`` (and, separately,
     ``fetch_funding``) call numbered ``fail_on_call`` (1-based) raises ``ccxt.NetworkError``
     (simulated interruption).
     ``repeat_page`` makes the exchange ignore ``since`` and always return its first page.
@@ -34,6 +35,7 @@ class FakeExchange:
         n_funding: int = 0,
         fail_on_call: int | None = None,
         repeat_page: bool = False,
+        funding_missing: range = range(0),
     ) -> None:
         self.step = timedelta(minutes=timeframe_minutes(timeframe))
         self.n_bars = n_bars
@@ -41,6 +43,7 @@ class FakeExchange:
         self.n_funding = n_funding
         self.fail_on_call = fail_on_call
         self.repeat_page = repeat_page
+        self.funding_missing = funding_missing
         self.candle_calls: list[datetime] = []  # `since` of every fetch_candles call
         self.funding_calls: list[datetime] = []
 
@@ -62,7 +65,11 @@ class FakeExchange:
         self.funding_calls.append(since)
         if len(self.funding_calls) == self.fail_on_call:
             raise ccxt.NetworkError("injected network error")
-        events = [(T0 + timedelta(hours=8 * k), 0.0001 * k) for k in range(self.n_funding)]
+        events = [
+            (T0 + timedelta(hours=8 * k), 0.0001 * k)
+            for k in range(self.n_funding)
+            if k not in self.funding_missing
+        ]
         return [e for e in events if e[0] >= since][: min(limit, self.page_size)]
 
     def fetch_quote(self, symbol: str) -> Quote:

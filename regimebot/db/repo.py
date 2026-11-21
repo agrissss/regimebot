@@ -182,6 +182,22 @@ def candle_timestamps(
     return _utc_index(session.scalars(stmt))
 
 
+def funding_timestamps(
+    session: Session, symbol: str, start: datetime, end: datetime
+) -> pd.DatetimeIndex:
+    """Sorted stored funding ``ts`` values with ``start <= ts <= end`` (both inclusive)."""
+    stmt = (
+        select(FundingRate.ts)
+        .where(
+            FundingRate.symbol == symbol,
+            *_time_range(FundingRate, start, None),
+            FundingRate.ts <= end,
+        )
+        .order_by(FundingRate.ts)
+    )
+    return _utc_index(session.scalars(stmt))
+
+
 def funding_ts_bounds(session: Session, symbol: str) -> tuple[datetime, datetime] | None:
     """Earliest and latest stored funding ``ts`` for a symbol, or ``None`` when empty."""
     row = session.execute(
@@ -367,6 +383,8 @@ def save_fills(session: Session, run_id: int, fills: Sequence[Fill]) -> None:
             "fee": f.fee,
             "slippage_bps": f.slippage_bps,
             "liquidity": f.liquidity,
+            "bid": f.bid,
+            "ask": f.ask,
         }
         for f in fills
     ]
@@ -387,6 +405,8 @@ def load_fills(session: Session, run_id: int) -> list[Fill]:
             r.fee,
             r.slippage_bps,
             r.liquidity,
+            r.bid,
+            r.ask,
         )
         for r in session.scalars(stmt)
     ]
@@ -417,6 +437,25 @@ def save_signals(session: Session, run_id: int, signals: Sequence[Signal]) -> li
         stmt = insert(SignalRow).returning(SignalRow.id, sort_by_parameter_order=True)
         ids.extend(session.scalars(stmt, rows[i : i + CHUNK_ROWS]))
     return ids
+
+
+def load_signal_stamps(session: Session, run_id: int) -> dict[int, tuple[str, datetime]]:
+    """A run's signals as row id -> (symbol, ts), the link ``risk_decisions.signal_id`` uses."""
+    stmt = select(SignalRow.id, SignalRow.symbol, SignalRow.ts).where(SignalRow.run_id == run_id)
+    return {sid: (symbol, ts) for sid, symbol, ts in session.execute(stmt)}
+
+
+def load_risk_decisions(
+    session: Session, run_id: int
+) -> list[tuple[int | None, datetime, RiskDecision]]:
+    """A run's risk decisions as ``(signal_id, ts, RiskDecision)`` in insertion order."""
+    stmt = (
+        select(RiskDecisionRow).where(RiskDecisionRow.run_id == run_id).order_by(RiskDecisionRow.id)
+    )
+    return [
+        (r.signal_id, r.ts, RiskDecision(r.approved, r.qty, r.rule, r.detail))
+        for r in session.scalars(stmt)
+    ]
 
 
 def save_risk_decisions(

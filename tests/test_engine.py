@@ -102,6 +102,16 @@ def test_signal_is_sized_queued_and_filled_at_the_quote_not_the_close(tmp_path: 
     assert engine.portfolio.cash == approx(10_000 - 1.2505000375)
 
 
+def test_a_live_spread_is_stored_with_the_regime_inputs(tmp_path: Path) -> None:
+    engine = make(tmp_path, symbols=(BTC, ETH))
+    engine.on_decision(T1, {s: window(T1, 100.0) for s in (BTC, ETH)}, spreads={BTC: 2.5})
+    inputs = {symbol: inputs for symbol, _, _, inputs in engine.log.regimes}
+    assert inputs[BTC]["spread_bps"] == 2.5  # what the classifier was given
+    assert "spread_bps" not in inputs[ETH]  # no quote, no spread: nothing made up
+    decide(engine, T2, {BTC: 100.0, ETH: 100.0})  # a backtest decision: no spreads at all
+    assert [set(i) for _, ts, _, i in engine.log.regimes if ts == T2] == [set(REGIME_INPUTS)] * 2
+
+
 def test_participation_cap_gives_a_partial_entry(tmp_path: Path) -> None:
     engine = make(tmp_path, Scripted("trend"))
     decide(engine, T1, {BTC: 100.0})
@@ -111,6 +121,16 @@ def test_participation_cap_gives_a_partial_entry(tmp_path: Path) -> None:
     assert fill.qty == approx(5.0)
     assert fill.price == approx(100.01 * 1.0007)
     assert engine.portfolio.positions[BTC].qty == approx(5.0)
+
+
+def test_a_fill_cut_below_the_configured_min_notional_is_cancelled(tmp_path: Path) -> None:
+    # the same 5-unit cut fill as above (~500 quote) is dust when risk.min_notional is 600
+    engine = make(tmp_path, Scripted("trend"), overrides={"risk.min_notional": 600.0})
+    decide(engine, T1, {BTC: 100.0})
+    engine.fill_queued(BTC, T1, 99.99, 100.01, bar_volume=100.0)
+    assert rules(engine) == [(0, "ok"), (0, "no_liquidity")]
+    assert engine.log.decisions[-1][2].detail.endswith("min notional 600.0")
+    assert engine.log.fills == [] and engine.portfolio.positions == {}
 
 
 @pytest.mark.parametrize("volume", [0.0, 1.0, 5e-324], ids=["zero", "dust", "subnormal"])

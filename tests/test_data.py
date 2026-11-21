@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,12 +15,13 @@ from typer.testing import CliRunner
 from regimebot.cli import app, history_start
 from regimebot.config import AppConfig, load_config
 from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
-from regimebot.data.history import download_candles, download_funding
+from regimebot.data.history import FUNDING_STEP, download_candles, download_funding
 from regimebot.data.resample import resample
-from regimebot.data.validate import gap_ranges, validate_candles
-from regimebot.db.models import Base, Candle
-from regimebot.db.repo import load_candles, load_funding, upsert_candles
+from regimebot.data.validate import bad_bars, gap_ranges, validate_candles
+from regimebot.db.models import Base, Candle, FundingRate
+from regimebot.db.repo import load_candles, load_funding, upsert_candles, upsert_funding
 from regimebot.db.session import make_engine, session_scope
+from regimebot.types import Bar
 
 SYM = "BTC/USDT:USDT"
 MIN = timedelta(minutes=1)
@@ -206,6 +208,91 @@ def test_earlier_start_backfills_funding(session: Session) -> None:
     assert len(load_funding(session, SYM)) == 5
     assert download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end) == 5
     assert len(load_funding(session, SYM)) == 10
+
+
+EIGHT_H = timedelta(hours=8)  # the fake exchange's funding cadence: event k at T0 + 8h * k
+
+
+def _delete_funding(session: Session, lo: datetime, hi: datetime) -> None:
+    session.execute(delete(FundingRate).where(FundingRate.ts >= lo, FundingRate.ts <= hi))
+    session.commit()
+
+
+def test_the_hole_behind_a_recent_island_is_filled_by_a_same_arguments_rerun(
+    session: Session,
+) -> None:
+    """A paper session stores only its recent window: old history, then an island near "now".
+    Re-running the original download fills the stretch between them."""
+    end = T0 + 60 * EIGHT_H
+    download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end)  # k 0..9
+    island = FakeExchange(n_bars=1, n_funding=50)
+    download_funding(island, session, SYM, T0 + 40 * EIGHT_H, end)  # k 40..49
+    assert len(load_funding(session, SYM)) == 20
+    rerun = FakeExchange(n_bars=1, n_funding=50)
+    assert download_funding(rerun, session, SYM, T0, end) == 30  # k 10..39
+    assert rerun.funding_calls[0] == T0 + 9 * EIGHT_H + FUNDING_STEP  # right after the old end
+    assert len(load_funding(session, SYM)) == 50
+
+
+def test_an_interior_funding_hole_is_filled_and_only_the_hole_is_fetched(session: Session) -> None:
+    end = T0 + 19 * EIGHT_H + timedelta(hours=16)  # within the tolerance of the last event
+    download_funding(FakeExchange(n_bars=1, n_funding=20), session, SYM, T0, end)
+    _delete_funding(session, T0 + 6 * EIGHT_H, T0 + 8 * EIGHT_H)  # k 6..8: 32 h between stamps
+    ex = FakeExchange(n_bars=1, n_funding=20)
+    assert download_funding(ex, session, SYM, T0, end) == 3
+    # the hole, then the page that finds nothing more in it; no edge is fetched
+    assert ex.funding_calls == [T0 + 5 * EIGHT_H + FUNDING_STEP, T0 + 8 * EIGHT_H + FUNDING_STEP]
+    assert len(load_funding(session, SYM)) == 20
+
+
+def test_an_interrupted_interior_funding_fill_leaves_no_new_hole_and_a_rerun_completes_it(
+    session: Session,
+) -> None:
+    end = T0 + 299 * EIGHT_H + timedelta(hours=16)  # within the tolerance of the last event
+    download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end)  # k 0..9
+    island = FakeExchange(n_bars=1, n_funding=300)
+    download_funding(island, session, SYM, T0 + 290 * EIGHT_H, end)  # k 290..299
+    before = list(load_funding(session, SYM).index)
+    assert len(before) == 20
+    broken = FakeExchange(n_bars=1, n_funding=300, fail_on_call=2)  # dies on the hole's page 2
+    with pytest.raises(ccxt.NetworkError):
+        download_funding(broken, session, SYM, T0, end)
+    assert list(load_funding(session, SYM).index) == before  # page 1 rolled back: no new hole
+    rerun = FakeExchange(n_bars=1, n_funding=300)
+    assert download_funding(rerun, session, SYM, T0, end) == 280  # k 10..289
+    assert len(rerun.funding_calls) == 4  # three pages and the empty one that ends the hole
+    assert len(load_funding(session, SYM)) == 300
+    covered = FakeExchange(n_bars=1, n_funding=300)
+    assert download_funding(covered, session, SYM, T0, end) == 0 and covered.funding_calls == []
+
+
+def test_an_unfillable_funding_gap_costs_one_request_per_run_and_terminates(
+    session: Session,
+) -> None:
+    end = T0 + 29 * EIGHT_H + timedelta(hours=16)
+    missing = range(10, 20)  # the exchange has no record for k 10..19
+    full = FakeExchange(n_bars=1, n_funding=30, funding_missing=missing)
+    download_funding(full, session, SYM, T0, end)
+    assert len(load_funding(session, SYM)) == 20
+    for _ in range(2):
+        ex = FakeExchange(n_bars=1, n_funding=30, funding_missing=missing)
+        assert download_funding(ex, session, SYM, T0, end) == 0
+        assert ex.funding_calls == [T0 + 9 * EIGHT_H + FUNDING_STEP]
+
+
+def test_a_covered_funding_range_makes_no_request_and_a_live_poll_fetches_the_tail(
+    session: Session,
+) -> None:
+    end = T0 + 9 * EIGHT_H + timedelta(hours=16)
+    download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end)
+    _delete_funding(session, T0 + 4 * EIGHT_H, T0 + 4 * EIGHT_H)  # one missed event: 16 h
+    covered = FakeExchange(n_bars=1, n_funding=10)
+    assert download_funding(covered, session, SYM, T0, end) == 0
+    assert covered.funding_calls == []
+    # a paper poll must not wait 17 h for a new event: it always asks for what follows the last
+    live = FakeExchange(n_bars=1, n_funding=11)  # k 10 at T0 + 80 h is new
+    assert download_funding(live, session, SYM, T0, end, live=True) == 1
+    assert live.funding_calls[0] == T0 + 9 * EIGHT_H + FUNDING_STEP
 
 
 # --- ccxt adapter ---------------------------------------------------------------------------
@@ -399,6 +486,41 @@ def test_empty_frame_not_ok() -> None:
     assert not validate_candles(_frame(0), "1m").ok
 
 
+def test_bad_bars_marks_the_bars_validate_counts() -> None:
+    df = _frame(6)
+    df.iloc[1, df.columns.get_loc("high")] = 0.5  # bad OHLC: the high is below the body
+    df.iloc[3, df.columns.get_loc("low")] = -1.0  # non-positive price (still below the body)
+    df.iloc[4, df.columns.get_loc("volume")] = -2.0  # negative volume
+    assert bad_bars(df).tolist() == [False, True, False, True, True, False]
+    r = validate_candles(df, "1m")  # the same rules, counted
+    assert (r.bad_ohlc, r.non_positive_prices, r.negative_volume) == (1, 1, 1)
+
+
+class BadBarExchange(FakeExchange):
+    """``FakeExchange`` whose bar ``bad`` (1-based) has its high below its low."""
+
+    def __init__(self, bad: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.bad = bad
+
+    def _bar(self, i: int, symbol: str) -> Bar:
+        bar = super()._bar(i, symbol)
+        return replace(bar, high=bar.low - 1.0) if i == self.bad else bar
+
+
+def test_a_download_with_a_reject_hook_drops_bad_bars_and_keeps_paging(session: Session) -> None:
+    rejected: list[pd.DataFrame] = []
+    ex = BadBarExchange(bad=100, n_bars=250, page_size=100)  # the last bar of the first page
+    n = download_candles(ex, session, SYM, "1m", T0, T0 + 1000 * MIN, on_reject=rejected.append)
+    stored = load_candles(session, SYM, "1m")
+    assert n == len(stored) == 249 and T0 + 100 * MIN not in stored.index
+    assert [list(rows.index) for rows in rejected] == [[T0 + 100 * MIN]]
+    assert ex.candle_calls[:2] == [T0, T0 + 101 * MIN]  # paging went on past it
+    plain = BadBarExchange(bad=7, n_bars=10)  # `data download` stores what it gets, as before
+    download_candles(plain, session, "ETH", "1m", T0, T0 + 10 * MIN)
+    assert len(load_candles(session, "ETH", "1m")) == 10
+
+
 # --- resample -------------------------------------------------------------------------------
 
 
@@ -464,13 +586,21 @@ def test_history_starts_the_feature_warm_up_before_the_backtest_rounded_to_days(
 
 
 def _store_flat(eng: Engine, cfg: AppConfig, start: datetime, n: int) -> None:
+    """``n`` 1m candles from ``start``, and funding every 8 h over the configured check range."""
     idx = pd.date_range(start, periods=n, freq="1min", name="ts")
     df = pd.DataFrame(
         {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.0, "volume": 1.0}, index=idx
     )
+    _store_funding(eng, cfg, pd.date_range(history_start(cfg), cfg.backtest.end, freq="8h"))
     with session_scope(eng) as s:
         for sym in cfg.exchange.symbols:
             upsert_candles(s, sym, "1m", df)
+
+
+def _store_funding(eng: Engine, cfg: AppConfig, stamps: pd.DatetimeIndex) -> None:
+    with session_scope(eng) as s:
+        for sym in cfg.exchange.symbols:
+            upsert_funding(s, sym, pd.Series(1e-4, index=stamps.rename("ts")))
 
 
 def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -486,6 +616,38 @@ def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     res = runner.invoke(app, ["data", "check"])
     assert res.exit_code == 0, res.output
     assert "OK" in res.output and f"first={start.isoformat()}" in res.output
+    last = datetime(2024, 1, 3, tzinfo=UTC).isoformat()  # funding 00:00, 08:00, 16:00 daily
+    assert f"funding rows=7 first={start.isoformat()} last={last} largest_gap=8.0 h" in res.output
+    eng.dispose()
+
+
+def test_data_check_fails_on_a_funding_gap_and_says_what_to_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = f"sqlite:///{tmp_path / 'fund.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T01:40:00Z")
+    start = history_start(cfg)
+    _store_flat(eng, cfg, start, (cfg.backtest.end - start) // MIN)  # candles fine
+    with session_scope(eng) as s:  # 2024-01-02 00:00 and 08:00 missing: 24 h without a stamp
+        s.execute(
+            delete(FundingRate).where(
+                FundingRate.ts > T0 + timedelta(hours=16), FundingRate.ts < T0 + timedelta(hours=40)
+            )
+        )
+    res = CliRunner().invoke(app, ["data", "check"])
+    assert res.exit_code == 1
+    assert f"{SYM}: FAIL" in res.output and "missing_bars=0/" in res.output
+    assert "funding rows=5 " in res.output and "largest_gap=24.0 h" in res.output
+    gap = f"funding gap {(T0 + timedelta(hours=16)).isoformat()} .. "
+    assert gap + f"{(T0 + timedelta(hours=40)).isoformat()} (24.0 h)" in res.output
+    assert "the backtest needs 1m history" not in res.output  # the candles are fine
+    assert (
+        "funding has stretches over 17 h without a stamp between 2024-01-01T00:00:00+00:00 and "
+        "2024-01-03T01:40:00+00:00: run `regimebot data download` to fetch them"
+    ) in res.output
     eng.dispose()
 
 

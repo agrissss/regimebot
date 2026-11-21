@@ -73,6 +73,17 @@ def test_quote_from_bar_open_puts_half_spread_each_side() -> None:
     assert ask == approx(100.01)
 
 
+def test_fills_record_the_quote_they_were_priced_from() -> None:
+    fill = market_fill(SYM, TS, BUY, 1.0, BID, ASK, 100.0, 100.0, COSTS, cap_participation=True)
+    assert fill is not None and (fill.bid, fill.ask) == (BID, ASK)
+    # a stop is priced from a quote built around its trigger: the open of a bar gapping through
+    stop = stop_fill(SYM, make_bar(97.0, 97.5, 96.0), SELL, 1.0, 98.0, COSTS)
+    assert stop is not None and (stop.bid, stop.ask) == quote_from_bar_open(97.0, COSTS)
+    # a target is a resting limit at its own price: there is no quote
+    target = target_fill(SYM, make_bar(100.0, 104.5, 99.5), SELL, 1.0, 104.0, COSTS)
+    assert target is not None and (target.bid, target.ask) == (None, None)
+
+
 # --- market_fill ----------------------------------------------------------------------------
 
 

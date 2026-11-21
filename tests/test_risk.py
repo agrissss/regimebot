@@ -21,7 +21,7 @@ import regimebot
 from regimebot import cli
 from regimebot.config import AppConfig, PlaybookEntry, RiskConfig, load_config
 from regimebot.engine.portfolio import Portfolio
-from regimebot.risk.manager import DEFAULT_KILL_FILE, MIN_NOTIONAL, RiskManager
+from regimebot.risk.manager import DEFAULT_KILL_FILE, RiskManager
 from regimebot.types import (
     ExitReason,
     Fill,
@@ -391,11 +391,15 @@ def test_invalid_pending_notional_raises(tmp_path: Path, bad: float) -> None:
 def test_min_notional_boundary(tmp_path: Path) -> None:
     # risk_per_trade 0.0001: risk = 10000 * 0.0001 = 1
     rm = manager(tmp_path, risk_per_trade=0.0001)
-    # stop 90: qty 1 / 10 = 0.1 -> notional 10 = MIN_NOTIONAL: allowed
+    # stop 90: qty 1 / 10 = 0.1 -> notional 10 = risk.min_notional (default 10): allowed
     assert approved(rm.evaluate(make_signal(stop=90.0), book(), PLAY, MON)) == ("ok", approx(0.1))
     # stop 89: qty 1 / 11 -> notional 9.09 < 10
     assert rejected(rm.evaluate(make_signal(stop=89.0), book(), PLAY, MON)) == "too_small"
-    assert MIN_NOTIONAL == 10.0
+    assert BASE_CFG.risk.min_notional == 10.0
+    # the minimum is configured: at 20 the notional-10 entry is too small too
+    strict = manager(tmp_path, risk_per_trade=0.0001, min_notional=20.0)
+    decision = strict.evaluate(make_signal(stop=90.0), book(), PLAY, MON)
+    assert (decision.rule, decision.detail) == ("too_small", "notional 10.00 < 20.0")
 
 
 def test_cap_reduced_below_min_notional_is_too_small(tmp_path: Path) -> None:
@@ -869,7 +873,7 @@ def test_random_approvals_never_breach_caps_or_the_risk_budget(tmp_path: Path) -
             used = {**positions, **pending}  # distinct keys: open symbols are never approved
             risk_budget = r.risk_per_trade * equity
             assert decision.qty > 0.0
-            assert notional >= MIN_NOTIONAL
+            assert notional >= r.min_notional
             assert decision.qty * abs(entry - stop) <= risk_budget * tol
             assert notional <= r.max_asset_exposure * equity * tol
             for members in TWO_GROUPS.values():

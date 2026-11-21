@@ -3,13 +3,16 @@
 
 import subprocess
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import Engine, create_engine, inspect, select
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Engine, create_engine, insert, inspect, select
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
@@ -17,8 +20,8 @@ from typer.testing import CliRunner
 from regimebot.cli import app
 from regimebot.config import AppConfig, config_json, load_config
 from regimebot.db import repo
-from regimebot.db.models import Base, Run, SignalRow
-from regimebot.db.session import make_engine, session_scope, upgrade_to_head
+from regimebot.db.models import Base, FillRow, Run, SignalRow
+from regimebot.db.session import ALEMBIC_INI, make_engine, session_scope, upgrade_to_head
 from regimebot.types import (
     ExitReason,
     Fill,
@@ -320,6 +323,40 @@ def test_fills_events_regimes_equity_round_trip(session: Session, cfg: AppConfig
     tables = Base.metadata.tables
     for name in ("fills", "risk_events", "regimes"):
         assert session.execute(tables[name].select()).all()
+
+
+def test_fills_round_trip_the_quote_they_were_priced_from(session: Session, cfg: AppConfig) -> None:
+    run_id = repo.create_run(session, Mode.PAPER, cfg)
+    quoted = Fill("BTC", T0, OrderSide.BUY, 1.0, 100.1, 100.0, 0.05, 10.0, "taker", 99.99, 100.01)
+    limit = Fill(
+        "BTC", T0 + timedelta(minutes=1), OrderSide.SELL, 1.0, 104.0, 104.0, 0.02, 0.0, "maker"
+    )
+    repo.save_fills(session, run_id, [quoted, limit])
+    assert repo.load_fills(session, run_id) == [quoted, limit]
+    assert (limit.bid, limit.ask) == (None, None)
+
+
+def test_the_fill_quote_migration_upgrades_a_database_at_the_previous_revision(
+    database_url: str, cfg: AppConfig
+) -> None:
+    alembic_cfg = Config(str(ALEMBIC_INI))
+    alembic_cfg.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    command.upgrade(alembic_cfg, "0001")  # a database as the published version left it
+    eng = make_engine(database_url)
+    assert "bid" not in {c["name"] for c in inspect(eng).get_columns("fills")}
+    old = {"symbol": "BTC", "ts": T0, "side": "buy", "qty": 1.0, "price": 100.1}
+    old |= {"ref_price": 100.0, "fee": 0.05, "slippage_bps": 10.0, "liquidity": "taker"}
+    with session_scope(eng) as s:
+        run_id = repo.create_run(s, Mode.BACKTEST, cfg)
+        s.execute(insert(FillRow), [old | {"run_id": run_id}])  # only the 0001 columns
+    upgrade_to_head(database_url)
+    with session_scope(eng) as s:
+        (fill,) = repo.load_fills(s, run_id)  # the old row survives, with no quote
+        assert fill == Fill("BTC", T0, OrderSide.BUY, 1.0, 100.1, 100.0, 0.05, 10.0, "taker")
+        repo.save_fills(s, run_id, [replace(fill, bid=99.9, ask=100.2)])
+    with session_scope(eng) as s:
+        assert [(f.bid, f.ask) for f in repo.load_fills(s, run_id)] == [(None, None), (99.9, 100.2)]
+    eng.dispose()
 
 
 def test_open_positions_upsert_delete_load(session: Session, cfg: AppConfig) -> None:

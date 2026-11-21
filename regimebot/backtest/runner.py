@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import AppConfig, timeframe_minutes
 from regimebot.data.resample import resample
+from regimebot.data.validate import FUNDING_GAP_TOLERANCE, funding_gaps
 from regimebot.db import repo
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
@@ -142,6 +143,29 @@ def _warmup_events(
     return events
 
 
+def _funding_events(feeds: Mapping[str, _Feed], start: datetime, end: datetime) -> list[RiskEvent]:
+    """One ``funding_missing`` event at ``start`` per stretch of ``[start, end)`` longer than
+    ``FUNDING_GAP_TOLERANCE`` without a funding stamp for a symbol: positions held there pay or
+    receive no funding, so the result is not silently charged zero. The first stretch is
+    measured from the last stamp in the tolerance before ``start`` when there is one (events
+    missing right at the start count, a normal cadence across it does not) and reported from
+    ``start``."""
+    lo, hi = _ns(pd.to_datetime([start, end], utc=True))
+    lookback = int(FUNDING_GAP_TOLERANCE / timedelta(microseconds=1)) * 1000  # ns
+    events = []
+    for symbol, feed in feeds.items():
+        ts = feed.funding_ts  # sorted
+        before = ts[(ts >= lo - lookback) & (ts < lo)]
+        left = _dt(int(before[-1])) if len(before) else start
+        inside = [_dt(int(t)) for t in ts[(ts >= lo) & (ts < hi)]]
+        for a, b in funding_gaps(inside, left, end):
+            detail = f"{symbol}: no funding stamp from {max(a, start).isoformat()} to "
+            events.append(
+                RiskEvent(start, "funding_missing", detail + b.isoformat(), "funding_not_charged")
+            )
+    return events
+
+
 def _replay_interval(
     engine: Engine, feeds: Mapping[str, _Feed], k: int, base_width_ns: int
 ) -> None:
@@ -188,7 +212,8 @@ def run_backtest(
     ``strategies`` defaults to ``build_strategies(cfg)``. ``candles`` must hold exactly the
     configured symbols; ``funding`` may lack symbols (no funding charged). History before
     ``start`` warms the features up; a symbol still under-warmed at ``start`` gets a
-    ``warmup_incomplete`` risk event there (``_warmup_events``).
+    ``warmup_incomplete`` risk event there (``_warmup_events``), and every stretch of the range
+    without funding longer than the tolerance a ``funding_missing`` one (``_funding_events``).
     """
     for bound in (start, end):
         if bound.utcoffset() is None:
@@ -202,7 +227,9 @@ def run_backtest(
     base_width_ns = timeframe_minutes(cfg.exchange.base_timeframe) * 60 * 10**9
 
     portfolio = Portfolio(cfg.backtest.initial_equity)
-    log = RunLog(risk_events=_warmup_events(features, start, end))
+    log = RunLog(
+        risk_events=_warmup_events(features, start, end) + _funding_events(feeds, start, end)
+    )
     risk = RiskManager(cfg, kill_file)
     strategies = build_strategies(cfg) if strategies is None else strategies
     engine = Engine(cfg, strategies, risk, portfolio, log)
@@ -262,8 +289,11 @@ def persist_result(session: Session, result: BacktestResult, note: str = "") -> 
 
 
 def load_result(session: Session, run_id: int, cfg: AppConfig) -> BacktestResult:
-    """Rebuild stored backtest ``run_id`` (its run config ``cfg``) from what ``persist_result``
-    wrote: trades, fills, risk events and equity snapshots (not signals or decisions)."""
+    """Rebuild stored run ``run_id`` (its run config ``cfg``) from what ``persist_result`` (or a
+    paper session) wrote: trades, fills, risk events and equity snapshots (not signals or
+    decisions). A backtest covers its configured period. A paper run covers its first equity
+    snapshot (its start before any) to its last, open or not; decisions are in ``[start, end)``,
+    so ``end`` is one microsecond after the last snapshot."""
     trades = repo.load_trades(session, run_id)
     snapshots = repo.load_equity_snapshots(session, run_id)
     log = RunLog(
@@ -273,4 +303,8 @@ def load_result(session: Session, run_id: int, cfg: AppConfig) -> BacktestResult
         equity=snapshots,
     )
     equity = _snapshot_series(snapshots, 1, "equity")
-    return BacktestResult(log, trades, equity, cfg, cfg.backtest.start, cfg.backtest.end)
+    start, end = cfg.backtest.start, cfg.backtest.end
+    if (run := repo.load_run(session, run_id)).mode == Mode.PAPER:
+        first, last = (snapshots[0][0], snapshots[-1][0]) if snapshots else (run.started_at,) * 2
+        start, end = first, last + timedelta(microseconds=1)
+    return BacktestResult(log, trades, equity, cfg, start, end)

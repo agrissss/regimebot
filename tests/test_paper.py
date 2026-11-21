@@ -31,9 +31,11 @@ from sqlalchemy.orm import Session
 from synth import BTC, ETH, MINUTE, T0, Scripted, candles_from_closes, regime_walk
 from typer.testing import CliRunner
 
-from regimebot.backtest.runner import run_backtest
+from regimebot.backtest.baselines import buy_and_hold
+from regimebot.backtest.runner import decision_features, run_backtest
 from regimebot.cli import app
 from regimebot.config import AppConfig, load_config
+from regimebot.data.resample import resample
 from regimebot.db import repo
 from regimebot.db.models import Base, OpenPosition, RegimeRow, RiskDecisionRow, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope
@@ -42,7 +44,7 @@ from regimebot.market_state.features import warm_rows
 from regimebot.paper import session as paper_session
 from regimebot.paper import state
 from regimebot.paper.session import PaperSession
-from regimebot.types import ExitReason, Fill, Mode, Regime, Trade
+from regimebot.types import ExitReason, Fill, Mode, Regime, RiskEvent, Trade
 
 HOUR = timedelta(hours=1)
 D = timedelta(minutes=15)  # decision bar
@@ -56,7 +58,7 @@ EVERY_5M = 5 * MINUTE
 
 
 def open_cfg(**overrides: object) -> AppConfig:
-    """Default windows and ``paper.warmup_bars`` (3000 bars, all of the market's history: paper
+    """Default windows and ``paper.warmup_bars`` (3400 bars, all of the market's history: paper
     features equal the backtest's exactly); every regime's playbook allows the stub."""
     entry = {
         "strategies": ["breakout"],
@@ -201,6 +203,21 @@ def exits(rows: dict[str, list[Any]]) -> list[tuple[str, ExitReason, datetime]]:
     return [(t.symbol, t.exit_reason, t.exit_ts) for t in rows["trades"]]
 
 
+def cold_alerts(at: datetime, *symbols: str) -> list[tuple[str, str]]:
+    """The scripted market's flat prices never warm the features up (``volume_z``, ``ret_z``,
+    ``adx`` divide by zero): a session alerts ``warmup_incomplete`` for each symbol (both unless
+    given) at the first decision where it has a window, once per process."""
+    return [
+        ("warmup_incomplete", f"{s}: features not fully valid at {at.isoformat()}")
+        for s in symbols or (BTC, ETH)
+    ]
+
+
+def not_cold(events: list[RiskEvent]) -> list[RiskEvent]:
+    """Risk events other than the ``warmup_incomplete`` one recorded at every cold decision."""
+    return [e for e in events if e.kind != "warmup_incomplete"]
+
+
 class Spy:
     """Records every attribute the session reads from the exchange."""
 
@@ -252,12 +269,28 @@ def test_a_scripted_market_trades_exactly_like_the_backtest(tmp_path: Path) -> N
     assert [unlag_trade(t) for t in paper.trades] == ref.trades
     assert [unlag_fill(f) for f in paper.fills] == ref.fills
     assert paper.fills != ref.fills  # the difference is real, and the only one
+    # fills carry the quote they were priced from: equal, as the scripted live quote is the
+    # backtest's modelled one (the forming bar's open -/+ the half spread)
+    assert all(
+        f.bid is not None and f.ask is not None for f in paper.fills if f.liquidity == "taker"
+    )
     assert paper.signals == ref.signals
     assert paper.decisions == ref.decisions
-    assert paper.regimes == ref.regimes
-    # the backtest flags its under-warmed start (6 h of history, 31-day windows); paper does not
+    # paper decisions also store the live spread the classifier read: 2 x 1 bp
+    assert all(i["spread_bps"] == pytest.approx(2.0) for _, _, _, i in paper.regimes)
+    without_spread = [(s, ts, r, i.copy()) for s, ts, r, i in paper.regimes]
+    for *_, inputs in without_spread:
+        del inputs["spread_bps"]
+    assert without_spread == ref.regimes
+    # 6 h of flat history never warms the features: the backtest flags it once at its start,
+    # paper at every decision for every symbol (alerting once per symbol)
     assert {(e.ts, e.kind) for e in ref.risk_events} == {(START, "warmup_incomplete")}
-    assert len(ref.risk_events) == 2 and paper.risk_events == []
+    assert len(ref.risk_events) == 2
+    assert [(e.ts, e.kind, e.action, e.detail.split(": ")[0]) for e in paper.risk_events] == [
+        (START + k * D, "warmup_incomplete", "no_trade_until_warm", symbol)
+        for k in range(10)
+        for symbol in (BTC, ETH)
+    ]
     assert paper.equity == ref.equity
     # one decision per decision bar, though three polls fall inside each
     assert [e[0] for e in paper.equity] == [START + k * D for k in range(10)]
@@ -271,7 +304,7 @@ def test_a_scripted_market_trades_exactly_like_the_backtest(tmp_path: Path) -> N
 
 
 def test_the_default_warm_up_gives_the_decision_a_fully_valid_feature_row(tmp_path: Path) -> None:
-    """``warmup_bars`` = 3000 decision bars of history (24 more than the 2976 the default
+    """``warmup_bars`` = 3400 decision bars of history (424 more than the 2976 the default
     windows need) make the window's last row fully valid at a live decision."""
     cfg = load_config(overrides={"exchange.symbols": [BTC]})
     db = make_engine(f"sqlite:///{tmp_path / 'warm.db'}")
@@ -279,10 +312,46 @@ def test_the_default_warm_up_gives_the_decision_a_fully_valid_feature_row(tmp_pa
     candles = regime_walk(cfg.paper.warmup_bars * 15, seed=8)
     with session_scope(db) as s:
         repo.upsert_candles(s, BTC, "1m", candles)
-    ts = candles.index[-1].to_pydatetime()  # a decision bar boundary: 3000 x 15 minutes in
+    ts = candles.index[-1].to_pydatetime()  # a decision bar boundary: 3400 x 15 minutes in
     session = PaperSession(cfg, ReplayExchange({}, {}, cfg.costs, Clock(ts)), db, tmp_path / "K")
     window = session._windows(ts, [BTC])[BTC]
     assert window.index[-1] == ts and bool(warm_rows(window).iloc[-1])
+    db.dispose()
+
+
+# Every window short: features are fully valid from the 24th decision bar (6 h of history).
+SHORT_WINDOWS = {"features.atr_window": 5, "features.rv_window": 8, "features.pctile_window": 16}
+SHORT_WINDOWS |= {"features.adx_window": 5, "features.ema_fast": 4, "features.ema_slow": 12}
+SHORT_WINDOWS |= {f"features.{w}_window": 8 for w in ("volume", "donchian", "zscore")}
+
+
+def test_a_cold_window_is_recorded_at_every_decision_and_alerted_once_until_warm(
+    tmp_path: Path, alerts: list[tuple[str, str]]
+) -> None:
+    cfg = load_config(overrides={"exchange.symbols": [BTC], **SHORT_WINDOWS})
+    candles = {BTC: regime_walk(9 * 60, seed=4)}  # T0 to T0 + 9 h: cold at START (4 h)
+    warm = warm_rows(decision_features(cfg, candles[BTC], None))
+    first_warm = warm.index[warm.to_numpy()][0].to_pydatetime()
+    assert START < first_warm < T0 + 7 * HOUR
+    clock = Clock(START + LAG)
+    db = make_engine(f"sqlite:///{tmp_path / 'cold.db'}")
+    Base.metadata.create_all(db)
+    exchange = ReplayExchange(candles, {}, cfg.costs, clock)
+    session = PaperSession(cfg, exchange, db, tmp_path / "KILL", clock=clock, strategies=[])
+    run_id = session.start()
+    while clock.now <= T0 + 8 * HOUR + LAG:
+        session.run_once()
+        clock.now += MINUTE
+    cold = [ts for ts in (START + k * D for k in range(17)) if ts < first_warm]
+    events = stored(db, run_id)["risk_events"]
+    assert [(e.ts, e.kind, e.action) for e in events] == [
+        (ts, "warmup_incomplete", "no_trade_until_warm") for ts in cold
+    ]
+    assert events[0].detail == f"{BTC}: features not fully valid at {START.isoformat()}"
+    assert alerts == [
+        ("warmup_incomplete", f"{BTC}: features not fully valid at {START.isoformat()}"),
+        ("warmup_incomplete_recovered", f"{BTC}: recovered"),
+    ]
     db.dispose()
 
 
@@ -329,7 +398,7 @@ def test_a_poll_that_comes_after_the_wait_skips_the_decision(
     rows = stored(rig.db, run_id)
     assert [ts for ts, _ in rows["equity"]] == [START, T1 + D]  # T1 never ran late
     assert rows["fills"] == [] and session.log.signals == []
-    assert alerts == [
+    assert alerts == cold_alerts(START) + [
         ("decision_missed", f"decision at {T1.isoformat()} reached 723s late: skipped")
     ]
 
@@ -376,11 +445,12 @@ def test_a_start_whose_warm_up_outlasts_the_wait_skips_that_decision(
     assert session.log.signals == []  # no T1 entry minutes after its signal
     (missed,) = [e for e in logs if e["event"] == "decision_missed"]
     assert missed["ts"] == T1.isoformat()
+    assert alerts[-2:] == cold_alerts(T1 + D)  # the first decision this session made
     if alerted:
-        assert [kind for kind, _ in alerts] == ["decision_missed"]
+        assert [kind for kind, _ in alerts[:-2]] == ["decision_missed"]
         assert missed["log_level"] == "warning"
     else:  # a routine start more than 3 minutes into a bar: logged, not alerted
-        assert alerts == []
+        assert alerts[:-2] == []
         assert (missed["log_level"], missed["reason"]) == ("info", "before session start")
 
 
@@ -415,7 +485,7 @@ def test_a_decision_that_turns_late_while_quoting_is_skipped(
     rig.poll(session, T1 + D)
     assert [ts for ts, _ in stored(rig.db, run_id)["equity"]] == [START, T1 + D]
     assert session.log.signals == [] and session.log.fills == []
-    assert alerts == [
+    assert alerts == cold_alerts(START) + [
         ("decision_missed", f"decision at {T1.isoformat()} reached 290s late: skipped")
     ]
 
@@ -452,11 +522,13 @@ def test_a_failing_candle_feed_blocks_the_symbol_and_alerts_once_per_incident(
 
     log = session.log
     assert [s.symbol for s in log.signals] == [BTC]  # ETH had no bar T1, so no window
-    assert [(e.ts, e.kind, e.action) for e in log.risk_events] == [
-        (T1, "stale_data", "skip_symbol")
-    ]
-    assert ETH in log.risk_events[0].detail
-    assert alerts == [
+    stale = not_cold(log.risk_events)
+    assert [(e.ts, e.kind, e.action) for e in stale] == [(T1, "stale_data", "skip_symbol")]
+    assert ETH in stale[0].detail
+    # without a window ETH is stale, not cold: its warm-up incident is left as it was
+    cold = [(e.ts, e.detail.split(": ")[0]) for e in log.risk_events if e not in stale]
+    assert cold == [(START, BTC), (START, ETH), (T1, BTC)]
+    assert alerts == cold_alerts(START) + [
         ("stale_data", f"{ETH}: candle download failed"),
         ("stale_data_recovered", f"{ETH}: recovered"),
     ]
@@ -484,7 +556,7 @@ def test_a_failed_download_keeps_the_window_when_bar_t_is_already_stored(
         ETH: T1 + 2 * MINUTE + LAG,
     }
     assert [e for e in log.risk_events if e.kind == "stale_data"] == []
-    assert alerts == [  # the failure is still reported
+    assert alerts == cold_alerts(START) + [  # the failure is still reported
         ("stale_data", f"{ETH}: candle download failed"),
         ("stale_data_recovered", f"{ETH}: recovered"),
     ]
@@ -512,7 +584,11 @@ def test_a_decision_waits_for_a_late_symbol_until_it_turns_stale(
     assert (ETH in entries) is eth_trades
     stale = [e for e in session.log.risk_events if e.kind == "stale_data"]
     assert bool(stale) is not eth_trades  # stale ETH is skipped at every decision
-    assert [a[0] for a in alerts] == ([] if eth_trades else ["stale_data"])
+    others = [kind for kind, _ in alerts if kind != "warmup_incomplete"]
+    assert others == ([] if eth_trades else ["stale_data"])
+    # a stale ETH never has a window, so only BTC is alerted as cold
+    cold = cold_alerts(START, *((BTC, ETH) if eth_trades else (BTC,)))
+    assert [a for a in alerts if a[0] == "warmup_incomplete"] == cold
 
 
 def test_a_failed_quote_means_no_spread_and_no_fill_and_the_entry_expires(
@@ -665,7 +741,9 @@ def test_decisions_missed_while_down_are_not_replayed(
         (ETH, ExitReason.STOP, T1 + 10 * MINUTE),  # both exits happened while down
         (BTC, ExitReason.TARGET, T1 + 20 * MINUTE),
     ]
-    assert alerts == []  # T1 + D was never observed by a running session
+    # T1 + D was never observed by a running session: not alerted. Each process alerts the
+    # cold features once, at its first decision.
+    assert alerts == cold_alerts(START) + cold_alerts(T1 + 2 * D)
 
 
 def test_resume_refuses_an_unknown_run_a_backtest_run_and_a_changed_config(
@@ -833,10 +911,11 @@ def test_the_kill_file_flattens_within_one_poll_and_retries_a_failed_quote(
         (BTC, ExitReason.KILL, T1 + 7 * MINUTE + LAG),  # retried on the next poll
     ]
     assert [s.ts for s in session.log.signals] == [T1, T1]  # no entries once halted
-    assert [(e.ts, e.kind, e.action) for e in rows["risk_events"]] == [
+    assert [(e.ts, e.kind, e.action) for e in not_cold(rows["risk_events"])] == [
         (T1 + 6 * MINUTE + LAG, "manual_kill", "halt")  # once, not again at T1 + D
     ]
-    assert [kind for kind, _ in alerts] == ["manual_kill"]
+    assert alerts[:2] == cold_alerts(START)
+    assert [kind for kind, _ in alerts[2:]] == ["manual_kill"]
     assert rows["open_positions"] == [state.PORTFOLIO_KEY, state.RISK_KEY]
 
 
@@ -850,13 +929,14 @@ def test_the_kill_file_halts_a_flat_book_within_one_poll(
     rig.kill_file.touch()
     rig.poll(session, START + 6 * MINUTE)
     halt = (START + 6 * MINUTE + LAG, "manual_kill", "halt")
-    assert [(e.ts, e.kind, e.action) for e in session.log.risk_events] == [halt]
-    assert [kind for kind, _ in alerts] == ["manual_kill"]
+    assert [(e.ts, e.kind, e.action) for e in not_cold(session.log.risk_events)] == [halt]
+    assert alerts[:2] == cold_alerts(START)
+    assert [kind for kind, _ in alerts[2:]] == ["manual_kill"]
     with Session(rig.db) as s:  # `paper status` shows it at once
         status = state.latest_status(s)
     assert status is not None and status.halted_reason == "manual_kill"
     rig.poll(session, T1 + 2 * MINUTE)  # the T1 decision neither re-records it nor enters
-    assert [(e.ts, e.kind, e.action) for e in session.log.risk_events] == [halt]
+    assert [(e.ts, e.kind, e.action) for e in not_cold(session.log.risk_events)] == [halt]
     assert session.log.signals == [] and stored(rig.db, run_id)["fills"] == []
 
 
@@ -871,7 +951,7 @@ def test_halts_are_alerted_and_so_is_a_daily_halt_clearing(
     rig.poll(session, midnight, every=EVERY_5M)
     halts = [e for e in session.log.risk_events if e.action == "halt"]
     assert [(e.ts, e.kind) for e in halts] == [(T1 + D + shift, "daily_loss")]  # ETH's stop
-    assert alerts == [
+    assert alerts == cold_alerts(START + shift) + [
         ("daily_loss", halts[0].detail),
         ("daily_loss_recovered", "daily_loss halt cleared"),  # at the midnight decision
     ]
@@ -918,7 +998,8 @@ def test_run_forever_survives_a_failing_poll_and_stops_without_flattening(
 
     assert sleeps == [10, 10, 10, 10]  # four polls, one sleep after each
     assert signal.getsignal(signal.SIGTERM) == handler
-    assert [kind for kind, _ in alerts] == ["poll_error", "poll_error_recovered"]
+    assert alerts[:2] == cold_alerts(T1)  # the first poll decides T1
+    assert [kind for kind, _ in alerts[2:]] == ["poll_error", "poll_error_recovered"]
     events = [e["event"] for e in logs]
     assert events[-1] == "paper_stopped"
     assert ("paper_stop_requested" in events) is (stop == "sigterm")  # logged after the loop
@@ -962,6 +1043,89 @@ def cli_rig(tmp_path: Path, db: Database) -> Rig:
     return rig
 
 
+def test_a_polled_bar_breaking_the_ohlc_rules_is_dropped_logged_and_counted_once(
+    tmp_path: Path, cli_db: Database
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+    bad = T1 + 5 * MINUTE
+    rig.exchange.candles[BTC].loc[bad, "high"] = 90.0  # below its low
+    session = rig.session()
+    run_id = session.start()
+    with structlog.testing.capture_logs() as logs:
+        rig.poll(session, T1 + 8 * MINUTE)  # bar T1 + 5m is fetched by two polls
+    with Session(cli_db) as s:
+        stored_btc = repo.load_candles(s, BTC, "1m").index
+    assert bad not in stored_btc and bad + MINUTE in stored_btc  # dropped, the feed went on
+    (warning,) = [e for e in logs if e["event"] == "paper_bar_rejected"]
+    assert (warning["symbol"], warning["ts"], warning["high"]) == (BTC, bad.isoformat(), 90.0)
+    assert warning["log_level"] == "warning"
+
+    def rejected_line() -> str:
+        lines = CliRunner().invoke(app, ["paper", "status"]).output.splitlines()
+        (line,) = [x for x in lines if x.startswith("rejected bars:")]
+        return line
+
+    assert rejected_line() == f"rejected bars: {BTC} 1"
+    session.close()
+    resumed = rig.session()
+    resumed.start(resume_run_id=run_id)  # its warm-up fetches the dropped bar again
+    rig.poll(resumed, T1 + 10 * MINUTE)
+    assert rejected_line() == f"rejected bars: {BTC} 1"  # still one bar, not one per fetch
+    resumed.close()
+
+
+def test_cli_report_of_a_paper_run_shows_its_period_baseline_and_execution_quality(
+    tmp_path: Path, cli_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+    session = rig.session()
+    run_id = session.start()
+    rig.poll(session, END, every=EVERY_5M)
+    session.close()  # stopped but open: an open run can be reported at any time
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_id)])
+    assert result.exit_code == 0, result.output
+    out = tmp_path / "reports" / f"run_{run_id}"
+    for name in ("trades.csv", "daily_pnl.csv", "equity.png", "drawdown.png"):
+        assert (out / name).stat().st_size > 0
+    text = (out / "report.html").read_text("utf-8")
+    assert "<h1>regimebot paper trading report</h1>" in text
+    assert "PAPER TRADING RUN (simulated fills on live data)" in text
+    assert f"Paper run period: {START.isoformat()} to {END.isoformat()}" in text
+    # buy and hold over the run's own decisions is the only baseline
+    candles, _ = market()
+    closes = {s: resample(df, "1m", "15m") for s, df in candles.items()}
+    held = buy_and_hold(
+        {s: df[(df.index >= START) & (df.index <= END)] for s, df in closes.items()},
+        10_000.0,
+        rig.cfg.costs,
+    )
+    log = session.log
+    net = sum(t.net_pnl for t in log.trades)
+    row = f"<td>Net P&amp;L</td><td>{net:,.2f}</td><td>{held.iloc[-1] - 10_000:,.2f}</td>"
+    assert row + "<td>n/a: backtest only</td>" in text
+    assert "Random entry: n/a: backtest only" in text and "Random seed" not in text
+    # execution quality: 4 trades; entries fill LAG after their decision at the live quote
+    assert len(log.fills) == 8 and [t.exit_reason for t in log.trades] == [
+        ExitReason.STOP,
+        ExitReason.TARGET,
+        ExitReason.TRAIL,
+        ExitReason.TIME,
+    ]
+    assert "<td>Fills</td><td>8</td>" in text
+    assert "<td>Decision-to-fill lag of entries, median</td><td>3.00 s</td>" in text
+    assert "<td>Decision-to-fill lag of entries, 95th percentile</td><td>3.00 s</td>" in text
+    # the live quotes (4 entries, the TIME exit) are 2 x 1 bp wide; stops and targets excluded
+    spread = "<td>Average quoted spread at fill (live quotes: entries and market exits)</td>"
+    assert spread + "<td>2.00 bps</td>" in text
+    entries = [f.slippage_bps for f in log.fills if f.side == "buy"]  # every trade is long
+    assert f"<td>entry</td><td>4</td><td>{sum(entries) / 4:.2f} bps</td>" in text
+    assert "<td>stop exit</td><td>2</td>" in text and "<td>market exit</td><td>1</td>" in text
+    assert "<td>target exit</td><td>1</td><td>0.00 bps</td>" in text
+    for rule in ("no_liquidity", "expired", "gapped_through_stop", "cancelled", "kill_switch"):
+        assert f"<td>{rule}</td><td>0</td>" in text
+
+
 def test_cli_paper_status_shows_the_latest_paper_run_and_its_liveness(
     tmp_path: Path, cli_db: Database
 ) -> None:
@@ -992,11 +1156,16 @@ def test_cli_paper_status_shows_the_latest_paper_run_and_its_liveness(
     snapshot, cash = session.log.equity[-1][1], session.portfolio.cash  # at the T1 decision
     assert lines[2] == f"equity: {snapshot:.2f} at {T1.isoformat()} (cash {cash:.2f})"
     assert "halted: no" in lines and "open positions: 1" in lines
+    assert "rejected bars: 0" in lines
     assert any(line.startswith(f"  {BTC} long qty=25 entry=") for line in lines)
     assert f"  {BTC} no_trade at {T1.isoformat()}" in lines
     assert f"  {ETH} no_trade at {T1.isoformat()}" in lines
-    assert lines[-2:] == [
-        "last 1 risk events:",
+    cold = "warmup_incomplete -> no_trade_until_warm"
+    assert lines[-5:] == [
+        "last 4 risk events:",
+        f"  {START.isoformat()} {cold}: {BTC}: features not fully valid at {START.isoformat()}",
+        f"  {START.isoformat()} {cold}: {ETH}: features not fully valid at {START.isoformat()}",
+        f"  {T1.isoformat()} {cold}: {BTC}: features not fully valid at {T1.isoformat()}",
         f"  {T1.isoformat()} stale_data -> skip_symbol: {ETH}: no features",
     ]
 
@@ -1038,6 +1207,43 @@ def test_cli_paper_run_prints_the_banner_and_leaves_the_run_open(
 
     bad = CliRunner().invoke(app, ["paper", "run", "--resume", "99"])
     assert bad.exit_code == 2 and "unknown run_id 99" in bad.output
+
+
+def test_cli_paper_run_resume_latest_resumes_the_newest_open_run_or_starts_one(
+    cli_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supervisor can restart the same command: it continues the open run, or starts one."""
+    cfg = load_config()
+    clock = Clock(datetime.now(UTC))
+    candles = {s: candles_from_closes([100.0] * 10) for s in cfg.exchange.symbols}
+    monkeypatch.setattr(
+        "regimebot.cli.CcxtExchange",
+        lambda _id, **kwargs: ReplayExchange(candles, {}, cfg.costs, clock),
+    )
+    monkeypatch.setattr(PaperSession, "run_forever", lambda self: None)
+
+    def run(resume: str = "latest") -> Any:
+        return CliRunner().invoke(app, ["paper", "run", "--resume", resume])
+
+    first = run()
+    assert first.exit_code == 0, first.output
+    assert "--resume latest: no open paper run, starting a new one" in first.output
+    assert "run id:    1 (new)" in first.output
+    second = run()  # the first process exited and released its lock
+    assert second.exit_code == 0, second.output
+    assert "--resume latest: resuming open paper run 1" in second.output
+    assert "run id:    1 (resumed)" in second.output
+    assert CliRunner().invoke(app, ["paper", "end", "1"]).exit_code == 0
+    third = run()
+    assert "no open paper run, starting a new one" in third.output
+    assert "run id:    2 (new)" in third.output
+    with Session(cli_db) as s:
+        assert [r.ended_at is None for r in s.scalars(select(Run).order_by(Run.id))] == [
+            False,
+            True,
+        ]
+    bad = run("soon")
+    assert bad.exit_code == 2 and "a run id or `latest`" in bad.output
 
 
 def test_cli_paper_clear_halt_clears_a_manual_kill_only_when_safe(

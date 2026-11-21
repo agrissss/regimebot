@@ -97,6 +97,10 @@ class Fill:
     fee: float  # quote currency, positive = cost
     slippage_bps: float  # signed, positive = worse than ref_price
     liquidity: str  # "taker" | "maker"
+    # The quote a taker fill was priced from: modelled (backtest, stops) or live (paper). None
+    # for a resting limit (target) and for fills stored before it was recorded.
+    bid: float | None = None
+    ask: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

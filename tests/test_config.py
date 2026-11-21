@@ -6,9 +6,11 @@ from pydantic import ValidationError
 
 from regimebot.config import (
     DEFAULT_CONFIG_PATH,
+    AppConfig,
     config_hash,
     config_json,
     effective_gross_cap,
+    gross_cap_limits,
     load_config,
     timeframe_minutes,
     with_overrides,
@@ -74,12 +76,14 @@ def test_pctile_window_must_cover_rv_window() -> None:
 
 
 def test_paper_warmup_must_cover_the_feature_warm_up() -> None:
-    assert load_config().paper.warmup_bars == 3000  # the default passes (it needs 2976)
+    assert load_config().paper.warmup_bars == 3400  # the default passes (it needs 2976)
     load_config(overrides={"paper.warmup_bars": 2976})
     with pytest.raises(ValidationError, match="paper.warmup_bars 2975 is below the 2976"):
         load_config(overrides={"paper.warmup_bars": 2975})
-    with pytest.raises(ValidationError, match="below the 3096"):  # 96 + 3000
-        load_config(overrides={"features.pctile_window": 3000})
+    with pytest.raises(ValidationError, match="raise paper.warmup_bars to at least 2976"):
+        load_config(overrides={"paper.warmup_bars": 2975})
+    with pytest.raises(ValidationError, match="raise paper.warmup_bars to at least 3496"):
+        load_config(overrides={"features.pctile_window": 3400})  # 96 + 3400
 
 
 def test_effective_gross_cap() -> None:
@@ -93,6 +97,33 @@ def test_effective_gross_cap() -> None:
     assert effective_gross_cap(low_gross.risk, low_gross.exchange.symbols) == 0.8
     with pytest.raises(ValueError):
         with_overrides(cfg, {"risk.max_group_exposure": 1.6})  # same hard cap as gross
+    # the per-asset cap: n symbols can reach at most n x max_asset_exposure
+    btc = with_overrides(cfg, {"exchange.symbols": ["BTC/USDT:USDT"]})
+    assert effective_gross_cap(btc.risk, btc.exchange.symbols) == 0.75  # not the 1.0 group cap
+    two = with_overrides(
+        cfg,
+        {"exchange.symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT"], "risk.max_asset_exposure": 0.6},
+    )
+    assert effective_gross_cap(two.risk, two.exchange.symbols) == pytest.approx(1.0)  # group
+    assert gross_cap_limits(two.risk, two.exchange.symbols) == {
+        "gross": 1.5,
+        "group": 1.0,
+        "asset": pytest.approx(1.2),
+    }
+    loose = with_overrides(two, {"risk.max_group_exposure": 1.5})
+    assert effective_gross_cap(loose.risk, loose.exchange.symbols) == pytest.approx(1.2)  # 2 x 0.6
+
+
+def test_min_notional_is_configured_positive_and_defaults_for_old_stored_configs() -> None:
+    assert load_config().risk.min_notional == 10.0
+    assert load_config(overrides={"risk.min_notional": 25.0}).risk.min_notional == 25.0
+    for bad in (0.0, -1.0):
+        with pytest.raises(ValidationError, match="min_notional"):
+            load_config(overrides={"risk.min_notional": bad})
+    # a run stored before the field existed still validates (`report` rebuilds old runs)
+    raw = load_config().model_dump(mode="json")
+    del raw["risk"]["min_notional"]
+    assert AppConfig.model_validate(raw).risk.min_notional == 10.0
 
 
 def test_fraction_and_timeframe_rejected() -> None:

@@ -84,6 +84,7 @@ risk:
   max_drawdown: 0.10
   streak_half: 3
   streak_stop: 5
+  min_notional: 10.0           # quote units; smaller entries are rejected or cancelled
 backtest:
   initial_equity: 10000.0
   start: "2024-01-01T00:00:00Z"
@@ -98,4 +99,4 @@ walk_forward:
 paper:
   poll_seconds: 10
   stale_after_seconds: 180
-  warmup_bars: 3000            # decision bars loaded before trading starts
+  warmup_bars: 3400            # decision bars loaded before trading starts (2,976 needed)

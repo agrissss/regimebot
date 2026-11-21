@@ -104,13 +104,17 @@ def test_sensitivity_runs_base_once_and_flags_unchanged_ints(
     assert ints.net_pnl.nunique() == 1
 
 
-def test_cost_stress_never_increases_net_pnl_for_the_same_trades() -> None:
-    df = cost_stress(open_cfg(), CANDLES, {}, T0, END, mult=2.0, strategies=stub())
-    base, stressed = df.iloc[0], df.iloc[1]
-    assert list(df.variant) == ["base", "stressed"]
-    assert base.n_trades == stressed.n_trades > 0  # stub entries do not depend on costs
-    assert stressed.net_pnl <= base.net_pnl
-    assert stressed.fees > base.fees
+def test_cost_stress_runs_half_base_and_double_costs_and_net_pnl_falls_as_costs_rise() -> None:
+    cfg = open_cfg()
+    df = cost_stress(cfg, CANDLES, {}, T0, END, strategies=stub())
+    assert list(df.variant) == ["x0.5", "base", "x2"]
+    assert df.cost_mult.tolist() == [0.5, 1.0, 2.0]
+    assert df.n_trades.nunique() == 1 and df.n_trades.iloc[0] > 0  # stub entries ignore costs
+    assert df.net_pnl.is_monotonic_decreasing and df.net_pnl.is_unique
+    assert df.fees.is_monotonic_increasing and df.fees.is_unique
+    with tempfile.TemporaryDirectory() as tmp:  # the base row is the plain run
+        plain = run_backtest(cfg, CANDLES, {}, T0, END, Path(tmp) / "KILL", stub())
+    assert df.net_pnl.iloc[1] == compute_metrics(plain.trades, plain.equity, 10_000.0).net_pnl
 
 
 def test_leverage_compare_returns_both_rows() -> None:
@@ -174,11 +178,17 @@ def test_cost_stress_multiplies_all_five_cost_fields(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         robustness, "run_metrics", lambda c, *a, **k: (seen.append(c), real(c, *a, **k))[1]
     )
-    cost_stress(cfg, CANDLES, {}, T0, END, mult=3.0, strategies=stub())
-    base, stressed = seen
+    cost_stress(cfg, CANDLES, {}, T0, END, strategies=stub())
+    half, base, double = seen
+    assert base is cfg  # x1 runs the config as given
     for k in robustness.COST_KEYS:
-        assert getattr(stressed.costs, k) == pytest.approx(3.0 * getattr(base.costs, k))
-    assert stressed.costs.max_participation == base.costs.max_participation
+        assert getattr(half.costs, k) == pytest.approx(0.5 * getattr(cfg.costs, k))
+        assert getattr(double.costs, k) == pytest.approx(2.0 * getattr(cfg.costs, k))
+    assert (
+        half.costs.max_participation
+        == double.costs.max_participation
+        == base.costs.max_participation
+    )
 
 
 def test_halted_at_column_is_set_only_when_a_run_hits_the_drawdown_halt() -> None:
