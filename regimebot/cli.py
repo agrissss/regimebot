@@ -694,6 +694,8 @@ def paper_status(
         ts, equity = status.equity
         typer.echo(f"equity: {equity:.2f} at {ts.isoformat()} (cash {status.cash or 0.0:.2f})")
     typer.echo(f"halted: {status.halted_reason or 'no'}")
+    rejected = ", ".join(f"{s} {n}" for s, n in sorted(status.rejected_bars.items()) if n)
+    typer.echo(f"rejected bars: {rejected or 0}")
     typer.echo(f"open positions: {len(status.positions)}")
     for p in status.positions:
         typer.echo(

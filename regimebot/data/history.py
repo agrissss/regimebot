@@ -1,5 +1,6 @@
 """Download history from an exchange into the database; safe to re-run, resumes."""
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import timeframe_minutes
 from regimebot.data.exchange import Exchange
-from regimebot.data.validate import funding_gaps, gap_ranges
+from regimebot.data.validate import bad_bars, funding_gaps, gap_ranges
 from regimebot.db import repo
 
 log = structlog.get_logger(__name__)
@@ -27,6 +28,7 @@ def download_candles(
     timeframe: str,
     start: datetime,
     end: datetime,
+    on_reject: Callable[[pd.DataFrame], None] | None = None,
 ) -> int:
     """Store closed bars with ``start <= ts <= end``; returns the number of bars written.
 
@@ -36,6 +38,9 @@ def download_candles(
     arguments. A fully stored range makes no request. A hole the exchange has no data for (outage,
     pre-listing) costs one empty request per run and never loops. Commits after every page (the
     one place outside ``session_scope``) so progress survives an interruption.
+
+    ``on_reject`` (a paper poll): bars that break an OHLC sanity rule (``bad_bars``) are not
+    stored but handed to it, as a frame like the stored ones; paging goes on past them.
     """
     width = pd.Timedelta(minutes=timeframe_minutes(timeframe))
     first, last = pd.Timestamp(start).ceil(width), pd.Timestamp(end).floor(width)
@@ -46,7 +51,14 @@ def download_candles(
     total = 0
     for hole_start, hole_end in gap_ranges(grid.difference(stored), width):
         total += _fill_candles(
-            exchange, session, symbol, timeframe, hole_start, hole_end, width.to_pytimedelta()
+            exchange,
+            session,
+            symbol,
+            timeframe,
+            hole_start,
+            hole_end,
+            width.to_pytimedelta(),
+            on_reject,
         )
     return total
 
@@ -59,6 +71,7 @@ def _fill_candles(
     cursor: datetime,
     stop: datetime,
     width: timedelta,
+    on_reject: Callable[[pd.DataFrame], None] | None,
 ) -> int:
     """Page ``[cursor, stop]``, committing each page; ends on an empty page or no progress."""
     total = 0
@@ -75,6 +88,9 @@ def _fill_candles(
             columns=repo.CANDLE_COLUMNS,
             index=pd.DatetimeIndex([b.ts for b in bars], name="ts"),
         )
+        if on_reject is not None and (bad := bad_bars(frame)).any():
+            on_reject(frame[bad])
+            frame = frame[~bad]
         total += repo.upsert_candles(session, symbol, timeframe, frame)
         session.commit()  # each page is durable, so an interruption resumes here
         log.info(

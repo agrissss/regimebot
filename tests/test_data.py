@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,11 @@ from regimebot.config import AppConfig, load_config
 from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
 from regimebot.data.history import FUNDING_STEP, download_candles, download_funding
 from regimebot.data.resample import resample
-from regimebot.data.validate import gap_ranges, validate_candles
+from regimebot.data.validate import bad_bars, gap_ranges, validate_candles
 from regimebot.db.models import Base, Candle, FundingRate
 from regimebot.db.repo import load_candles, load_funding, upsert_candles, upsert_funding
 from regimebot.db.session import make_engine, session_scope
+from regimebot.types import Bar
 
 SYM = "BTC/USDT:USDT"
 MIN = timedelta(minutes=1)
@@ -461,6 +463,41 @@ def test_negative_volume_counted() -> None:
 
 def test_empty_frame_not_ok() -> None:
     assert not validate_candles(_frame(0), "1m").ok
+
+
+def test_bad_bars_marks_the_bars_validate_counts() -> None:
+    df = _frame(6)
+    df.iloc[1, df.columns.get_loc("high")] = 0.5  # bad OHLC: the high is below the body
+    df.iloc[3, df.columns.get_loc("low")] = -1.0  # non-positive price (still below the body)
+    df.iloc[4, df.columns.get_loc("volume")] = -2.0  # negative volume
+    assert bad_bars(df).tolist() == [False, True, False, True, True, False]
+    r = validate_candles(df, "1m")  # the same rules, counted
+    assert (r.bad_ohlc, r.non_positive_prices, r.negative_volume) == (1, 1, 1)
+
+
+class BadBarExchange(FakeExchange):
+    """``FakeExchange`` whose bar ``bad`` (1-based) has its high below its low."""
+
+    def __init__(self, bad: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.bad = bad
+
+    def _bar(self, i: int, symbol: str) -> Bar:
+        bar = super()._bar(i, symbol)
+        return replace(bar, high=bar.low - 1.0) if i == self.bad else bar
+
+
+def test_a_download_with_a_reject_hook_drops_bad_bars_and_keeps_paging(session: Session) -> None:
+    rejected: list[pd.DataFrame] = []
+    ex = BadBarExchange(bad=100, n_bars=250, page_size=100)  # the last bar of the first page
+    n = download_candles(ex, session, SYM, "1m", T0, T0 + 1000 * MIN, on_reject=rejected.append)
+    stored = load_candles(session, SYM, "1m")
+    assert n == len(stored) == 249 and T0 + 100 * MIN not in stored.index
+    assert [list(rows.index) for rows in rejected] == [[T0 + 100 * MIN]]
+    assert ex.candle_calls[:2] == [T0, T0 + 101 * MIN]  # paging went on past it
+    plain = BadBarExchange(bad=7, n_bars=10)  # `data download` stores what it gets, as before
+    download_candles(plain, session, "ETH", "1m", T0, T0 + 10 * MIN)
+    assert len(load_candles(session, "ETH", "1m")) == 10
 
 
 # --- resample -------------------------------------------------------------------------------

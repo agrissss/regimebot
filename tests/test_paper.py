@@ -1043,6 +1043,37 @@ def cli_rig(tmp_path: Path, db: Database) -> Rig:
     return rig
 
 
+def test_a_polled_bar_breaking_the_ohlc_rules_is_dropped_logged_and_counted_once(
+    tmp_path: Path, cli_db: Database
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+    bad = T1 + 5 * MINUTE
+    rig.exchange.candles[BTC].loc[bad, "high"] = 90.0  # below its low
+    session = rig.session()
+    run_id = session.start()
+    with structlog.testing.capture_logs() as logs:
+        rig.poll(session, T1 + 8 * MINUTE)  # bar T1 + 5m is fetched by two polls
+    with Session(cli_db) as s:
+        stored_btc = repo.load_candles(s, BTC, "1m").index
+    assert bad not in stored_btc and bad + MINUTE in stored_btc  # dropped, the feed went on
+    (warning,) = [e for e in logs if e["event"] == "paper_bar_rejected"]
+    assert (warning["symbol"], warning["ts"], warning["high"]) == (BTC, bad.isoformat(), 90.0)
+    assert warning["log_level"] == "warning"
+
+    def rejected_line() -> str:
+        lines = CliRunner().invoke(app, ["paper", "status"]).output.splitlines()
+        (line,) = [x for x in lines if x.startswith("rejected bars:")]
+        return line
+
+    assert rejected_line() == f"rejected bars: {BTC} 1"
+    session.close()
+    resumed = rig.session()
+    resumed.start(resume_run_id=run_id)  # its warm-up fetches the dropped bar again
+    rig.poll(resumed, T1 + 10 * MINUTE)
+    assert rejected_line() == f"rejected bars: {BTC} 1"  # still one bar, not one per fetch
+    resumed.close()
+
+
 def test_cli_report_of_a_paper_run_shows_its_period_baseline_and_execution_quality(
     tmp_path: Path, cli_db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1124,6 +1155,7 @@ def test_cli_paper_status_shows_the_latest_paper_run_and_its_liveness(
     snapshot, cash = session.log.equity[-1][1], session.portfolio.cash  # at the T1 decision
     assert lines[2] == f"equity: {snapshot:.2f} at {T1.isoformat()} (cash {cash:.2f})"
     assert "halted: no" in lines and "open positions: 1" in lines
+    assert "rejected bars: 0" in lines
     assert any(line.startswith(f"  {BTC} long qty=25 entry=") for line in lines)
     assert f"  {BTC} no_trade at {T1.isoformat()}" in lines
     assert f"  {ETH} no_trade at {T1.isoformat()}" in lines

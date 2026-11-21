@@ -60,6 +60,24 @@ def funding_gaps(
     return [(a, b) for a, b in pairwise([start, *stamps, end]) if b - a > FUNDING_GAP_TOLERANCE]
 
 
+def _bar_problems(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Per-bar breaches of the OHLC sanity rules, keyed by ``ValidationReport`` field."""
+    body_lo = df[["open", "close"]].min(axis=1)
+    body_hi = df[["open", "close"]].max(axis=1)
+    ok_ohlc = (df["low"] <= body_lo) & (body_hi <= df["high"])  # NaN compares False: bad
+    return {
+        "bad_ohlc": ~ok_ohlc,
+        "non_positive_prices": (df[["open", "high", "low", "close"]] <= 0).any(axis=1),
+        "negative_volume": df["volume"] < 0,
+    }
+
+
+def bad_bars(df: pd.DataFrame) -> pd.Series:
+    """True for every bar that breaks an OHLC sanity rule ``validate_candles`` counts."""
+    problems = _bar_problems(df)
+    return problems["bad_ohlc"] | problems["non_positive_prices"] | problems["negative_volume"]
+
+
 def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:
     """Check a candle frame indexed by close time ``ts``."""
     if df.empty:
@@ -70,16 +88,12 @@ def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:
     grid = pd.date_range(unique[0], unique[-1], freq=step)
     missing = grid.difference(unique)
     gaps = gap_ranges(missing, step)
-    body_lo = df[["open", "close"]].min(axis=1)
-    body_hi = df[["open", "close"]].max(axis=1)
-    ok_ohlc = (df["low"] <= body_lo) & (body_hi <= df["high"])  # NaN compares False: counted bad
+    problems = {name: int(rows.sum()) for name, rows in _bar_problems(df).items()}
     return ValidationReport(
         bars=len(df),
         expected_bars=len(grid),
         duplicates=int(index.duplicated().sum()),
         gaps=tuple(gaps),
         missing_bars=len(missing),
-        bad_ohlc=int((~ok_ohlc).sum()),
-        non_positive_prices=int((df[["open", "high", "low", "close"]] <= 0).any(axis=1).sum()),
-        negative_volume=int((df["volume"] < 0).sum()),
+        **problems,
     )

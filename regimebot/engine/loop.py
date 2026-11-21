@@ -27,7 +27,7 @@ from regimebot.engine.portfolio import Portfolio, Position
 from regimebot.engine.rules import stop_reason, trailed_stop
 from regimebot.execution.fill_model import market_fill, quote_from_bar_open, stop_fill, target_fill
 from regimebot.market_state.regime import REQUIRED_FEATURES, classify, playbook_for
-from regimebot.risk.manager import MIN_NOTIONAL, RiskManager
+from regimebot.risk.manager import RiskManager
 from regimebot.strategy.base import Strategy
 from regimebot.types import (
     Bar,
@@ -214,8 +214,8 @@ class Engine:
         capped at ``max_participation`` of ``bar_volume`` (``ref_price`` = signal entry). An entry
         is cancelled, with a second decision for its signal, when it is first offered at or after
         ``signal.ts`` + one decision width (``expired``: the next decision has passed), when there
-        is no fill or one under ``MIN_NOTIONAL`` (``no_liquidity``), or when the fill price is at
-        or beyond the stop (``gapped_through_stop``: the price gapped past it, 1R would not be
+        is no fill or one under ``risk.min_notional`` (``no_liquidity``), or when the fill price is
+        at or beyond the stop (``gapped_through_stop``: the price gapped past it, 1R would not be
         positive).
 
         The order is priced before it is removed: when pricing raises (a crossed quote, a
@@ -395,9 +395,10 @@ class Engine:
             self.cfg.costs,
             cap_participation=True,
         )
-        if fill is None or fill.qty * fill.price < MIN_NOTIONAL:
+        min_notional = self.cfg.risk.min_notional
+        if fill is None or fill.qty * fill.price < min_notional:
             why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
-            detail = f"{why} at bar volume {bar_volume}, min notional {MIN_NOTIONAL}"
+            detail = f"{why} at bar volume {bar_volume}, min notional {min_notional}"
             self._cancel_entry(signal.symbol, ts, "no_liquidity", detail)
             return
         if side_sign(signal.side) * (fill.price - signal.stop) <= 0:  # 1R zero or negative

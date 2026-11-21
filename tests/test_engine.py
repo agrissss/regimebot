@@ -123,6 +123,16 @@ def test_participation_cap_gives_a_partial_entry(tmp_path: Path) -> None:
     assert engine.portfolio.positions[BTC].qty == approx(5.0)
 
 
+def test_a_fill_cut_below_the_configured_min_notional_is_cancelled(tmp_path: Path) -> None:
+    # the same 5-unit cut fill as above (~500 quote) is dust when risk.min_notional is 600
+    engine = make(tmp_path, Scripted("trend"), overrides={"risk.min_notional": 600.0})
+    decide(engine, T1, {BTC: 100.0})
+    engine.fill_queued(BTC, T1, 99.99, 100.01, bar_volume=100.0)
+    assert rules(engine) == [(0, "ok"), (0, "no_liquidity")]
+    assert engine.log.decisions[-1][2].detail.endswith("min notional 600.0")
+    assert engine.log.fills == [] and engine.portfolio.positions == {}
+
+
 @pytest.mark.parametrize("volume", [0.0, 1.0, 5e-324], ids=["zero", "dust", "subnormal"])
 def test_entry_without_liquidity_is_cancelled_and_the_symbol_is_free_again(
     tmp_path: Path, volume: float

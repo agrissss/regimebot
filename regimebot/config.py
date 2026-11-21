@@ -178,6 +178,9 @@ class RiskConfig(_Model):
     max_drawdown: Fraction
     streak_half: PositiveInt
     streak_stop: PositiveInt
+    # quote units: a smaller entry is rejected (too_small) or, cut at fill time, cancelled
+    # (no_liquidity). Defaulted so configs stored before it existed still validate.
+    min_notional: float = Field(default=10.0, gt=0)
 
 
 def gross_cap_limits(risk: RiskConfig, symbols: Sequence[str]) -> dict[str, float]:

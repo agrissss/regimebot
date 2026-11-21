@@ -23,7 +23,6 @@ from regimebot.types import RiskDecision, RiskEvent, Signal, Trade, side_sign
 log = structlog.get_logger(__name__)
 
 DEFAULT_KILL_FILE = Path(__file__).resolve().parents[2] / "data" / "KILL"  # <repo>/data/KILL
-MIN_NOTIONAL = 10.0  # quote units; smaller orders are rejected as "too_small"
 STREAK_SIZE_MULT = 0.5  # size multiplier once the loss streak reaches streak_half
 # Halts that stay until cleared by hand (``clear_halt``): a run that hits one has ended trading.
 PERMANENT_HALTS = ("manual_kill", "max_drawdown")
@@ -107,7 +106,7 @@ class RiskManager:
         Rules in order: kill_switch, no_equity, day_stopped, regime_blocks_entries,
         strategy_not_allowed, position_exists, invalid_stop; then sizing, where a cap with no
         room left rejects with its rule (cap_asset, cap_group, cap_gross) and a notional under
-        ``MIN_NOTIONAL`` rejects as too_small. Day/week rollovers for ``now`` apply first.
+        ``risk.min_notional`` rejects as too_small. Day/week rollovers for ``now`` apply first.
 
         ``pending`` maps symbol -> notional (quote units) of entries approved but not yet
         filled. It counts as exposure for every cap, and a pending symbol is position_exists,
@@ -159,8 +158,8 @@ class RiskManager:
                 detail = f"{label} room {room:.2f} caps risk {risk_amount:.2f}"
         if notional <= 0 and rule != "ok":
             return _reject(rule, f"no {detail}")
-        if notional < MIN_NOTIONAL:
-            return _reject("too_small", f"notional {notional:.2f} < {MIN_NOTIONAL}")
+        if notional < self.risk.min_notional:
+            return _reject("too_small", f"notional {notional:.2f} < {self.risk.min_notional}")
         if rule != "ok":
             qty = notional / signal.entry
         return RiskDecision(approved=True, qty=qty, rule=rule, detail=detail)

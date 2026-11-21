@@ -84,6 +84,7 @@ risk:
   max_drawdown: 0.10
   streak_half: 3
   streak_stop: 5
+  min_notional: 10.0           # quote units; smaller entries are rejected or cancelled
 backtest:
   initial_equity: 10000.0
   start: "2024-01-01T00:00:00Z"

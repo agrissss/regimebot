@@ -123,6 +123,8 @@ class PaperSession:
         self._marks = state.FlushMarks()
         self._newest: dict[str, Bar] = {}  # newest bar fed to the engine, per symbol
         self._last_funding: dict[str, datetime] = {}  # newest funding event fed, per symbol
+        self._rejected: dict[str, int] = {}  # polled bars dropped by the OHLC sanity rules
+        self._last_rejected: dict[str, datetime] = {}  # newest of them, per symbol
         self._last_decision = _EPOCH
         self._incidents: set[str] = set()  # open alert incidents, "kind:subject"
         self._halts: set[str] = set()  # active halts last seen (alerted on change)
@@ -190,6 +192,8 @@ class PaperSession:
                     self._newest[symbol] = self._stored_bar(session, symbol, ts)
                 self._last_funding = dict(cursors.last_funding)
                 self._last_decision = cursors.last_decision
+                self._rejected = dict(cursors.rejected_bars)
+                self._last_rejected = dict(cursors.last_rejected)
             self._halts = set(self.risk.to_state()["halts"])
             self._marks = self._save(session)
         return self.run_id
@@ -298,17 +302,28 @@ class PaperSession:
             self._last_decision,
             {s: bar.ts for s, bar in self._newest.items()},
             dict(self._last_funding),
+            dict(self._rejected),
+            dict(self._last_rejected),
         )
         state.save_state(session, self.run_id, self.engine, cursors, self._stopped_at)
         return marks
 
     def _download(self, symbol: str, since: datetime, now: datetime) -> bool:
-        """Store ``symbol``'s closed base bars in ``[since, now]`` and its new funding events;
-        False when the candle download failed."""
+        """Store ``symbol``'s closed base bars in ``[since, now]`` (dropping any that break an
+        OHLC sanity rule: ``_reject``) and its new funding events; False when the candle download
+        failed."""
         ok = True
         try:
             with session_scope(self._db) as session:
-                download_candles(self.exchange, session, symbol, self._tf, since, now)
+                download_candles(
+                    self.exchange,
+                    session,
+                    symbol,
+                    self._tf,
+                    since,
+                    now,
+                    on_reject=lambda rows: self._reject(symbol, rows),
+                )
         except Exception as exc:  # any exchange or data error: the symbol is stale this poll
             log.warning("paper_download_failed", symbol=symbol, data="candles", error=repr(exc))
             ok = False
@@ -320,6 +335,24 @@ class PaperSession:
         except Exception as exc:  # retried next poll
             log.warning("paper_download_failed", symbol=symbol, data="funding", error=repr(exc))
         return ok
+
+    def _reject(self, symbol: str, rows: pd.DataFrame) -> None:
+        """Log and count the bars a download dropped for breaking an OHLC sanity rule (they are
+        not stored, so the symbol misses them like any gap). Each bar counts once: one at or
+        before the newest already counted (fetched again by a later poll) is skipped. A resume's
+        warm-up runs before the saved counts are restored, so it may log an old bar again, but
+        the counts ``paper status`` shows as rejected bars come back from the saved state."""
+        last = self._last_rejected.get(symbol)
+        stamps = pd.DatetimeIndex(rows.index).to_pydatetime()
+        values = rows[repo.CANDLE_COLUMNS].to_numpy(dtype=float).tolist()
+        for ts, bar in zip(stamps, values, strict=True):
+            if last is not None and ts <= last:
+                continue
+            last = ts
+            self._rejected[symbol] = self._rejected.get(symbol, 0) + 1
+            self._last_rejected[symbol] = ts
+            ohlcv = dict(zip(repo.CANDLE_COLUMNS, bar, strict=True))
+            log.warning("paper_bar_rejected", symbol=symbol, ts=ts.isoformat(), **ohlcv)
 
     def _new_events(self, now: datetime) -> tuple[list[Event], dict[str, datetime]]:
         """Stored bars and funding events newer than the engine has seen, all symbols in time

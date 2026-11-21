@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from regimebot.config import (
     DEFAULT_CONFIG_PATH,
+    AppConfig,
     config_hash,
     config_json,
     effective_gross_cap,
@@ -111,6 +112,18 @@ def test_effective_gross_cap() -> None:
     }
     loose = with_overrides(two, {"risk.max_group_exposure": 1.5})
     assert effective_gross_cap(loose.risk, loose.exchange.symbols) == pytest.approx(1.2)  # 2 x 0.6
+
+
+def test_min_notional_is_configured_positive_and_defaults_for_old_stored_configs() -> None:
+    assert load_config().risk.min_notional == 10.0
+    assert load_config(overrides={"risk.min_notional": 25.0}).risk.min_notional == 25.0
+    for bad in (0.0, -1.0):
+        with pytest.raises(ValidationError, match="min_notional"):
+            load_config(overrides={"risk.min_notional": bad})
+    # a run stored before the field existed still validates (`report` rebuilds old runs)
+    raw = load_config().model_dump(mode="json")
+    del raw["risk"]["min_notional"]
+    assert AppConfig.model_validate(raw).risk.min_notional == 10.0
 
 
 def test_fraction_and_timeframe_rejected() -> None:
