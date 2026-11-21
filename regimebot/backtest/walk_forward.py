@@ -8,10 +8,6 @@ Bookkeeping that keeps the result honest:
   ``oos_net_pnl`` is the plain sum of the windows' net pnl, each measured on the same capital;
 * ``n_variants_tried`` counts every distinct (window, grid combination) fitted, which is what a
   multiple-testing correction needs.
-
-# ponytail: every run recomputes resampling and features from the same candles; precompute the
-# features once per config (they depend only on ``cfg.features``/``cfg.regime``) if walk-forward
-# runtime (about 40 runs of up to 60 s on 2 years x 3 symbols) becomes the bottleneck.
 """
 
 import itertools
@@ -33,6 +29,10 @@ from regimebot.strategy import Strategy
 from regimebot.types import Trade
 
 log = structlog.get_logger(__name__)
+
+# ponytail: every run recomputes resampling and features from the same candles; precompute the
+# features once per config (they depend only on ``cfg.features``/``cfg.regime``) if walk-forward
+# runtime (about 40 runs of up to 60 s on 2 years x 3 symbols) becomes the bottleneck.
 
 
 @dataclass(frozen=True)
@@ -85,27 +85,26 @@ def walk_forward(
     train, test = timedelta(days=wf.train_days), timedelta(days=wf.test_days)
     keys = list(wf.grid)
     combos = [dict(zip(keys, vals, strict=True)) for vals in itertools.product(*wf.grid.values())]
+    # built once: an invalid combination fails here, before any backtest runs
+    variants = [with_overrides(cfg, params) for params in combos]
     rows: list[dict[str, object]] = []
     oos: list[Trade] = []
     i = 0
     while (train_start := start + i * test) + train + test <= end:
         train_end = train_start + train
         test_end = train_end + test
-        best: tuple[float, dict[str, float]] | None = None
+        best: tuple[float, dict[str, float], AppConfig] | None = None
         best_m: Metrics | None = None
-        for n, params in enumerate(combos, 1):
-            m, _ = run_metrics(
-                with_overrides(cfg, params), candles, funding, train_start, train_end, strategies
-            )
+        for n, (params, variant) in enumerate(zip(combos, variants, strict=True), 1):
+            m, _ = run_metrics(variant, candles, funding, train_start, train_end, strategies)
             log.info("walk_forward_train", window=i, combo=n, of=len(combos), n_trades=m.n_trades)
             if _qualifies(m, wf.min_trades) and (best is None or m.profit_factor > best[0]):
-                best, best_m = (m.profit_factor, params), m
-        chosen = best[1] if best else {}
+                best, best_m = (m.profit_factor, params, variant), m
+        chosen, test_cfg = (best[1], best[2]) if best else ({}, cfg)
         if best_m is None:  # nothing qualified: report the unmodified config's train run
+            log.warning("walk_forward_no_qualifying_params", window=i, min_trades=wf.min_trades)
             best_m, _ = run_metrics(cfg, candles, funding, train_start, train_end, strategies)
-        tm, trades = run_metrics(
-            with_overrides(cfg, chosen), candles, funding, train_end, test_end, strategies
-        )
+        tm, trades = run_metrics(test_cfg, candles, funding, train_end, test_end, strategies)
         log.info("walk_forward_test", window=i, n_trades=tm.n_trades, net_pnl=tm.net_pnl)
         oos.extend(trades)
         rows.append(

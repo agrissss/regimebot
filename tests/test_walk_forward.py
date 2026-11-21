@@ -5,6 +5,7 @@ selection logic is checked exactly; one test drives the real engine end to end.
 """
 
 import json
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from regimebot.backtest import walk_forward as wf
 from regimebot.backtest.runner import BacktestResult
 from regimebot.config import AppConfig, load_config, with_overrides
 from regimebot.engine.loop import RunLog
+from regimebot.strategy import Strategy
 from regimebot.types import ExitReason, Regime, Side, Trade
 
 DAY = timedelta(days=1)
@@ -44,10 +46,20 @@ def trade(ts: datetime, pnl: float) -> Trade:
 class FakeRun:
     """``run_backtest`` stand-in: ``script(risk_per_trade, start)`` gives the trades' pnls."""
 
-    def __init__(self, script):  # type: ignore[no-untyped-def]
-        self.script, self.calls = script, []
+    def __init__(self, script: Callable[[float, datetime], list[float]]) -> None:
+        self.script = script
+        self.calls: list[tuple[float, datetime, datetime]] = []
 
-    def __call__(self, cfg, candles, funding, start, end, kill_file, strategies=None):  # type: ignore[no-untyped-def]
+    def __call__(
+        self,
+        cfg: AppConfig,
+        candles: Mapping[str, pd.DataFrame],
+        funding: Mapping[str, pd.Series],
+        start: datetime,
+        end: datetime,
+        kill_file: Path,
+        strategies: Sequence[Strategy] | None = None,
+    ) -> BacktestResult:
         assert not Path(kill_file).exists()
         self.calls.append((cfg.risk.risk_per_trade, start, end))
         pnls = self.script(cfg.risk.risk_per_trade, start)
@@ -107,6 +119,34 @@ def test_params_are_argmax_on_train_not_on_test(monkeypatch: pytest.MonkeyPatch)
     assert fake.calls[-1][0] == 0.004
 
 
+def test_selection_metric_is_profit_factor_not_net_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0.005: PF 4, net 15; 0.004: PF inf, net 6. A net-pnl selector would pick 0.005.
+    fake = FakeRun(lambda p, s: [10.0, 10.0, -5.0] if p == 0.005 else [3.0, 3.0])
+    monkeypatch.setattr(wf, "run_backtest", fake)
+    res = wf.walk_forward(cfg_with({GRID_KEY: [0.005, 0.004]}), {}, {}, T0, T0 + 3 * DAY)
+    assert json.loads(res.windows.params[0]) == {GRID_KEY: 0.004}
+    assert res.windows.train_net_pnl[0] == 6.0
+
+
+def test_nan_profit_factor_does_not_qualify_even_with_enough_trades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wf, "run_backtest", FakeRun(lambda p, s: [0.0, 0.0, 0.0]))  # PF is NaN
+    res = wf.walk_forward(cfg_with({GRID_KEY: [0.004]}), {}, {}, T0, T0 + 3 * DAY)
+    assert res.windows.no_qualifying_params[0] and res.windows.train_n_trades[0] == 3
+
+
+def test_invalid_grid_combination_fails_before_any_backtest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeRun(lambda p, s: [1.0, 1.0])
+    monkeypatch.setattr(wf, "run_backtest", fake)
+    grid = {GRID_KEY: [0.004], "risk.max_gross_leverage": [1.0, 2.0]}  # 2.0 exceeds the hard cap
+    with pytest.raises(ValueError):
+        wf.walk_forward(cfg_with(grid), {}, {}, T0, T0 + 3 * DAY)
+    assert fake.calls == []
+
+
 def test_ties_go_to_first_in_grid_order_and_inf_beats_finite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,6 +171,9 @@ def test_no_qualifying_params_runs_test_on_unmodified_config(
     (row,) = res.windows.to_dict("records")
     assert row["no_qualifying_params"] and json.loads(row["params"]) == {}
     assert fake.calls[-1][0] == cfg.risk.risk_per_trade  # the test run used the base value
+    # 2 grid train runs + 1 unmodified-config train run (reported) + 1 test run
+    assert len(fake.calls) == 4
+    assert (row["train_n_trades"], row["train_net_pnl"]) == (1, 5.0)
 
 
 def test_n_variants_tried_is_combinations_times_windows(monkeypatch: pytest.MonkeyPatch) -> None:

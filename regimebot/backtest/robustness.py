@@ -11,9 +11,11 @@ from typing import Any
 
 import pandas as pd
 import structlog
+from pydantic import BaseModel
 
 from regimebot.backtest.walk_forward import run_metrics
 from regimebot.config import AppConfig, with_overrides
+from regimebot.reporting.metrics import Metrics
 from regimebot.strategy import Strategy
 
 log = structlog.get_logger(__name__)
@@ -28,9 +30,18 @@ COST_KEYS = (
 
 
 def _get(cfg: AppConfig, dotted: str) -> Any:
+    """Value at a dotted config path (attributes, or keys of dict nodes such as ``playbook``)."""
     node: Any = cfg
     for key in dotted.split("."):
-        node = getattr(node, key)
+        if isinstance(node, Mapping):
+            found = [k for k in node if str(getattr(k, "value", k)) == key]
+            if not found:
+                raise ValueError(f"unknown config path: {dotted!r}")
+            node = node[found[0]]
+        elif isinstance(node, BaseModel) and key in type(node).model_fields:
+            node = getattr(node, key)
+        else:
+            raise ValueError(f"unknown config path: {dotted!r}")
     return node
 
 
@@ -46,28 +57,41 @@ def sensitivity(
 ) -> pd.DataFrame:
     """Each numeric parameter at ``(1 - rel)``, base and ``(1 + rel)`` of its value, others fixed.
 
-    Ints are rounded and kept >= 1. A value the config rejects gives a row of NaNs with the
-    reason in ``note``. Columns: param, variant, value, net_pnl, profit_factor, n_trades, note.
+    The base config is run once and reused. Ints are rounded and kept >= 1; a variant that
+    equals the base after rounding reuses the base result and says so in ``note``. A value the
+    config rejects gives a row of NaNs with the reason in ``note``. Unknown or non-numeric
+    paths raise ``ValueError`` before any run. Columns: param, variant, value, net_pnl,
+    profit_factor, n_trades, note.
     """
-    rows = []
+    bases = {}
     for param in params:
-        base = _get(cfg, param)
-        if isinstance(base, bool) or not isinstance(base, int | float):
-            raise ValueError(f"{param} is not a numeric parameter (value {base!r})")
+        bases[param] = _get(cfg, param)
+        if isinstance(bases[param], bool) or not isinstance(bases[param], int | float):
+            raise ValueError(f"{param} is not a numeric parameter (value {bases[param]!r})")
+    base_m, _ = run_metrics(cfg, candles, funding, start, end, strategies)
+    rows = []
+    for param, base in bases.items():
         for label, factor in ((f"-{rel:.0%}", 1 - rel), ("base", 1.0), (f"+{rel:.0%}", 1 + rel)):
             value = base * factor
             if isinstance(base, int):
                 value = max(1, round(value))
             row: dict[str, Any] = {"param": param, "variant": label, "value": value, "note": ""}
-            try:
-                variant = with_overrides(cfg, {param: value})
-            except ValueError as exc:
-                row.update(net_pnl=math.nan, profit_factor=math.nan, n_trades=math.nan)
-                row["note"] = f"invalid: {str(exc).splitlines()[0]}"
+            m: Metrics | None = base_m
+            if value == base:
+                if label != "base":
+                    row["note"] = "unchanged after rounding"
             else:
-                m, _ = run_metrics(variant, candles, funding, start, end, strategies)
+                try:
+                    variant = with_overrides(cfg, {param: value})
+                except ValueError as exc:
+                    m = None
+                    row.update(net_pnl=math.nan, profit_factor=math.nan, n_trades=math.nan)
+                    row["note"] = f"invalid: {str(exc).splitlines()[0]}"
+                else:
+                    m, _ = run_metrics(variant, candles, funding, start, end, strategies)
+                    log.info("sensitivity", param=param, variant=label, value=value)
+            if m is not None:
                 row.update(net_pnl=m.net_pnl, profit_factor=m.profit_factor, n_trades=m.n_trades)
-                log.info("sensitivity", param=param, variant=label, value=value)
             rows.append(row)
     cols = ["param", "variant", "value", "net_pnl", "profit_factor", "n_trades", "note"]
     return pd.DataFrame(rows, columns=cols)

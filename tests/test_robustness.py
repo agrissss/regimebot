@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from synth import BTC, T0, Scripted, regime_walk
 
+from regimebot.backtest import robustness
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
 from regimebot.backtest.runner import run_backtest
 from regimebot.config import AppConfig, load_config
@@ -72,6 +73,35 @@ def test_sensitivity_invalid_value_is_a_nan_row_with_note_and_non_numeric_raises
         sensitivity(cfg, CANDLES, {}, T0, END, ["exchange.base_timeframe"], strategies=stub())
 
 
+def test_sensitivity_unknown_path_raises_and_dict_nodes_are_walked() -> None:
+    cfg = open_cfg()
+    with pytest.raises(ValueError, match="unknown config path"):
+        sensitivity(cfg, CANDLES, {}, T0, END, ["risk.nope"], strategies=stub())
+    with pytest.raises(ValueError, match="unknown config path"):
+        sensitivity(cfg, CANDLES, {}, T0, END, ["playbook.nope.size_mult"], strategies=stub())
+    df = sensitivity(cfg, CANDLES, {}, T0, END, ["playbook.range.size_mult"], strategies=stub())
+    assert df.value.tolist() == pytest.approx([0.8, 1.0, 1.2])
+    assert "invalid" in df.note.iloc[2]  # size_mult is capped at 1.0
+
+
+def test_sensitivity_runs_base_once_and_flags_unchanged_ints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = load_config(overrides={"exchange.symbols": [BTC], "risk.streak_half": 2})
+    runs: list[AppConfig] = []
+    real = robustness.run_metrics
+    monkeypatch.setattr(
+        robustness, "run_metrics", lambda c, *a, **k: (runs.append(c), real(c, *a, **k))[1]
+    )
+    params = ["risk.streak_half", "risk.risk_per_trade"]
+    df = sensitivity(cfg, CANDLES, {}, T0, END, params, strategies=stub())
+    # base once + (streak_half 2 -> 2, 2, 2: no extra runs) + risk_per_trade -20%/+20%
+    assert len(runs) == 3
+    ints = df[df.param == "risk.streak_half"]
+    assert ints.note.tolist() == ["unchanged after rounding", "", "unchanged after rounding"]
+    assert ints.net_pnl.nunique() == 1
+
+
 def test_cost_stress_never_increases_net_pnl_for_the_same_trades() -> None:
     df = cost_stress(open_cfg(), CANDLES, {}, T0, END, mult=2.0, strategies=stub())
     base, stressed = df.iloc[0], df.iloc[1]
@@ -86,3 +116,17 @@ def test_leverage_compare_returns_both_rows() -> None:
     assert df.max_gross_leverage.tolist() == [1.0, 1.5]
     assert {"net_pnl", "max_drawdown", "n_trades"} <= set(df.columns)
     assert df.n_trades.gt(0).all() and df.max_drawdown.ge(0).all()
+
+
+def test_cost_stress_multiplies_all_five_cost_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = open_cfg()
+    seen: list[AppConfig] = []
+    real = robustness.run_metrics
+    monkeypatch.setattr(
+        robustness, "run_metrics", lambda c, *a, **k: (seen.append(c), real(c, *a, **k))[1]
+    )
+    cost_stress(cfg, CANDLES, {}, T0, END, mult=3.0, strategies=stub())
+    base, stressed = seen
+    for k in robustness.COST_KEYS:
+        assert getattr(stressed.costs, k) == pytest.approx(3.0 * getattr(base.costs, k))
+    assert stressed.costs.max_participation == base.costs.max_participation
