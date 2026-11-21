@@ -109,8 +109,10 @@ def test_required_feature_list_is_pinned():
 @pytest.mark.parametrize("name", NAMES)
 def test_each_required_feature_nan_gives_no_trade(name):
     r = row(**{name: math.nan})
-    assert classify(r, cfg(), outside()) is Regime.NO_TRADE
-    assert list(classify_frame(one_row_frame(r, outside()), cfg())) == ["no_trade"]
+    c = cfg([WINDOW])  # inside the window the answer would be EVENT_RISK without the NaN rule
+    assert classify(row(), c, WINDOW.start) is Regime.EVENT_RISK
+    assert classify(r, c, WINDOW.start) is Regime.NO_TRADE
+    assert list(classify_frame(one_row_frame(r, WINDOW.start), c)) == ["no_trade"]
 
 
 def test_classify_frame_matches_classify_row_by_row():
