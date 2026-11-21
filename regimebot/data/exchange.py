@@ -19,6 +19,9 @@ log = structlog.get_logger(__name__)
 
 MAX_RETRIES = 5  # retries after the first attempt, so up to 6 calls in total
 BACKOFF_SECONDS = 1.0  # first wait; doubles each retry
+# A bar counts as closed only CLOSE_GRACE after its close time: covers local clock skew and
+# the exchange building a response just before the boundary (partial bar).
+CLOSE_GRACE = timedelta(seconds=2)
 
 
 class Exchange(Protocol):
@@ -79,12 +82,12 @@ class CcxtExchange:
 
     def fetch_candles(self, symbol: str, timeframe: str, since: datetime, limit: int) -> list[Bar]:
         width = timedelta(minutes=timeframe_minutes(timeframe))
+        cutoff = self._now() - CLOSE_GRACE  # read BEFORE the request: it may take a while
         # ccxt's `since` is an open time; our `since` is a close time.
         rows = self._call(self._client.fetch_ohlcv, symbol, timeframe, _to_ms(since - width), limit)
-        now = self._now()
         bars = [Bar(symbol, _from_ms(r[0]) + width, *(float(x) for x in r[1:6])) for r in rows]
         # Drop the forming bar (not closed yet) and anything before `since`.
-        return [b for b in bars if since <= b.ts <= now]
+        return [b for b in bars if since <= b.ts <= cutoff]
 
     def fetch_funding(
         self, symbol: str, since: datetime, limit: int
@@ -97,6 +100,9 @@ class CcxtExchange:
         ]
 
     def fetch_quote(self, symbol: str) -> Quote:
-        # Not fetch_ticker: on Binance USD-M it returns bid/ask = None (checked live).
-        t = self._call(self._client.fetch_bids_asks, [symbol])[symbol]
-        return Quote(symbol, self._now(), float(t["bid"]), float(t["ask"]))
+        # Not fetch_ticker (bid/ask are None on Binance USD-M) nor fetch_bids_asks (downloads
+        # the whole book-ticker list): a 5-level order book is the cheap per-symbol call.
+        book = self._call(self._client.fetch_order_book, symbol, 5)
+        ms = book.get("timestamp")
+        ts = _from_ms(ms) if ms is not None else self._now()
+        return Quote(symbol, ts, float(book["bids"][0][0]), float(book["asks"][0][0]))

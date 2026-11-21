@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from regimebot.cli import app
-from regimebot.data.exchange import CcxtExchange
+from regimebot.config import AppConfig, load_config
+from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
 from regimebot.data.validate import validate_candles
@@ -71,7 +72,7 @@ def test_resume_after_interruption_downloads_only_remainder(session: Session) ->
     assert len(load_candles(session, SYM, "1m")) == 100  # page 1 survived
 
     second = FakeExchange(n_bars=250, page_size=100)
-    n = download_candles(second, session, SYM, "1m", T0, T0 + 1000 * MIN)
+    n = download_candles(second, session, SYM, "1m", T0 + MIN, T0 + 1000 * MIN)
     assert n == 150
     assert second.candle_calls[0] == T0 + 101 * MIN  # first bar not yet stored
     assert len(load_candles(session, SYM, "1m")) == 250
@@ -80,7 +81,7 @@ def test_resume_after_interruption_downloads_only_remainder(session: Session) ->
 def test_rerun_is_idempotent_and_refetches_nothing_stored(session: Session) -> None:
     download_candles(FakeExchange(n_bars=50), session, SYM, "1m", T0, T0 + 50 * MIN)
     again = FakeExchange(n_bars=50)
-    n = download_candles(again, session, SYM, "1m", T0, T0 + 50 * MIN)
+    n = download_candles(again, session, SYM, "1m", T0 + MIN, T0 + 50 * MIN)
     assert n == 0 and again.candle_calls == []
     assert len(load_candles(session, SYM, "1m")) == 50
 
@@ -105,6 +106,30 @@ def test_download_funding_pages_and_resumes(session: Session) -> None:
     assert len(load_funding(session, SYM)) == 12
 
 
+def test_start_not_on_bar_boundary(session: Session) -> None:
+    ex = FakeExchange(n_bars=20)
+    download_candles(ex, session, SYM, "1m", T0 + timedelta(seconds=30), T0 + 10 * MIN)
+    df = load_candles(session, SYM, "1m")
+    assert df.index[0] == T0 + MIN and df.index[-1] == T0 + 10 * MIN and len(df) == 10
+
+
+def test_earlier_start_backfills_range_before_stored_bars(session: Session) -> None:
+    download_candles(FakeExchange(n_bars=500), session, SYM, "1m", T0 + 300 * MIN, T0 + 500 * MIN)
+    n = download_candles(FakeExchange(n_bars=500), session, SYM, "1m", T0, T0 + 500 * MIN)
+    df = load_candles(session, SYM, "1m")
+    assert n == 299 and len(df) == 500  # bars 1..299 added, 300..500 not refetched
+    assert validate_candles(df, "1m").missing_bars == 0
+
+
+def test_earlier_start_backfills_funding(session: Session) -> None:
+    end = T0 + timedelta(days=30)
+    ex = FakeExchange(n_bars=1, n_funding=10)
+    download_funding(ex, session, SYM, T0 + timedelta(hours=8 * 5), end)
+    assert len(load_funding(session, SYM)) == 5
+    assert download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end) == 5
+    assert len(load_funding(session, SYM)) == 10
+
+
 # --- ccxt adapter ---------------------------------------------------------------------------
 
 
@@ -127,8 +152,8 @@ class StubClient:
             {"timestamp": int(T0.timestamp() * 1000) + 1, "fundingRate": None},
         ]
 
-    def fetch_bids_asks(self, symbols: list[str]) -> dict[str, dict[str, float]]:
-        return {symbols[0]: {"bid": 99.5, "ask": 100.5}}
+    def fetch_order_book(self, symbol: str, limit: int) -> dict[str, Any]:
+        return {"bids": [[99.5, 1]], "asks": [[100.5, 1]], "timestamp": _ms(T0)}
 
 
 def _ms(ts: datetime) -> int:
@@ -136,7 +161,7 @@ def _ms(ts: datetime) -> int:
 
 
 def test_ccxt_open_time_becomes_close_time_and_forming_bar_dropped() -> None:
-    now = T0 + 3 * MIN + timedelta(seconds=30)  # bar opening at +3m is still forming
+    now = T0 + 3 * MIN + CLOSE_GRACE + timedelta(seconds=30)  # bar opening at +3m is still forming
     rows = [[_ms(T0 + i * MIN), 1, 2, 0.5, 1.5, 7] for i in range(4)]
     ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: now)
     bars = ex.fetch_candles(SYM, "1m", T0 + MIN, 1000)
@@ -149,21 +174,60 @@ def test_ccxt_open_time_becomes_close_time_and_forming_bar_dropped() -> None:
 
 def test_ccxt_bar_closing_exactly_now_is_kept() -> None:
     rows = [[_ms(T0), 1, 2, 0.5, 1.5, 7]]
-    ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: T0 + MIN)
+    ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: T0 + MIN + CLOSE_GRACE)
     assert len(ex.fetch_candles(SYM, "1m", T0 + MIN, 10)) == 1
+
+
+def test_bar_inside_grace_margin_is_not_closed() -> None:
+    rows = [[_ms(T0), 1, 2, 0.5, 1.5, 7]]
+    just_inside = T0 + MIN + CLOSE_GRACE - timedelta(milliseconds=1)
+    ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: just_inside)
+    assert ex.fetch_candles(SYM, "1m", T0 + MIN, 10) == []
+
+
+def test_cutoff_is_read_before_the_request() -> None:
+    """Response built at 00:00:59.950 arrives at local 00:01:00.080: bar is still forming."""
+    clock = [T0 + timedelta(seconds=59, milliseconds=950)]
+
+    class SlowClient(StubClient):
+        def fetch_ohlcv(self, *a: Any) -> list[list[float]]:
+            clock[0] = T0 + timedelta(seconds=60, milliseconds=80)  # time passes in flight
+            return self.ohlcv
+
+    rows = [[_ms(T0), 1, 2, 0.5, 1.5, 7]]  # open 00:00 -> ts 00:01
+    ex = CcxtExchange("binanceusdm", client=SlowClient(rows), now=lambda: clock[0])
+    assert ex.fetch_candles(SYM, "1m", T0 + MIN, 10) == []
+
+
+def test_bars_before_since_are_filtered() -> None:
+    rows = [[_ms(T0 + i * MIN), 1, 2, 0.5, 1.5, 7] for i in range(3)]  # ts +1m,+2m,+3m
+    ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: T0 + 10 * MIN)
+    assert [b.ts for b in ex.fetch_candles(SYM, "1m", T0 + 2 * MIN, 10)] == [
+        T0 + 2 * MIN,
+        T0 + 3 * MIN,
+    ]
 
 
 def test_ccxt_funding_and_quote_parsing() -> None:
     ex = CcxtExchange("binanceusdm", client=StubClient(), now=lambda: T0)
     assert ex.fetch_funding(SYM, T0, 10) == [(T0, 0.0001)]  # null rate skipped
     q = ex.fetch_quote(SYM)
-    assert (q.bid, q.ask, q.ts) == (99.5, 100.5, T0)
+    assert (q.bid, q.ask, q.ts) == (99.5, 100.5, T0)  # exchange timestamp wins
+
+
+def test_quote_falls_back_to_local_time_without_exchange_timestamp() -> None:
+    client = StubClient()
+    client.fetch_order_book = lambda s, n: {"bids": [[1, 1]], "asks": [[2, 1]], "timestamp": None}  # type: ignore[method-assign]  # stub override
+    ex = CcxtExchange("binanceusdm", client=client, now=lambda: T0 + MIN)
+    assert ex.fetch_quote(SYM).ts == T0 + MIN
 
 
 def test_retry_then_success_with_exponential_backoff() -> None:
     sleeps: list[float] = []
     client = StubClient([[_ms(T0), 1, 2, 0.5, 1.5, 7]], fail=3)
-    ex = CcxtExchange("binanceusdm", client=client, sleep=sleeps.append, now=lambda: T0 + MIN)
+    ex = CcxtExchange(
+        "binanceusdm", client=client, sleep=sleeps.append, now=lambda: T0 + MIN + CLOSE_GRACE
+    )
     assert len(ex.fetch_candles(SYM, "1m", T0 + MIN, 10)) == 1
     assert sleeps == [1.0, 2.0, 4.0]
 
@@ -265,6 +329,10 @@ def test_resample_partial_leading_bucket_dropped() -> None:
     assert list(resample(df, "1m", "15m").index.strftime("%H:%M")) == []
 
 
+def test_resample_empty_frame() -> None:
+    assert resample(_frame(0), "1m", "15m").empty
+
+
 def test_resample_rejects_non_multiple() -> None:
     with pytest.raises(ValueError):
         resample(_frame(), "15m", "5m")
@@ -273,17 +341,28 @@ def test_resample_rejects_non_multiple() -> None:
 # --- CLI ------------------------------------------------------------------------------------
 
 
+def _narrow_cfg(monkeypatch: pytest.MonkeyPatch, start: str, end: str) -> AppConfig:
+    """Config whose backtest range is tiny, patched into the CLI."""
+    base = load_config()
+    cfg = base.model_copy(
+        update={
+            "backtest": base.backtest.model_copy(
+                update={"start": datetime.fromisoformat(start), "end": datetime.fromisoformat(end)}
+            )
+        }
+    )
+    monkeypatch.setattr("regimebot.cli.load_config", lambda: cfg)
+    return cfg
+
+
 def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     url = f"sqlite:///{tmp_path / 'cli.db'}"
     monkeypatch.setenv("DATABASE_URL", url)
     eng = make_engine(url)
     Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T01:40:00Z")
     runner = CliRunner()
     assert runner.invoke(app, ["data", "check"]).exit_code == 1  # no data: not ok
-
-    from regimebot.config import load_config
-
-    cfg = load_config()
     n = 100
     idx = pd.date_range(cfg.backtest.start, periods=n, freq="1min", name="ts")
     df = pd.DataFrame(
@@ -295,4 +374,41 @@ def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     res = runner.invoke(app, ["data", "check"])
     assert res.exit_code == 0, res.output
     assert "OK" in res.output
+    eng.dispose()
+
+
+def test_data_download_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = f"sqlite:///{tmp_path / 'dl.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    fake = FakeExchange(n_bars=30, n_funding=2)
+    monkeypatch.setattr("regimebot.cli.CcxtExchange", lambda exchange_id: fake)
+    res = CliRunner().invoke(
+        app, ["data", "download", "--start", "2024-01-01", "--end", "2024-01-01T00:10:00Z"]
+    )
+    assert res.exit_code == 0, res.output
+    with session_scope(eng) as s:
+        for sym in ("BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"):
+            assert len(load_candles(s, sym, "1m")) == 10
+            assert len(load_funding(s, sym)) == 1  # only the 00:00 event is <= end
+    assert "BTC/USDT:USDT: 10 candles, 1 funding rows" in res.output
+    eng.dispose()
+
+
+def test_data_check_fails_on_short_history_and_prints_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = f"sqlite:///{tmp_path / 'sh.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T03:00:00Z")
+    df = _frame(100, start=cfg.backtest.start + timedelta(hours=1))  # starts an hour late
+    with session_scope(eng) as s:
+        for sym in cfg.exchange.symbols:
+            upsert_candles(s, sym, "1m", df)
+    res = CliRunner().invoke(app, ["data", "check"])
+    assert res.exit_code == 1
+    assert "bars=100 first=" in res.output and "shorter" in res.output
     eng.dispose()

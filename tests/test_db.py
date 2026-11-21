@@ -315,3 +315,16 @@ def test_cli_db_upgrade_uses_database_url(tmp_path: Path, monkeypatch: pytest.Mo
     result = CliRunner().invoke(app, ["db", "upgrade"])
     assert result.exit_code == 0, result.output
     assert "runs" in inspect(create_engine(f"sqlite:///{path}")).get_table_names()
+
+
+def test_ts_bounds(engine: Engine) -> None:
+    with session_scope(engine) as s:
+        assert repo.candle_ts_bounds(s, "BTC", "1m") is None
+        assert repo.funding_ts_bounds(s, "BTC") is None
+        df = make_candles()
+        repo.upsert_candles(s, "BTC", "1m", df)
+        lo, hi = repo.candle_ts_bounds(s, "BTC", "1m") or (None, None)
+        assert lo == df.index[0] and hi == df.index[-1] and lo.tzinfo is not None
+        fs = pd.Series([0.1, 0.2], index=df.index[:2], name="rate")
+        repo.upsert_funding(s, "BTC", fs)
+        assert repo.funding_ts_bounds(s, "BTC") == (df.index[0], df.index[1])

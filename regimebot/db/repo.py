@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
@@ -161,6 +161,28 @@ def load_candles(
     df = pd.DataFrame([tuple(r[1:]) for r in records], columns=CANDLE_COLUMNS, dtype="float64")
     df.index = _utc_index(r[0] for r in records)
     return df
+
+
+def candle_ts_bounds(
+    session: Session, symbol: str, timeframe: str
+) -> tuple[datetime, datetime] | None:
+    """Earliest and latest stored candle ``ts`` for a series, or ``None`` when empty."""
+    row = session.execute(
+        select(func.min(Candle.ts), func.max(Candle.ts)).where(
+            Candle.symbol == symbol, Candle.timeframe == timeframe
+        )
+    ).one()
+    return None if row[0] is None else (row[0], row[1])
+
+
+def funding_ts_bounds(session: Session, symbol: str) -> tuple[datetime, datetime] | None:
+    """Earliest and latest stored funding ``ts`` for a symbol, or ``None`` when empty."""
+    row = session.execute(
+        select(func.min(FundingRate.ts), func.max(FundingRate.ts)).where(
+            FundingRate.symbol == symbol
+        )
+    ).one()
+    return None if row[0] is None else (row[0], row[1])
 
 
 def upsert_funding(session: Session, symbol: str, series: pd.Series) -> int:
