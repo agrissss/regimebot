@@ -45,7 +45,22 @@ Keep a final stretch of history that no decision about the strategy has used, an
 
 This is a rule you follow; the code has no holdout feature and no holdout period is configured. Practical form: run all development with `--end` before the holdout start, then run the final candidate once on the holdout (`--start`, `--end`), and report whatever comes out. If you look at it, change something and look again, it is no longer a holdout.
 
-Be honest about the current state: the first results below used all of 2024-2026 as development data. There is no untouched holdout left in that range. Paper trading forward in time is the only clean test remaining.
+Be honest about the current state: the first results below used 2024-01-01 to 2026-01-01 as development data, so that range is not a holdout. The backtests end at 2026-01-01, so 2026-01-01 onwards has never been used for any parameter or design choice and is a clean holdout. It is also a falling market, unlike the 2024-2025 test period. The next experiment is a single run of the frozen default configuration on that holdout (drawdown halt on and off, and 30 random-entry seeds), with pass criteria written down before the run (below), followed by 2021-2023. Results will be added when run. Paper trading forward in time is a further clean test.
+
+#### Pre-registered criteria for the 2026 holdout
+
+Written before the run, dated 2026-11-21.
+
+- Configuration: `config/default.yaml` at the commit that runs it. No parameter changes.
+- The strategy passes only if, with the drawdown halt off, all of these hold:
+  - net P&L after all costs is above 0;
+  - profit factor is at least 1.15;
+  - there are at least 100 trades;
+  - net P&L is above the median band of the 30 random-entry seeds, meaning the strategy beats at least 27 of the 30 seeds;
+  - maximum drawdown is at most 20%.
+- Whether the result stays positive with costs doubled is not required, but it will be reported.
+- Anything else is a fail, and a fail closes the question for this rule set as specified.
+- One secondary check, stated in advance: breakout alone has net P&L above 0 on the holdout. It tests the per-strategy observation in the README (breakout was the least bad strategy, positive before fees) and is reported as exploratory whatever the outcome.
 
 ### 4. Sensitivity
 
@@ -57,7 +72,7 @@ Each listed parameter is perturbed by +/-20% and the backtest rerun (default par
 
 ### 5. Cost stress
 
-The same command doubles every cost (fees, spread, slippage, impact) and compares effective gross leverage 1.0 against 1.5. Outputs: `reports/cost_stress.csv`, `reports/leverage_compare.csv`. If doubling costs wipes out the result, the margin is thinner than the cost estimates are accurate. Fees dominate high-frequency results, as the first results show.
+The same command scales every cost (x0.5 and x2 against the config as x1) (fees, spread, slippage, impact) and compares effective gross leverage 1.0 against 1.5. Outputs: `reports/cost_stress.csv`, `reports/leverage_compare.csv`. If doubling costs wipes out the result, the margin is thinner than the cost estimates are accurate. Fees dominate high-frequency results, as the first results show. The command runs costs at x0.5, x1 and x2 (`cost_stress.csv` has a `cost_mult` column).
 
 ### 6. Remove the best 5%
 
@@ -80,9 +95,9 @@ The report then states how many variants were tried before this one was chosen. 
 ## How to read a report honestly
 
 1. Start with the risk warning, and check whether the run halted. A run that hit the 10% drawdown limit stopped trading at that date; its numbers describe only the period before it. `backtest run` prints the halt time and reason.
-2. Look at net P&L, then fees. If gross P&L before fees is near zero or negative, there is nothing for cost tuning to rescue.
+2. Look at net P&L, then total modelled costs (fees, funding, spread and slippage). If gross P&L before all costs is near zero or negative, there is nothing for cost tuning to rescue.
 3. Compare with buy-and-hold and random entry, not with zero.
-4. Check the breakdowns (regime, symbol, strategy, exit reason). One profitable cell out of many is what chance produces.
+4. Check the breakdowns (regime, symbol, strategy, side, exit reason), the share of trades that met the minimum reward-to-risk at the actual fill, and the largest market moves. The report also gives expectancy with a bootstrap interval and states how many random seeds the strategy beat (`--random-seeds`, up to 50). One profitable cell out of many is what chance produces.
 5. Check the result without the best 5%, and the trade count. Under about 100 trades, most metrics are noise.
 6. Check modelled versus realised slippage.
 7. Ask how many variants were tried.
@@ -106,7 +121,7 @@ Data 2023-11-30 to 2026-01-01 (the first 31 days only warm up the features); tra
 .venv/bin/regimebot backtest run --set risk.max_drawdown=1.0
 ```
 
-1,312 trades, net -4,546.86 USDT (-45.47%), profit factor 0.83, win rate 31.86%, expectancy -0.16R, max drawdown 48.64%, max gross leverage seen 1.02x. Fees were 4,031.04 and funding 58.07, so before fees the loss was about 516 (about 458 before fees and funding). Buy and hold over the two years: +5,302.82 (+53.03%, max drawdown 50.52%). Random entries with the same exits: median -6,433.63, range -6,883.03 to -4,263.12, profit factor 0.67. Reading: the strategies lose a little before costs and a lot after. Trading 1,312 times is expensive, and cost tuning cannot fix a gross result that is not positive. The entry rules do somewhat better than random entries with the same exits (though one of the three random seeds lost less than the strategy), nowhere near enough to cover costs, and the strategy is far behind buy and hold.
+1,312 trades, net -4,546.86 USDT (-45.47%), profit factor 0.83, win rate 31.86%, expectancy -0.16R, max drawdown 48.64%, max gross leverage seen 1.02x. Fees were 4,031.04 and funding 58.07, and spread and slippage inside the fill prices were about 2,374, so total modelled costs were about 6,460. The earlier figure of about -516 before fees still included the spread and slippage; before all modelled costs the rules made a small positive gross result, roughly +1,900 over two years, several times smaller than the costs. Buy and hold over the two years: +5,302.82 (+53.03%, max drawdown 50.52%). Random entries with the same exits: median -6,433.63, range -6,883.03 to -4,263.12, profit factor 0.67. Reading: the rules make a small gross profit before costs and lose a lot after them. Trading 1,312 times is expensive, and the costs are several times the gross result, so there is no edge after costs as specified. The entry rules do somewhat better than random entries with the same exits (though one of the three random seeds lost less than the strategy), nowhere near enough to cover costs, and the strategy is far behind buy and hold.
 
 **Robustness** (two years, drawdown halt off). Moving each of four parameters by +/-20% keeps the net result between -4,278.77 and -5,207.16 (profit factor 0.81 to 0.85), so the loss is not an artefact of one parameter value. Doubling all costs gives -6,976.88 (profit factor 0.69). Effective leverage 1.0x versus 1.5x gives -4,546.86 (max drawdown 48.64%, max gross seen 1.02x) versus -5,122.05 (max drawdown 53.19%, max gross seen 1.52x): more leverage made the loss larger. With the default config every symbol is in one group capped at 1.0x, so the configured 1.5x gross cap is unreachable; the comparison raises the group cap together with the gross cap, and reports print both the configured and the effective cap. An earlier sentence in these docs said the cap never binds at 0.5% risk per trade. That was wrong: in the two-year run 243 of 1,312 approved entries were reduced by the asset or group cap.
 
@@ -119,6 +134,8 @@ Data 2023-11-30 to 2026-01-01 (the first 31 days only warm up the features); tra
 ```
 
 Best in-training profit factors 0.84, 0.96, 0.87 and 0.91 on 677, 647, 627 and 623 trades; training nets -2,434.49, -513.23, -1,827.04 and -1,289.81. Out-of-sample: 636 trades, net -2,234.05 USDT; test profit factors 1.36, 0.65, 0.86, 0.59; window nets +1,329.28, -1,557.25, -508.65, -1,497.43. One quarter won and three lost. Reading: the best parameter set in the grid lost money in training in every window, and the winning quarter came from parameters that had lost in training, so it is not evidence of an edge.
+
+**After-the-fact slices** (halt-off run; hypotheses, not findings). Mean reversion: 292 trades, net -2,404 (before fees -1,464). Trend: 666 trades, net -1,678 (before fees -62). Breakout: 354 trades, net -465 (before fees +1,069). By side: longs -4,196, shorts -351. These were looked at after the result was known; the breakout observation is tested once, in advance, in the holdout criteria above. Cost model: the modelled 3 bps per side of spread plus slippage is pessimistic for a small account on these markets; at about 0.5 bps the two-year halt-off loss would be roughly -2,600 instead of -4,547, still a loss.
 
 **Regime study** (`regimebot regimes study`, fully warmed classifier). A 5% move within 24 hours followed 22% / 37% / 60% of high-volatility-expansion bars on BTC / ETH / SOL, against 6% / 16% / 30% after compression. The mean 24-hour return after a "trending up" bar on BTC was +0.27% against a standard deviation of 2.2%. Regimes tell you how big the next move may be, not which way it goes. The breakout and trend strategies need the direction.
 

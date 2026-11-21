@@ -1,3 +1,5 @@
+> Historical: this is the original build plan (November 2026). The code and the other docs are the current truth where they differ.
+
 # regimebot MVP implementation plan
 
 Spec: `docs/architecture.md` (read it first; it is short).

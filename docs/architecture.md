@@ -59,6 +59,7 @@ Strategy, risk, portfolio and persistence code is identical in every mode.
   history is loaded from that span before `backtest.start`.
 - Longer horizons are expressed as longer windows on the decision frame, not as
   joined higher-timeframe bars. This removes the most common look-ahead bug.
+- Backtests model the spread as a constant; paper uses the live quoted spread, so the `liquidity_stress` regime is triggered only by the illiquidity percentile in backtests and results by regime are not strictly comparable between the two.
 - Inside one 1m bar, if both stop and target are touched, the stop is assumed
   to fill first. Fill conventions are in ADR 0004.
 
@@ -80,11 +81,17 @@ results never mix.
 - Entries approved in the same decision bar count toward exposure caps before
   they fill, and a queued entry expires if unfilled at the next decision.
 - Stale or invalid data blocks new entries.
+- In paper trading, a symbol whose features are not fully valid at a decision is recorded (`warmup_incomplete`), alerted once per incident and not traded.
 - Live order submission is not implemented in this version. See ADR 0003.
 
 ## Not in this version
 
 Live order adapter, WebSocket feeds (REST polling is used), open-interest and
 liquidation history, implied volatility, news and sentiment, web dashboard.
+The full list of what the original brief asked for and was deliberately left out,
+with reasons, and the enterprise items that do not apply to a single-user local
+tool, are in the README sections
+[What the original brief asked for that is deliberately not built](../README.md#what-the-original-brief-asked-for-that-is-deliberately-not-built)
+and [Not applicable](../README.md#not-applicable).
 
 See also: `README.md`, `docs/operations.md`, `docs/research-protocol.md`, `docs/adr/`.
