@@ -18,6 +18,7 @@ from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.market_state.features import compute_features
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
+from regimebot.risk.manager import DEFAULT_KILL_FILE
 
 app = typer.Typer(help="Regime-aware crypto trading research system.", no_args_is_help=True)
 
@@ -34,6 +35,25 @@ def main() -> None:
 def version() -> None:
     """Print the installed regimebot version."""
     typer.echo(package_version("regimebot"))
+
+
+@app.command()
+def kill() -> None:
+    """Emergency stop: create the kill file; sessions halt, flatten and stop opening positions."""
+    DEFAULT_KILL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_KILL_FILE.touch()
+    typer.echo(f"kill switch on: {DEFAULT_KILL_FILE}")
+
+
+@app.command()
+def unkill() -> None:
+    """Remove the kill file. A halted session also needs its halt cleared before it resumes."""
+    try:
+        DEFAULT_KILL_FILE.unlink()
+    except FileNotFoundError:
+        typer.echo(f"kill switch was not on: no {DEFAULT_KILL_FILE}")
+        return
+    typer.echo(f"kill switch off: removed {DEFAULT_KILL_FILE}")
 
 
 @db_app.command("upgrade")
