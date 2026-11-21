@@ -1,6 +1,7 @@
 """Command-line entry point."""
 
 import json
+import os
 import tempfile
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -31,7 +32,7 @@ from regimebot.market_state.features import compute_features
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
 from regimebot.paper.session import PaperSession
-from regimebot.paper.state import latest_status
+from regimebot.paper.state import clear_halts, latest_status, lock_run
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
 
@@ -62,7 +63,8 @@ def kill() -> None:
 
 @app.command()
 def unkill() -> None:
-    """Remove the kill file. A halted session also needs its halt cleared before it resumes."""
+    """Remove the kill file. A paper run it halted stays halted (and flat) until
+    `regimebot paper clear-halt RUN_ID`."""
     try:
         DEFAULT_KILL_FILE.unlink()
     except FileNotFoundError:
@@ -427,7 +429,12 @@ def paper_run(
                 f"run id:    {run_id} ({'resumed' if resume is not None else 'new'})",
                 f"symbols:   {', '.join(cfg.exchange.symbols)}, polling every "
                 f"{cfg.paper.poll_seconds}s",
-                f"kill file: {DEFAULT_KILL_FILE} (`regimebot kill` flattens and blocks entries)",
+                f"kill file: {DEFAULT_KILL_FILE} (`regimebot kill` flattens at the next poll)",
+                f"halts:     the kill switch or a {cfg.risk.max_drawdown:.0%} drawdown halt "
+                "flattens and stops this run's trading;",
+                "           after a manual kill: `regimebot unkill`, then "
+                f"`regimebot paper clear-halt {run_id}`;",
+                "           a drawdown halt ends the run (start a new one)",
                 "stop:      Ctrl-C or SIGTERM (finishes the current poll, positions stay open)",
                 f"resume:    regimebot paper run --resume {run_id}",
                 "=" * 72,
@@ -438,11 +445,52 @@ def paper_run(
     _say(f"stopped; run {run_id} is open. Resume with: regimebot paper run --resume {run_id}")
 
 
+@paper_app.command("clear-halt")
+def paper_clear_halt(
+    run_id: Annotated[int, typer.Argument(help="The halted paper run.")],
+) -> None:
+    """Clear a paper run's recorded halts so its next decision may trade again.
+
+    Refuses while the kill file exists (`regimebot unkill` first) or while the run is running.
+    A max_drawdown halt re-triggers at the next check while drawdown is still past the limit: by
+    design that run is over, start a new one.
+    """
+    cfg = load_config()
+    try:
+        lock = lock_run(DEFAULT_KILL_FILE.parent, run_id)
+    except ValueError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+    try:
+        with session_scope(make_engine(cfg.database_url)) as session:
+            cleared = clear_halts(session, run_id, cfg, DEFAULT_KILL_FILE)
+    except (ValueError, RuntimeError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+    finally:
+        os.close(lock)  # held until the cleared state is committed
+    typer.echo(f"run {run_id}: cleared {', '.join(cleared) if cleared else 'nothing (no halt)'}")
+
+
 @paper_app.command("status")
-def paper_status() -> None:
-    """Show the latest paper run: equity, open positions, last regimes, halt, risk events."""
-    engine = make_engine(load_config().database_url)
-    with session_scope(engine) as session:
+def paper_status(
+    max_age: Annotated[
+        int | None,
+        typer.Option(
+            help="Seconds since the last poll before an open run counts as hung "
+            "(default 3 x poll_seconds + stale_after_seconds)."
+        ),
+    ] = None,
+) -> None:
+    """Show the latest paper run: liveness, equity, open positions, last regimes, halt, risk
+    events. Exits 1 when an open run has not polled within --max-age (for uptime checks)."""
+    cfg = load_config()
+    limit = (
+        max_age
+        if max_age is not None
+        else (3 * cfg.paper.poll_seconds + cfg.paper.stale_after_seconds)
+    )
+    with session_scope(make_engine(cfg.database_url)) as session:
         status = latest_status(session)
     if status is None:
         typer.echo("no paper runs yet: start one with `regimebot paper run`")
@@ -453,6 +501,8 @@ def paper_status() -> None:
         else "ended"
     )
     typer.echo(f"paper run {status.run_id}: {state}, started {status.started_at.isoformat()}")
+    age = None if status.last_poll is None else (datetime.now(UTC) - status.last_poll)
+    typer.echo("last poll: never" if age is None else f"last poll: {age.total_seconds():.0f} s ago")
     if status.equity is None:
         typer.echo("equity: no decision yet")
     else:
@@ -471,3 +521,6 @@ def paper_status() -> None:
     typer.echo(f"last {len(status.risk_events)} risk events:")
     for e in status.risk_events:
         typer.echo(f"  {e.ts.isoformat()} {e.kind} -> {e.action}: {e.detail}")
+    if status.is_open and (age is None or age.total_seconds() > limit):
+        typer.echo(f"NOT POLLING: no poll in the last {limit} s (hung or stopped?)", err=True)
+        raise typer.Exit(1)

@@ -2,12 +2,17 @@
 
 A paper run keeps its resumable state in ``open_positions``: one row per open position (its
 ``Position.to_state``), the risk manager's ``to_state`` under ``"__risk__"``, and under
-``"__portfolio__"`` the portfolio's cash, peak equity and marks, the engine's queued exits and last
-decision closes, and the session's cursors (``Cursors``).
+``"__portfolio__"`` the portfolio's cash, peak equity and marks, the engine's ``to_state`` (queued
+exits, last decision closes) and the session's cursors (``Cursors``). The ``"__portfolio__"`` row
+is rewritten on every poll, so its ``updated_at`` is the session's heartbeat. A running session
+holds an exclusive lock on ``paper_run_<id>.lock`` next to the kill file (``lock_run``).
 """
 
+import fcntl
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
@@ -15,11 +20,11 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import AppConfig, config_hash
 from regimebot.db import repo
-from regimebot.db.models import EquitySnapshot, RegimeRow, RiskEventRow, Run
+from regimebot.db.models import EquitySnapshot, OpenPosition, RegimeRow, RiskEventRow, Run
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Position
-from regimebot.risk.manager import HALT_SEVERITY
-from regimebot.types import ExitReason, Mode, RiskEvent
+from regimebot.risk.manager import HALT_SEVERITY, RiskManager
+from regimebot.types import Mode, RiskEvent
 
 PORTFOLIO_KEY = "__portfolio__"
 RISK_KEY = "__risk__"
@@ -76,22 +81,22 @@ def append_log(session: Session, run_id: int, log: RunLog, marks: FlushMarks) ->
     )
 
 
-# --- engine internals -----------------------------------------------------------------------
-# ``Engine`` has no public state hook (reported as a concern). Its queued exits and the last
-# decision closes (an exit's ``ref_price``) must survive a restart, or a restored exit could be
-# lost, so these helpers read and restore them directly. Nothing else touches engine internals.
+# --- run lock -------------------------------------------------------------------------------
 
 
-def queued_exits(engine: Engine) -> dict[str, ExitReason]:
-    """The engine's queued exits by symbol (live view; copy before filling)."""
-    return engine._exits
-
-
-def _restore_engine(
-    engine: Engine, exits: dict[str, ExitReason], last_close: dict[str, float]
-) -> None:
-    engine._exits.update(exits)
-    engine._last_close.update(last_close)
+def lock_run(lock_dir: Path, run_id: int) -> int:
+    """Take run ``run_id``'s exclusive lock and return its file descriptor; the lock holds until
+    the descriptor is closed or the process exits. Raises ValueError when it is already held
+    (another session runs this run), so two processes never book the same run."""
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    path = lock_dir / f"paper_run_{run_id}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise ValueError(f"paper run {run_id} is already running (lock {path} is held)") from None
+    return fd
 
 
 # --- save and restore -----------------------------------------------------------------------
@@ -109,8 +114,7 @@ def save_state(session: Session, run_id: int, engine: Engine, cursors: Cursors) 
         "cash": portfolio.cash,
         "peak_equity": portfolio.peak_equity,
         "last_prices": dict(portfolio.last_prices),
-        "queued_exits": {s: str(r) for s, r in queued_exits(engine).items()},
-        "last_close": dict(engine._last_close),
+        **engine.to_state(),  # queued_exits, last_close
         "last_decision": cursors.last_decision.isoformat(),
         "last_bar": {s: ts.isoformat() for s, ts in cursors.last_bar.items()},
         "last_funding": {s: ts.isoformat() for s, ts in cursors.last_funding.items()},
@@ -134,8 +138,8 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
     """Load ``run_id``'s saved state into a fresh ``engine`` (its portfolio, risk manager and
     queued exits) and return the session cursors.
 
-    Raises ValueError, before changing anything, when the run cannot be resumed or its state is
-    missing or malformed.
+    Raises ValueError when the run cannot be resumed or its state is missing or malformed; the
+    portfolio is only assigned once everything else has loaded.
     """
     check_resumable(session, run_id, engine.cfg)
     rows = repo.load_open_positions(session, run_id)
@@ -146,20 +150,37 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
     last_prices = {s: float(v) for s, v in saved["last_prices"].items()}
     if missing := sorted(set(positions) - set(last_prices)):
         raise ValueError(f"run {run_id}: no mark for open positions {missing}")
-    exits = {s: ExitReason(r) for s, r in saved["queued_exits"].items()}
-    last_close = {s: float(v) for s, v in saved["last_close"].items()}
     cursors = Cursors(
         _utc(saved["last_decision"]),
         {s: _utc(v) for s, v in saved["last_bar"].items()},
         {s: _utc(v) for s, v in saved["last_funding"].items()},
     )
     cash, peak = float(saved["cash"]), float(saved["peak_equity"])
-    engine.risk.load_state(risk_state)  # validates and parses before assigning anything
+    engine.load_state({key: saved[key] for key in ("queued_exits", "last_close")})
+    engine.risk.load_state(risk_state)  # both validate before assigning anything
     portfolio = engine.portfolio
     portfolio.cash, portfolio.peak_equity = cash, peak
     portfolio.last_prices, portfolio.positions = last_prices, positions
-    _restore_engine(engine, exits, last_close)
     return cursors
+
+
+def clear_halts(session: Session, run_id: int, cfg: AppConfig, kill_file: Path) -> list[str]:
+    """Clear paper run ``run_id``'s recorded halts in its stored risk state; returns the halts
+    that were active. The caller holds the run's lock (``lock_run``) until this commits.
+
+    Raises ValueError for a run that is not a paper run or has no saved state, RuntimeError
+    while the kill file exists (``RiskManager.clear_halt``).
+    """
+    if (mode := repo.load_run(session, run_id).mode) != Mode.PAPER:
+        raise ValueError(f"run {run_id} is a {mode} run, not a paper run")
+    saved = repo.load_open_positions(session, run_id).get(RISK_KEY)
+    if saved is None:
+        raise ValueError(f"run {run_id} has no saved paper state")
+    risk = RiskManager(cfg, kill_file)
+    risk.load_state(saved)
+    risk.clear_halt()
+    repo.save_open_position(session, run_id, RISK_KEY, risk.to_state())
+    return list(saved["halts"])
 
 
 def _utc(text: str) -> datetime:
@@ -179,6 +200,7 @@ class PaperStatus:
     run_id: int
     started_at: datetime
     is_open: bool  # never ended: ``paper run --resume`` continues it
+    last_poll: datetime | None  # the session rewrites its state row on every poll
     equity: tuple[datetime, float] | None  # last snapshot (one per decision)
     cash: float | None
     positions: list[Position]
@@ -197,6 +219,11 @@ def latest_status(session: Session) -> PaperStatus | None:
     rows: dict[str, Any] = repo.load_open_positions(session, run.id)
     saved, risk_state = rows.pop(PORTFOLIO_KEY, None), rows.pop(RISK_KEY, None)
     halts = set() if risk_state is None else set(risk_state["halts"])
+    last_poll = session.scalar(
+        select(OpenPosition.updated_at).where(
+            OpenPosition.run_id == run.id, OpenPosition.symbol == PORTFOLIO_KEY
+        )
+    )
     equity = session.execute(
         select(EquitySnapshot.ts, EquitySnapshot.equity)
         .where(EquitySnapshot.run_id == run.id)
@@ -225,6 +252,7 @@ def latest_status(session: Session) -> PaperStatus | None:
         run_id=run.id,
         started_at=run.started_at,
         is_open=run.ended_at is None,
+        last_poll=last_poll,
         equity=None if equity is None else (equity[0], equity[1]),
         cash=None if saved is None else float(saved["cash"]),
         positions=[Position.from_state(state) for state in rows.values()],

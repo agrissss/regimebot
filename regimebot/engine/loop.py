@@ -5,6 +5,9 @@ trades. A feed drives it with four events: ``on_decision`` at each decision-bar 
 ``fill_queued`` at the first price after a decision (entries and exits decided at a close fill
 there, never at the close itself), ``on_minute`` for every base bar while a position is open
 (stops and targets), and ``on_funding``. Everything it does is appended to a ``RunLog``.
+A long-running feed (paper trading) also uses ``to_state``/``load_state`` across restarts,
+``request_flatten`` for an emergency stop between decisions and ``cancel_queued_entries`` at
+shutdown.
 
 Causality: a decision at ``ts`` reads only ``windows`` (features up to and including ``ts``)
 and state built from earlier events. Orders it queues fill no earlier than the next event.
@@ -14,6 +17,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 import pandas as pd
 import structlog
@@ -126,6 +130,36 @@ class Engine:
             symbol in self.portfolio.positions or symbol in self._entries or symbol in self._exits
         )
 
+    @property
+    def queued_exits(self) -> dict[str, ExitReason]:
+        """A copy of the queued exits by symbol."""
+        return dict(self._exits)
+
+    def to_state(self) -> dict[str, Any]:
+        """JSON-safe snapshot of what a restart needs besides the portfolio and risk state: the
+        queued exits and the last decision closes (an exit's ``ref_price``). Queued entries are
+        not included: an entry only fills right after its own decision."""
+        return {
+            "queued_exits": {s: r.value for s, r in self._exits.items()},
+            "last_close": dict(self._last_close),
+        }
+
+    def load_state(self, state: Mapping[str, Any]) -> None:
+        """Restore a ``to_state`` snapshot. Raises ValueError, changing nothing, on a missing
+        key, an unknown exit reason or symbol, a close that is not finite and positive, or a
+        queued exit without a last close (it could not be priced)."""
+        if missing := sorted({"queued_exits", "last_close"} - set(state)):
+            raise ValueError(f"engine state: missing keys {missing}")
+        exits = {str(s): ExitReason(r) for s, r in state["queued_exits"].items()}
+        closes = {str(s): float(v) for s, v in state["last_close"].items()}
+        if unknown := sorted((set(exits) | set(closes)) - set(self.cfg.exchange.symbols)):
+            raise ValueError(f"engine state: unknown symbols {unknown}")
+        if bad := sorted(s for s, c in closes.items() if not (math.isfinite(c) and c > 0)):
+            raise ValueError(f"engine state: last close of {bad} must be finite and positive")
+        if unpriced := sorted(set(exits) - set(closes)):
+            raise ValueError(f"engine state: queued exits {unpriced} have no last close")
+        self._exits, self._last_close = exits, closes
+
     # --- events --------------------------------------------------------------------------
 
     def on_decision(
@@ -159,10 +193,7 @@ class Engine:
 
         self.log.risk_events.extend(self.risk.check_limits(self.portfolio, ts))
         if self.risk.must_flatten:
-            for symbol in self.portfolio.positions:
-                self._exits.setdefault(symbol, ExitReason.KILL)
-            for symbol in list(self._entries):
-                self._cancel_entry(symbol, ts, "kill_switch", f"halted: {self.risk.halted_reason}")
+            self.request_flatten(ts)
         else:
             for symbol, entry in list(self._entries.items()):
                 if entry.signal.ts < ts:  # never offered a fill (no bars since its decision)
@@ -177,13 +208,17 @@ class Engine:
 
         An exit closes the whole position (``ref_price`` = last decision close). An entry is
         capped at ``max_participation`` of ``bar_volume`` (``ref_price`` = signal entry); no fill,
-        or a fill under ``MIN_NOTIONAL``, cancels it with a ``no_liquidity`` decision."""
-        reason = self._exits.pop(symbol, None)
+        or a fill under ``MIN_NOTIONAL``, cancels it with a ``no_liquidity`` decision.
+
+        The order is priced before it is removed: when pricing raises (a crossed quote, a
+        non-finite volume), the order stays queued and the exception propagates."""
+        reason = self._exits.get(symbol)
         position = self.portfolio.positions.get(symbol)
         if reason is not None and position is not None:
             fill = self._exit_fill(position, ts, bid, ask, self._last_close[symbol], bar_volume)
-            self._close(fill, reason)
-        entry = self._entries.pop(symbol, None)
+            self._close(fill, reason)  # removes the queued exit
+        self._exits.pop(symbol, None)  # an exit whose position is already closed
+        entry = self._entries.get(symbol)
         if entry is not None:
             self._fill_entry(entry, ts, bid, ask, bar_volume)
 
@@ -219,14 +254,28 @@ class Engine:
         (``bar_volume=0``: no volume information, so the worst bounded impact), stamped ``ts``.
         A position with an exit already queued keeps that exit's reason. The equity snapshot at
         ``ts`` is replaced by the flat one."""
-        for symbol in list(self._entries):
-            self._cancel_entry(symbol, ts, "cancelled", f"flatten_all: {reason}")
+        self.cancel_queued_entries(ts, "cancelled", f"flatten_all: {reason}")
         for symbol, position in list(self.portfolio.positions.items()):
             bid, ask = quote_from_bar_open(prices[symbol], self.cfg.costs)
             fill = self._exit_fill(position, ts, bid, ask, prices[symbol], bar_volume=0.0)
             self._close(fill, self._exits.get(symbol, reason))
         self._exits.clear()
         self._snapshot(ts)
+
+    def request_flatten(self, ts: datetime, reason: ExitReason = ExitReason.KILL) -> None:
+        """Queue a ``reason`` exit for every open position (an exit already queued keeps its
+        reason) and cancel queued entries as ``kill_switch``; the exits fill at the next
+        ``fill_queued``. Used at a halted decision and for an emergency stop between them."""
+        for symbol in self.portfolio.positions:
+            self._exits.setdefault(symbol, reason)
+        self.cancel_queued_entries(ts, "kill_switch", f"halted: {self.risk.halted_reason}")
+
+    def cancel_queued_entries(
+        self, ts: datetime, rule: str = "cancelled", detail: str = "session stopped"
+    ) -> None:
+        """Drop every queued entry, recording a closing decision (``rule``) for each."""
+        for symbol in list(self._entries):
+            self._cancel_entry(symbol, ts, rule, detail)
 
     # --- decision steps ------------------------------------------------------------------
 
@@ -318,9 +367,11 @@ class Engine:
     def _fill_entry(
         self, entry: _QueuedEntry, ts: datetime, bid: float, ask: float, bar_volume: float
     ) -> None:
+        """Fill ``entry`` (still queued), or cancel it; it leaves the queue only once decided."""
         signal = entry.signal
         if ts >= signal.ts + self._decision_width:  # the next decision has passed: stale signal
-            self._reject(entry, ts, "expired", f"first fill offered at {ts}, signal at {signal.ts}")
+            detail = f"first fill offered at {ts}, signal at {signal.ts}"
+            self._cancel_entry(signal.symbol, ts, "expired", detail)
             return
         fill = market_fill(
             signal.symbol,
@@ -337,9 +388,10 @@ class Engine:
         if fill is None or fill.qty * fill.price < MIN_NOTIONAL:
             why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
             detail = f"{why} at bar volume {bar_volume}, min notional {MIN_NOTIONAL}"
-            self._reject(entry, ts, "no_liquidity", detail)
+            self._cancel_entry(signal.symbol, ts, "no_liquidity", detail)
             return
         self.portfolio.open(signal, fill)
+        del self._entries[signal.symbol]
         self.log.fills.append(fill)
 
     def _cancel_entry(self, symbol: str, ts: datetime, rule: str, detail: str) -> None:

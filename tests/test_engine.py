@@ -6,6 +6,7 @@ risk_per_trade 0.005 of 10 000 = 50 at the stop; taker 5 bps, maker 2 bps, half 
 slippage 2 bps, impact 1 bp per 1% of bar volume, max participation 5%.
 """
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -402,3 +403,98 @@ def test_flatten_all_keeps_the_reason_of_an_exit_already_queued(tmp_path: Path) 
     decide(engine, T2, {BTC: 100.0})  # TIME exit queued, flatten comes before it fills
     engine.flatten_all(T2, {BTC: 100.0}, ExitReason.END_OF_DATA)
     assert [t.exit_reason for t in engine.log.trades] == [ExitReason.TIME]
+
+
+# --- session hooks: state, failed fills, cancelling, flattening between decisions -------------
+
+
+def test_queued_exits_is_a_read_only_copy(tmp_path: Path) -> None:
+    engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(engine, T2, {BTC: 100.5})
+    exits = engine.queued_exits
+    assert exits == {BTC: ExitReason.TIME}
+    exits.clear()
+    assert engine.queued_exits == {BTC: ExitReason.TIME}
+
+
+def test_engine_state_round_trips_queued_exits_and_last_closes(tmp_path: Path) -> None:
+    engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(engine, T2, {BTC: 100.5})  # TIME exit queued, ref price 100.5
+    saved = json.loads(json.dumps(engine.to_state()))  # JSON-safe
+    assert saved == {"queued_exits": {BTC: "time"}, "last_close": {BTC: 100.5}}
+    restored = make(tmp_path, Scripted("trend"))
+    restored.portfolio.positions = engine.portfolio.positions
+    restored.portfolio.last_prices = dict(engine.portfolio.last_prices)
+    restored.load_state(saved)
+    assert restored.queued_exits == {BTC: ExitReason.TIME}
+    restored.fill_queued(BTC, T2, 100.0, 100.0, 1e6)  # the restored exit fills
+    (fill,) = restored.log.fills
+    assert fill.ref_price == 100.5
+
+
+@pytest.mark.parametrize(
+    ("state", "error"),
+    [
+        ({"queued_exits": {BTC: "soon"}, "last_close": {BTC: 100.0}}, "soon"),
+        ({"queued_exits": {}, "last_close": {"DOGE/USDT:USDT": 1.0}}, "unknown symbols"),
+        ({"queued_exits": {BTC: "time"}, "last_close": {}}, "no last close"),
+        ({"queued_exits": {}, "last_close": {BTC: float("nan")}}, "positive"),
+        ({"queued_exits": {}}, "missing keys"),
+    ],
+)
+def test_engine_load_state_rejects_bad_state_and_changes_nothing(
+    tmp_path: Path, state: dict[str, object], error: str
+) -> None:
+    engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(engine, T2, {BTC: 100.5})
+    before = engine.to_state()
+    with pytest.raises(ValueError, match=error):
+        engine.load_state(state)
+    assert engine.to_state() == before
+
+
+def test_a_fill_that_raises_leaves_the_order_queued(tmp_path: Path) -> None:
+    engine = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(engine, T2, {BTC: 100.5})
+    with pytest.raises(ValueError, match="crossed quote"):
+        engine.fill_queued(BTC, T2, 100.1, 100.0, 1e6)
+    with pytest.raises(ValueError, match="bar_volume"):
+        engine.fill_queued(BTC, T2, 100.0, 100.0, float("nan"))
+    assert engine.queued_exits == {BTC: ExitReason.TIME} and BTC in engine.portfolio.positions
+    engine.fill_queued(BTC, T2, 100.0, 100.0, 1e6)
+    assert [t.exit_reason for t in engine.log.trades] == [ExitReason.TIME]
+    assert engine.queued_exits == {}
+
+    entry = make(tmp_path, Scripted("trend"))
+    decide(entry, T1, {BTC: 100.0})
+    with pytest.raises(ValueError, match="crossed quote"):
+        entry.fill_queued(BTC, T1, 100.1, 100.0, 1e6)
+    assert entry.is_active(BTC) and rules(entry) == [(0, "ok")]  # still queued, no decision
+    entry.fill_queued(BTC, T1, 100.0, 100.0, 1e6)
+    assert BTC in entry.portfolio.positions
+
+
+def test_cancel_queued_entries_records_a_decision_for_each(tmp_path: Path) -> None:
+    engine = make(tmp_path, Scripted("trend"), symbols=(BTC, ETH))
+    decide(engine, T1, {BTC: 100.0, ETH: 100.0})
+    engine.cancel_queued_entries(T1 + MINUTE)
+    assert rules(engine) == [(0, "ok"), (1, "ok"), (0, "cancelled"), (1, "cancelled")]
+    (ts, decision) = engine.log.decisions[-1][1:]
+    assert (ts, decision.approved, decision.detail) == (T1 + MINUTE, False, "session stopped")
+    assert not engine.is_active(BTC) and not engine.is_active(ETH)
+
+
+def test_request_flatten_queues_kill_exits_and_cancels_entries(tmp_path: Path) -> None:
+    engine = make(tmp_path, Scripted("trend", max_hold_bars=1), symbols=(BTC, ETH))
+    decide(engine, T1, {BTC: 100.0, ETH: 100.0})
+    engine.fill_queued(BTC, T1, 100.0, 100.0, 1e6)  # BTC open, ETH entry still queued
+    engine.request_flatten(T1 + MINUTE)
+    assert engine.queued_exits == {BTC: ExitReason.KILL}
+    assert rules(engine) == [(0, "ok"), (1, "ok"), (1, "kill_switch")]
+    engine.fill_queued(BTC, T1 + MINUTE, 100.0, 100.0, 1e6)
+    assert [t.exit_reason for t in engine.log.trades] == [ExitReason.KILL]
+
+    timed = opened(tmp_path, Scripted("trend", max_hold_bars=1))
+    decide(timed, T2, {BTC: 100.0})  # TIME exit queued first keeps its reason
+    timed.request_flatten(T2 + MINUTE)
+    assert timed.queued_exits == {BTC: ExitReason.TIME}

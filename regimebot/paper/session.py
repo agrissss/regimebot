@@ -4,18 +4,20 @@ Each poll (``run_once``) downloads every symbol's newly closed base bars and fun
 the database and replays them through the engine in time order (``on_minute``, ``on_funding``; a
 bar closing at t before funding stamped t), as the backtest replays an interval. When a decision
 bar has closed for every symbol, features are rebuilt from the stored trailing history (the
-backtest's resample and ``compute_features``), ``on_decision`` runs with live spreads, and queued
-orders fill at a live quote (``fill_queued``) instead of at the next bar's open. All new rows and
-the resumable state are flushed at the end of every poll in one transaction.
+backtest's resample and ``compute_features``) and ``on_decision`` runs with live spreads between
+the replayed events up to its close and those after it. Queued orders then fill at a live quote
+(``fill_queued``) instead of at the next bar's open. All new rows and the resumable state are
+flushed at the end of every poll in one transaction.
 
 There is no order path: the session only calls the ``Exchange`` protocol's market-data methods
 (``fetch_candles``, ``fetch_funding``, ``fetch_quote``); every fill is simulated.
 """
 
 import math
+import os
 import signal
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
@@ -44,6 +46,7 @@ log = structlog.get_logger(__name__)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _TICK = timedelta(microseconds=1)  # stored timestamps have microsecond resolution
 _BAR, _FUNDING = 0, 1  # event order at equal timestamps, as in the backtest
+Event = tuple[datetime, int, int, Bar | float]  # (ts, kind, symbol order, bar or funding rate)
 
 
 def _utc_now() -> datetime:
@@ -61,16 +64,20 @@ class PaperSession:
 
     Decisions: the decision bar closing at T is processed once, at the first poll where every
     symbol has its base bar T stored or is stale. A symbol is stale when its last candle download
-    failed or its newest bar is older than ``stale_after_seconds``; a symbol missing bar T is
-    therefore stale by T + ``stale_after_seconds`` at the latest, which bounds the wait. A stale
-    symbol gets no window (the engine records ``stale_data`` and does not trade it), and
+    failed, it has no bars, or its newest bar is older than ``stale_after_seconds``; a symbol
+    missing bar T therefore turns stale before T + ``stale_after_seconds``. A decision still
+    unprocessed at T + ``stale_after_seconds`` (by a fresh clock read) is missed: skipped for
+    good and alerted as ``decision_missed``, never processed late. Only symbols with bar T stored
+    get a window; the others are recorded as ``stale_data`` by the engine and not traded.
     ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends.
 
-    Fills: spreads come from quotes fetched just before ``on_decision``; right after it, each
-    symbol with a queued order fills at a fresh quote, stamped with the session clock, with the
-    last closed bar's volume for participation. A failed quote means no spread and no fill for
-    that symbol at this decision: a queued entry then expires at the next decision (the engine's
-    rule), a queued exit is retried on every poll until it fills.
+    Fills: spreads come from quotes fetched just before ``on_decision``; after it, each symbol
+    with a queued order fills at a fresh quote, stamped with the session clock, with the last
+    closed bar's volume for participation. A failed quote means no spread and no fill for that
+    symbol at this decision: a queued entry then expires at the next decision (the engine's
+    rule), a queued exit is retried on every poll until it fills. The kill file is checked on
+    every poll: it halts and flattens at once, not only at the next decision. Every halt is
+    alerted, and so is a halt that clears.
     """
 
     def __init__(
@@ -100,17 +107,21 @@ class PaperSession:
         strategies = build_strategies(cfg) if strategies is None else strategies
         self.engine = Engine(cfg, strategies, self.risk, self.portfolio, self.log)
         self.run_id: int | None = None
+        self._lock_fd: int | None = None
         self._marks = state.FlushMarks()
         self._newest: dict[str, Bar] = {}  # newest bar fed to the engine, per symbol
         self._last_funding: dict[str, datetime] = {}  # newest funding event fed, per symbol
         self._last_decision = _EPOCH
         self._incidents: set[str] = set()  # open alert incidents, "kind:subject"
-        self._stop_requested = False
+        self._halts: set[str] = set()  # active halts last seen (alerted on change)
+        self._events_alerted = 0  # risk events already scanned for halts
+        self._stop_signal: int | None = None
 
     # --- lifecycle ---------------------------------------------------------------------------
 
     def start(self, resume_run_id: int | None = None) -> int:
-        """Warm up, then create a paper run or resume ``resume_run_id``; returns the run id.
+        """Lock the run, warm up, then create a paper run or resume ``resume_run_id``; returns
+        the run id. Raises ValueError when the run cannot be resumed or is already running.
 
         Warm-up stores the last ``warmup_bars`` decision bars' worth of base candles (and the
         funding) per symbol with ``download_candles``; a symbol whose download fails stays stale
@@ -121,31 +132,32 @@ class PaperSession:
         are appended to the same run. Base bars that closed while the process was down are
         replayed in order through ``on_minute`` at the first poll, so a stop or target hit during
         the downtime is honoured at the bar where it happened. Decisions missed during the
-        downtime are NOT replayed: a decision bar whose wait (``stale_after_seconds``) ended
-        before the restart is skipped and the session resumes at the next live decision. An
-        entry still queued at shutdown is dropped (it could only have filled at its decision).
+        downtime are NOT replayed: the first poll skips (and alerts) a decision whose wait has
+        ended, and the session continues at the next live decision. Queued entries are not
+        saved: ``run_forever`` cancels them on a clean stop, while after a hard kill (SIGKILL)
+        an approved entry is left without a closing decision row.
         """
         now = self._clock()
         if resume_run_id is not None:
             with Session(self._db) as session:
                 state.check_resumable(session, resume_run_id, self.cfg)  # fail before warm-up
+            self._lock(resume_run_id)
         for symbol in self._symbols:
             self._download(symbol, now - self._history, now)
         with session_scope(self._db) as session:
             if resume_run_id is None:
                 self.run_id = repo.create_run(session, Mode.PAPER, self.cfg)
+                self._lock(self.run_id)
                 for symbol in self._symbols:
                     self._adopt(session, symbol, now)
-                last_decision = _EPOCH
             else:
                 self.run_id = resume_run_id
                 cursors = state.restore(session, resume_run_id, self.engine)
                 for symbol, ts in cursors.last_bar.items():
                     self._newest[symbol] = self._stored_bar(session, symbol, ts)
                 self._last_funding = dict(cursors.last_funding)
-                last_decision = cursors.last_decision
-            # a decision whose wait ended before now was missed: never process it late
-            self._last_decision = max(last_decision, _floor(now - self._stale_after, self._width))
+                self._last_decision = cursors.last_decision
+            self._halts = set(self.risk.to_state()["halts"])
             self._marks = self._save(session)
         log.info(
             "paper_started",
@@ -156,21 +168,31 @@ class PaperSession:
         )
         return self.run_id
 
+    def close(self) -> None:
+        """Release the run's lock (process exit does the same)."""
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def _lock(self, run_id: int) -> None:
+        self._lock_fd = state.lock_run(self.risk.kill_file.parent, run_id)
+
     def run_forever(self) -> None:
         """Poll every ``poll_seconds`` until SIGINT or SIGTERM (or a KeyboardInterrupt in sleep).
 
-        A signal only sets a flag, so the current poll always finishes and is flushed; the
-        session then exits without flattening and the run stays open for a resume. An exception
-        in a poll is logged and alerted once per incident, and the next poll runs as usual.
+        A signal only records itself, so the current poll always finishes and is flushed. The
+        session then cancels queued entries (each gets a closing decision), flushes and returns
+        without flattening; the run stays open for a resume. An exception in a poll is logged and
+        alerted once per incident, and the next poll runs as usual.
         """
-        self._stop_requested = False
+        self._stop_signal = None
         previous = {
             sig: signal.signal(sig, self._request_stop) for sig in (signal.SIGINT, signal.SIGTERM)
         }
         try:
-            while not self._stop_requested:
+            while self._stop_signal is None:
                 self._guarded_poll()
-                if self._stop_requested:
+                if self._stop_signal is not None:
                     break
                 try:
                     self._sleep(self.cfg.paper.poll_seconds)
@@ -179,15 +201,18 @@ class PaperSession:
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        if self._stop_signal is not None:
+            log.info("paper_stop_requested", signal=signal.Signals(self._stop_signal).name)
+        self.engine.cancel_queued_entries(self._clock())
         try:
-            self.flush()  # normally a no-op rewrite: each poll flushed already
+            self.flush()
         except Exception:
             log.exception("paper_flush_failed", run_id=self.run_id)
         log.info("paper_stopped", run_id=self.run_id, positions=sorted(self.portfolio.positions))
 
     def _request_stop(self, signum: int, frame: FrameType | None) -> None:
-        self._stop_requested = True
-        log.info("paper_stop_requested", signal=signal.Signals(signum).name)
+        # Only record it: logging here could deadlock on the stdout lock the poll may hold.
+        self._stop_signal = signum
 
     def _guarded_poll(self) -> None:
         try:
@@ -201,21 +226,31 @@ class PaperSession:
     # --- one poll ----------------------------------------------------------------------------
 
     def run_once(self) -> None:
-        """One poll: download, replay new bars and funding, retry queued exits, decide if a
-        decision bar is due, flush. Exchange errors are contained per symbol and call."""
+        """One poll: download; replay new bars and funding up to the open decision bar, decide
+        it once ready, then replay the rest; act on the kill file; fill queued orders; alert
+        halts; flush. While a decision waits for a late symbol, later events are held back so
+        that every bar after T is checked against the stops as the decision at T left them.
+        Exchange errors are contained per symbol and call."""
         now = self._clock()
         downloaded = {}
         for symbol in self._symbols:
             newest = self._newest.get(symbol)
             since = now - self._history if newest is None else newest.ts + self._base
             downloaded[symbol] = self._download(symbol, since, now)
-        self._replay(now)
-        stale = self._stale_symbols(now, downloaded)
-        for symbol in [s for s in state.queued_exits(self.engine) if s in self.portfolio.positions]:
-            if (quote := self._quote(symbol)) is not None:
-                self._fill(symbol, quote)
-        if (ts := self._due_decision(now, stale)) is not None:
-            self._decide(ts, stale)
+        events, latest = self._new_events(now)
+        stale = self._stale_symbols(now, downloaded, latest)
+        quotes: dict[str, Quote] | None = None  # pre-decision quotes, when deciding
+        ts, ready = self._open_decision(now, stale, latest)
+        if ts is None:
+            self._feed(events)
+        else:  # events after an open decision wait for it: they stay stored and come back
+            self._feed(e for e in events if e[0] <= ts)
+            if ready:
+                quotes = self._decide(ts, latest)
+                self._feed(e for e in events if e[0] > ts)
+        self._check_kill_file(now)
+        self._fill_queued(quotes)
+        self._alert_halts()
         self.flush()
 
     def flush(self) -> None:
@@ -253,31 +288,37 @@ class PaperSession:
             log.warning("paper_download_failed", symbol=symbol, data="funding", error=repr(exc))
         return ok
 
-    def _replay(self, now: datetime) -> None:
-        """Feed every stored bar and funding event newer than the engine has seen, all symbols
-        in time order. Funding waits until the symbol's bars reach its stamp; its mark is the
-        close of the last bar at or before it (a record arriving over a bar late gets a later
-        close)."""
-        events: list[tuple[datetime, int, int, Bar | float]] = []
+    def _new_events(self, now: datetime) -> tuple[list[Event], dict[str, datetime]]:
+        """Stored bars and funding events newer than the engine has seen, all symbols in time
+        order, and each symbol's newest stored bar ts. Funding waits until the symbol's bars reach
+        its stamp; its mark is the close of the last bar at or before it (a record arriving over
+        a bar late gets a later close)."""
+        events: list[Event] = []
+        latest: dict[str, datetime] = {}
         with Session(self._db) as session:
             for order, symbol in enumerate(self._symbols):
                 newest = self._newest.get(symbol)
                 if newest is None:  # first data for this symbol: no position can need it
                     self._adopt(session, symbol, now)
+                    if (adopted := self._newest.get(symbol)) is not None:
+                        latest[symbol] = adopted.ts
                     continue
                 bars = repo.load_candles(session, symbol, self._tf, newest.ts + self._base)
                 stamps = list(pd.DatetimeIndex(bars.index).to_pydatetime())
                 for ts, row in zip(stamps, bars.to_numpy(dtype=float).tolist(), strict=True):
                     events.append((ts, _BAR, order, Bar(symbol, ts, *row)))
+                latest[symbol] = stamps[-1] if stamps else newest.ts
                 since = self._last_funding.get(symbol)
-                upto = (stamps[-1] if stamps else newest.ts) + _TICK
                 after = None if since is None else since + _TICK
-                rates = repo.load_funding(session, symbol, after, upto)
+                rates = repo.load_funding(session, symbol, after, latest[symbol] + _TICK)
                 for ts, rate in zip(
                     pd.DatetimeIndex(rates.index).to_pydatetime(), rates.tolist(), strict=True
                 ):
                     events.append((ts, _FUNDING, order, rate))
         events.sort(key=lambda event: event[:3])
+        return events, latest
+
+    def _feed(self, events: Iterable[Event]) -> None:
         for ts, _, order, payload in events:
             symbol = self._symbols[order]
             if isinstance(payload, Bar):
@@ -309,18 +350,20 @@ class PaperSession:
         open_, high, low, close, volume = frame.to_numpy(dtype=float)[0].tolist()
         return Bar(symbol, ts, open_, high, low, close, volume)
 
-    def _stale_symbols(self, now: datetime, downloaded: dict[str, bool]) -> set[str]:
-        """Symbols whose candle download failed or whose newest bar is too old (alerted)."""
+    def _stale_symbols(
+        self, now: datetime, downloaded: dict[str, bool], latest: dict[str, datetime]
+    ) -> set[str]:
+        """Symbols whose candle download failed, with no bars, or whose newest bar is too old
+        (alerted once per incident)."""
         stale = set()
         for symbol in self._symbols:
-            newest = self._newest.get(symbol)
             problem = None
             if not downloaded[symbol]:
                 problem = "candle download failed"
-            elif newest is None:
+            elif symbol not in latest:
                 problem = "no bars stored"
-            elif now - newest.ts > self._stale_after:
-                problem = f"newest bar closed at {newest.ts.isoformat()}"
+            elif now - latest[symbol] > self._stale_after:
+                problem = f"newest bar closed at {latest[symbol].isoformat()}"
             if problem is not None:
                 stale.add(symbol)
             self._track("stale_data", symbol, problem)
@@ -339,26 +382,34 @@ class PaperSession:
 
     # --- decisions and fills -----------------------------------------------------------------
 
-    def _due_decision(self, now: datetime, stale: set[str]) -> datetime | None:
-        """The decision bar closing at or before ``now`` when it is unprocessed and every symbol
-        has its bar or is stale; None otherwise."""
+    def _open_decision(
+        self, now: datetime, stale: set[str], latest: dict[str, datetime]
+    ) -> tuple[datetime | None, bool]:
+        """The unprocessed decision bar closing at or before ``now`` (None when there is none)
+        and whether it is ready: every symbol has its bar or is stale. One whose wait has ended
+        is marked missed and alerted, so it is never processed late."""
         ts = _floor(now, self._width)
         if ts <= self._last_decision:
-            return None
-        waiting = [s for s in self._symbols if s not in stale and self._newest[s].ts < ts]
-        return None if waiting else ts
+            return None, False
+        late = self._clock() - ts  # fresh: downloads (or a warm-up) may have taken a while
+        if late >= self._stale_after:
+            self._last_decision = ts
+            detail = f"decision at {ts.isoformat()} reached {late.total_seconds():.0f}s late"
+            log.warning("decision_missed", ts=ts.isoformat(), late_s=late.total_seconds())
+            alert("decision_missed", f"{detail}: skipped")
+            return None, False
+        waiting = [s for s in self._symbols if s not in stale and latest[s] < ts]
+        return ts, not waiting
 
-    def _decide(self, ts: datetime, stale: set[str]) -> None:
-        windows = self._windows(ts, stale)
+    def _decide(self, ts: datetime, latest: dict[str, datetime]) -> dict[str, Quote]:
+        """Run the decision at ``ts`` with a window for every symbol whose bar ``ts`` is stored;
+        returns the pre-decision quotes (a symbol without one gets no fill this poll)."""
+        with_bar = [s for s in self._symbols if s in latest and latest[s] >= ts]
+        windows = self._windows(ts, with_bar)
         quotes = {s: q for s in self._symbols if (q := self._quote(s)) is not None}
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice
         self.engine.on_decision(ts, windows, spreads)
-        for symbol in self._symbols:
-            if not (symbol in quotes and self._has_queued_order(symbol)):
-                continue
-            if (quote := self._quote(symbol)) is not None:
-                self._fill(symbol, quote)
         log.info(
             "paper_decision",
             ts=ts.isoformat(),
@@ -366,18 +417,17 @@ class PaperSession:
             equity=self.portfolio.equity,
             positions=sorted(self.portfolio.positions),
         )
+        return quotes
 
-    def _windows(self, ts: datetime, stale: set[str]) -> dict[str, pd.DataFrame]:
-        """Trailing ``WINDOW_ROWS`` feature rows per fresh symbol from the stored history,
-        exactly as the backtest builds them; the engine checks that each ends at ``ts``."""
+    def _windows(self, ts: datetime, symbols: list[str]) -> dict[str, pd.DataFrame]:
+        """Trailing ``WINDOW_ROWS`` feature rows of ``symbols`` from the stored history, exactly
+        as the backtest builds them; the engine checks that each ends at ``ts``."""
         # ponytail: recomputes warmup_bars of features at every decision (about a second at
         # 3000 bars); keep the frame and append each new decision bar if that ever matters.
         windows = {}
         end = ts + self._base  # half-open: bars up to and including ts
         with Session(self._db) as session:
-            for symbol in self._symbols:
-                if symbol in stale:
-                    continue
+            for symbol in symbols:
                 start = ts - self._history + self._base  # whole decision bars only
                 candles = repo.load_candles(session, symbol, self._tf, start, end)
                 funding = repo.load_funding(session, symbol, None, end)
@@ -386,10 +436,41 @@ class PaperSession:
                     windows[symbol] = features.iloc[-WINDOW_ROWS:]
         return windows
 
-    def _has_queued_order(self, symbol: str) -> bool:
-        if symbol in state.queued_exits(self.engine):
-            return True
-        return self.engine.is_active(symbol) and symbol not in self.portfolio.positions
+    def _check_kill_file(self, now: datetime) -> None:
+        """With the kill file present and anything open, halt now (the risk manager records
+        ``manual_kill`` once) and queue KILL exits, which fill on this poll."""
+        active = any(self.engine.is_active(s) for s in self._symbols)
+        if not (active and self.risk.kill_file.exists()):
+            return
+        self.log.risk_events.extend(self.risk.check_limits(self.portfolio, now))
+        if self.risk.must_flatten:
+            self.engine.request_flatten(now)
+
+    def _fill_queued(self, quotes: dict[str, Quote] | None) -> None:
+        """Fill queued orders at fresh quotes: exits on every poll, entries only on the poll of
+        their decision (``quotes`` given). A symbol whose pre-decision quote failed is not filled
+        on that poll: its entry expires at the next decision, its exit waits for the next poll."""
+        exits = self.engine.queued_exits
+        for symbol in self._symbols:
+            if quotes is not None and symbol not in quotes:
+                continue
+            flat = symbol not in self.portfolio.positions
+            entry = quotes is not None and flat and self.engine.is_active(symbol)
+            if not (symbol in exits or entry):
+                continue
+            if (quote := self._quote(symbol)) is not None:
+                self._fill(symbol, quote)
+
+    def _alert_halts(self) -> None:
+        """Alert every new halt event once, and every halt that has cleared."""
+        for event in self.log.risk_events[self._events_alerted :]:
+            if event.action == "halt":
+                alert(event.kind, event.detail)
+        self._events_alerted = len(self.log.risk_events)
+        halts = set(self.risk.to_state()["halts"])
+        for kind in sorted(self._halts - halts):
+            alert(f"{kind}_recovered", f"{kind} halt cleared")
+        self._halts = halts
 
     def _quote(self, symbol: str) -> Quote | None:
         """A live quote, or None when the fetch fails or the quote is unusable."""
@@ -401,10 +482,13 @@ class PaperSession:
         bid, ask = quote.bid, quote.ask
         if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
             log.warning("paper_quote_invalid", symbol=symbol, bid=bid, ask=ask)
-            return None  # checked here: the engine pops a queued order before pricing it
+            return None
         return quote
 
     def _fill(self, symbol: str, quote: Quote) -> None:
         newest = self._newest.get(symbol)
-        volume = 0.0 if newest is None else newest.volume  # no bar: worst-case exit impact
+        volume = 0.0 if newest is None else newest.volume
+        if not (math.isfinite(volume) and volume >= 0):
+            log.warning("paper_bar_volume_invalid", symbol=symbol, volume=volume)
+            volume = 0.0  # no usable volume: worst-case exit impact, no entry fill
         self.engine.fill_queued(symbol, self._clock(), quote.bid, quote.ask, volume)
