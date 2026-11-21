@@ -1,22 +1,27 @@
 """Repository functions: plain functions over a SQLAlchemy ``Session``.
 
-Conventions: timestamps are UTC-aware (naive values raise ``ValueError``); every ``save_*``
-function takes ``run_id`` and bulk-inserts, and does not commit (``session_scope`` does).
+Conventions: timestamps are UTC-aware. Naive datetimes are rejected: ``ValueError`` from the
+``load_*`` bounds and the upsert indexes, ``sqlalchemy.exc.StatementError`` (wrapping the
+``ValueError``) from the ``save_*`` functions. Every ``save_*`` function takes ``run_id``,
+bulk-inserts, and does not commit (``session_scope`` does).
 """
 
+import dataclasses
 import json
-import math
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import delete, insert, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
-from regimebot.config import AppConfig, config_hash
+from regimebot.config import AppConfig, config_hash, config_json
 from regimebot.db.models import (
     Base,
     Candle,
@@ -51,9 +56,15 @@ CANDLE_COLUMNS = ["open", "high", "low", "close", "volume"]
 
 
 def _upsert(
-    session: Session, model: type[Base], rows: list[dict[str, Any]], key_columns: Sequence[str]
+    session: Session,
+    model: type[Base],
+    row_chunks: Iterable[list[dict[str, Any]]],
+    key_columns: Sequence[str],
 ) -> None:
-    """Bulk ``INSERT ... ON CONFLICT DO UPDATE`` in chunks (SQLite and Postgres only)."""
+    """Bulk ``INSERT ... ON CONFLICT DO UPDATE``, one statement per chunk of rows.
+
+    Takes an iterable of chunks so callers build each chunk lazily (SQLite and Postgres only).
+    """
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
         dialect_insert: Any = sqlite.insert
@@ -62,13 +73,13 @@ def _upsert(
     else:
         raise NotImplementedError(f"upsert is not supported for dialect {dialect!r}")
     value_columns = [c.name for c in model.__table__.columns if c.name not in key_columns]
-    for i in range(0, len(rows), CHUNK_ROWS):
+    for chunk in row_chunks:
         stmt = dialect_insert(model)
         stmt = stmt.on_conflict_do_update(
             index_elements=list(key_columns),
             set_={c: stmt.excluded[c] for c in value_columns},
         )
-        session.execute(stmt, rows[i : i + CHUNK_ROWS])
+        session.execute(stmt, chunk)
 
 
 def _insert_chunks(session: Session, model: type[Base], rows: list[dict[str, Any]]) -> None:
@@ -77,9 +88,14 @@ def _insert_chunks(session: Session, model: type[Base], rows: list[dict[str, Any
 
 
 def _py_timestamps(index: pd.Index) -> list[datetime]:
-    """Python UTC datetimes from a tz-aware ``DatetimeIndex``; raises if naive."""
+    """Python UTC datetimes from a tz-aware, duplicate-free ``DatetimeIndex``.
+
+    Duplicates are rejected because Postgres cannot upsert the same row twice in one statement.
+    """
     if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
         raise ValueError("index must be a timezone-aware DatetimeIndex")
+    if index.has_duplicates:
+        raise ValueError("index has duplicate timestamps")
     return list(index.tz_convert("UTC").to_pydatetime())
 
 
@@ -107,20 +123,23 @@ def _time_range(model: Any, start: datetime | None, end: datetime | None) -> lis
 def upsert_candles(session: Session, symbol: str, timeframe: str, df: pd.DataFrame) -> int:
     """Insert or update candles; idempotent. ``df`` has a UTC ``DatetimeIndex`` named ``ts``
     and columns open, high, low, close, volume. Returns the number of rows written."""
+    stamps = _py_timestamps(df.index)
     values = df[CANDLE_COLUMNS].to_numpy(dtype=float)
-    if not math.isfinite(values.sum()):
+    if not np.isfinite(values).all():
         raise ValueError("candles contain NaN or infinite values")
-    rows = [
-        {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "ts": ts,
-            **dict(zip(CANDLE_COLUMNS, v, strict=True)),
-        }
-        for ts, v in zip(_py_timestamps(df.index), values.tolist(), strict=True)
-    ]
-    _upsert(session, Candle, rows, ["symbol", "timeframe", "ts"])
-    return len(rows)
+
+    def chunks() -> Iterator[list[dict[str, Any]]]:
+        for i in range(0, len(stamps), CHUNK_ROWS):
+            yield [
+                {"symbol": symbol, "timeframe": timeframe, "ts": ts}
+                | dict(zip(CANDLE_COLUMNS, row, strict=True))
+                for ts, row in zip(
+                    stamps[i : i + CHUNK_ROWS], values[i : i + CHUNK_ROWS].tolist(), strict=True
+                )
+            ]
+
+    _upsert(session, Candle, chunks(), ["symbol", "timeframe", "ts"])
+    return len(stamps)
 
 
 def load_candles(
@@ -146,15 +165,22 @@ def load_candles(
 
 def upsert_funding(session: Session, symbol: str, series: pd.Series) -> int:
     """Insert or update funding rates; ``series`` is indexed by UTC ``ts``. Returns rows written."""
+    stamps = _py_timestamps(series.index)
     rates = series.to_numpy(dtype=float)
-    if not math.isfinite(rates.sum()):
+    if not np.isfinite(rates).all():
         raise ValueError("funding rates contain NaN or infinite values")
-    rows = [
-        {"symbol": symbol, "ts": ts, "rate": rate}
-        for ts, rate in zip(_py_timestamps(series.index), rates.tolist(), strict=True)
-    ]
-    _upsert(session, FundingRate, rows, ["symbol", "ts"])
-    return len(rows)
+
+    def chunks() -> Iterator[list[dict[str, Any]]]:
+        for i in range(0, len(stamps), CHUNK_ROWS):
+            yield [
+                {"symbol": symbol, "ts": ts, "rate": rate}
+                for ts, rate in zip(
+                    stamps[i : i + CHUNK_ROWS], rates[i : i + CHUNK_ROWS].tolist(), strict=True
+                )
+            ]
+
+    _upsert(session, FundingRate, chunks(), ["symbol", "ts"])
+    return len(stamps)
 
 
 def load_funding(
@@ -178,6 +204,9 @@ def load_funding(
 # --- runs --------------------------------------------------------------------------------
 
 
+_REPO_DIR = Path(__file__).resolve().parent  # inside the repo this package lives in
+
+
 def _git_sha() -> str:
     try:
         out = subprocess.run(
@@ -186,6 +215,7 @@ def _git_sha() -> str:
             text=True,
             check=True,
             timeout=5,
+            cwd=_REPO_DIR,
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
@@ -197,7 +227,7 @@ def create_run(session: Session, mode: Mode, cfg: AppConfig, note: str = "") -> 
     run = Run(
         mode=str(mode),
         config_hash=config_hash(cfg),
-        config_json=cfg.model_dump_json(),
+        config_json=config_json(cfg),
         git_sha=_git_sha(),
         started_at=datetime.now(UTC),
         note=note,
@@ -218,32 +248,21 @@ def end_run(session: Session, run_id: int) -> None:
 # --- trading records ---------------------------------------------------------------------
 
 
+_TRADE_FIELDS = [f.name for f in dataclasses.fields(Trade)]  # also the TradeRow column names
+_TRADE_ENUMS: dict[str, type[Enum]] = {"side": Side, "regime": Regime, "exit_reason": ExitReason}
+
+
 def save_trades(session: Session, run_id: int, trades: Sequence[Trade]) -> None:
-    """Insert closed trades."""
-    _insert_chunks(session, TradeRow, [{"run_id": run_id, **_trade_to_row(t)} for t in trades])
-
-
-def _trade_to_row(t: Trade) -> dict[str, Any]:
-    return {
-        "symbol": t.symbol,
-        "strategy": t.strategy,
-        "side": str(t.side),
-        "regime": str(t.regime),
-        "qty": t.qty,
-        "entry_ts": t.entry_ts,
-        "exit_ts": t.exit_ts,
-        "entry_price": t.entry_price,
-        "exit_price": t.exit_price,
-        "initial_stop": t.initial_stop,
-        "target": t.target,
-        "gross_pnl": t.gross_pnl,
-        "fees": t.fees,
-        "funding": t.funding,
-        "net_pnl": t.net_pnl,
-        "exit_reason": str(t.exit_reason),
-        "r_multiple": t.r_multiple,
-        "bars_held": t.bars_held,
-    }
+    """Insert closed trades (every ``Trade`` field is stored; enums as their string values)."""
+    rows = [
+        {"run_id": run_id}
+        | {
+            name: v.value if isinstance(v := getattr(t, name), Enum) else v
+            for name in _TRADE_FIELDS
+        }
+        for t in trades
+    ]
+    _insert_chunks(session, TradeRow, rows)
 
 
 def load_trades(session: Session, run_id: int) -> list[Trade]:
@@ -251,29 +270,13 @@ def load_trades(session: Session, run_id: int) -> list[Trade]:
     stmt = (
         select(TradeRow).where(TradeRow.run_id == run_id).order_by(TradeRow.entry_ts, TradeRow.id)
     )
-    return [
-        Trade(
-            symbol=r.symbol,
-            strategy=r.strategy,
-            side=Side(r.side),
-            regime=Regime(r.regime),
-            qty=r.qty,
-            entry_ts=r.entry_ts,
-            exit_ts=r.exit_ts,
-            entry_price=r.entry_price,
-            exit_price=r.exit_price,
-            initial_stop=r.initial_stop,
-            target=r.target,
-            gross_pnl=r.gross_pnl,
-            fees=r.fees,
-            funding=r.funding,
-            net_pnl=r.net_pnl,
-            exit_reason=ExitReason(r.exit_reason),
-            r_multiple=r.r_multiple,
-            bars_held=r.bars_held,
-        )
-        for r in session.scalars(stmt)
-    ]
+    trades = []
+    for r in session.scalars(stmt):
+        kwargs: dict[str, Any] = {name: getattr(r, name) for name in _TRADE_FIELDS}
+        for name, enum_type in _TRADE_ENUMS.items():
+            kwargs[name] = enum_type(kwargs[name])
+        trades.append(Trade(**kwargs))
+    return trades
 
 
 def save_fills(session: Session, run_id: int, fills: Sequence[Fill]) -> None:
@@ -318,7 +321,7 @@ def save_signals(session: Session, run_id: int, signals: Sequence[Signal]) -> li
     ]
     ids: list[int] = []
     for i in range(0, len(rows), CHUNK_ROWS):
-        stmt = insert(SignalRow).returning(SignalRow.id)
+        stmt = insert(SignalRow).returning(SignalRow.id, sort_by_parameter_order=True)
         ids.extend(session.scalars(stmt, rows[i : i + CHUNK_ROWS]))
     return ids
 
@@ -415,7 +418,7 @@ def save_open_position(
         "state_json": json.dumps(state, sort_keys=True),
         "updated_at": datetime.now(UTC),
     }
-    _upsert(session, OpenPosition, [row], ["run_id", "symbol"])
+    _upsert(session, OpenPosition, [[row]], ["run_id", "symbol"])
 
 
 def load_open_positions(session: Session, run_id: int) -> dict[str, dict[str, Any]]:

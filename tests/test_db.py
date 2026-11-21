@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from regimebot.cli import app
-from regimebot.config import AppConfig, load_config
+from regimebot.config import AppConfig, config_json, load_config
 from regimebot.db import repo
-from regimebot.db.models import Base, Run
+from regimebot.db.models import Base, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.types import (
     ExitReason,
@@ -112,6 +112,15 @@ def test_load_candles_range_is_half_open(session: Session) -> None:
     assert len(repo.load_candles(session, "BTC", "1m", start=end)) == 5
 
 
+def test_upserts_reject_duplicate_timestamps(session: Session) -> None:
+    df = make_candles()
+    with pytest.raises(ValueError, match="duplicate"):
+        repo.upsert_candles(session, "BTC", "1m", pd.concat([df, df.iloc[:1]]))
+    s = pd.Series([0.1, 0.2], index=[df.index[0], df.index[0]], name="rate")
+    with pytest.raises(ValueError, match="duplicate"):
+        repo.upsert_funding(session, "BTC", s)
+
+
 def test_candles_reject_naive_index_and_nan(session: Session) -> None:
     df = make_candles()
     with pytest.raises(ValueError, match="timezone-aware"):
@@ -160,7 +169,8 @@ def test_create_and_end_run(session: Session, cfg: AppConfig) -> None:
     assert run is not None
     assert run.mode == "paper" and run.note == "hello" and run.ended_at is None
     assert run.started_at.tzinfo is not None
-    assert AppConfig.model_validate_json(run.config_json) == cfg
+    assert run.config_json == config_json(cfg)
+    assert "database_url" not in run.config_json
     assert run.git_sha != ""
     repo.end_run(session, run_id)
     assert run.ended_at is not None and run.ended_at >= run.started_at
@@ -210,9 +220,16 @@ def test_signals_return_ids_and_decisions_link_to_them(
     session: Session, cfg: AppConfig, engine: Engine
 ) -> None:
     run_id = repo.create_run(session, Mode.BACKTEST, cfg)
-    sig = Signal("breakout", "BTC", T0, Side.LONG, 100.0, 98.0, 104.0, 1.5, Regime.RANGE, 10, None)
-    ids = repo.save_signals(session, run_id, [sig, sig, sig])
-    assert len(ids) == 3 and len(set(ids)) == 3
+    signals = [
+        Signal(
+            "breakout", "BTC", T0, Side.LONG, 100.0 + k, 98.0, 104.0, 1.5, Regime.RANGE, 10, None
+        )
+        for k in range(25)
+    ]
+    ids = repo.save_signals(session, run_id, signals)
+    assert len(set(ids)) == 25
+    stored = dict(session.execute(select(SignalRow.id, SignalRow.entry)).all())
+    assert [stored[i] for i in ids] == [s.entry for s in signals]
     repo.save_risk_decisions(
         session,
         run_id,
