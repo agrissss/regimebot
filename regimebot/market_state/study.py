@@ -37,18 +37,18 @@ def regime_study(
     5th and 95th percentile of the forward log return, the share of bars followed by an absolute
     close-to-close move of 5% or more within ``h`` bars, and the bar count used (``n_h``)."""
     regimes = regimes.reindex(features.index)
-    rows: dict[str, dict[str, float]] = {}
+    rows: dict[str, dict[str, float | int]] = {}
     episodes = _episodes(regimes)
     fwd = {h: _forward(features["close"], h) for h in horizons}
     for regime in Regime:
         mask = regimes == regime.value
-        row: dict[str, float] = {
+        row: dict[str, float | int] = {
             "share": float(mask.mean()) if len(mask) else float("nan"),
-            "episodes": float(episodes.get(regime.value, 0)),
+            "episodes": int(episodes.get(regime.value, 0)),
         }
         for h, (ret, excursion) in fwd.items():
             r = ret[mask].dropna()
-            row[f"n_{h}"] = float(len(r))
+            row[f"n_{h}"] = len(r)
             row[f"mean_{h}"] = float(r.mean()) if len(r) else float("nan")
             row[f"std_{h}"] = float(r.std()) if len(r) > 1 else float("nan")
             row[f"p05_{h}"] = float(r.quantile(0.05)) if len(r) else float("nan")

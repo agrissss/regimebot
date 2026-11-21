@@ -114,9 +114,11 @@ def regimes_study() -> None:
             candles = resample(candles, base, decision)
             funding = load_funding(session, symbol, cfg.backtest.start, cfg.backtest.end)
             features = compute_features(
-                candles, cfg.features, cfg.regime.compression_pctile, funding
+                candles, cfg.features, cfg.regime.compression_pctile, funding_arg
             )
             table = regime_study(features, classify_frame(features, cfg.regime))
             typer.echo(f"{symbol}\n{table.to_string(float_format=lambda x: f'{x:.4f}')}")
             safe = symbol.replace("/", "_").replace(":", "_")
             table.to_csv(out_dir / f"regime_study_{safe}.csv")
+            # compute_features fails on an empty funding series (features.py); None means no funding
+            funding_arg = funding if len(funding) else None

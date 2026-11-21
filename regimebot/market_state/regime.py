@@ -33,7 +33,9 @@ def classify(
     spread_bps: float | None = None,
 ) -> Regime:
     """Label one bar. Priority: NaN features, event risk, liquidity stress, expansion,
-    trend, compression, range, else no-trade. Thresholds are inclusive as documented."""
+    trend, compression, range, else no-trade. Inclusive (>=, <=): shock, illiquidity, expansion,
+    ADX trend/range, compression, event window start. Strict: spread vs max, EMA order, close vs
+    ema_fast, event window end."""
     if any(math.isnan(row[k]) for k in REQUIRED_FEATURES):
         return Regime.NO_TRADE
     if any(w.start <= ts < w.end for w in cfg.event_windows) or abs(row["ret_z"]) >= cfg.shock_z:
@@ -93,4 +95,4 @@ def classify_frame(features: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
 
 def playbook_for(regime: Regime, cfg: AppConfig) -> PlaybookEntry:
     """What the config allows in ``regime``."""
-    return cfg.playbook[Regime(regime)]
+    return cfg.playbook[regime]
