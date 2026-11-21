@@ -227,6 +227,17 @@ class AppConfig(_Model):
             raise ValueError(f"playbook missing regimes: {sorted(r.value for r in missing)}")
         return self
 
+    @model_validator(mode="after")
+    def _paper_warmup_covers_features(self) -> "AppConfig":
+        from regimebot.market_state.features import warmup_bars  # it imports this module
+
+        if self.paper.warmup_bars < (need := warmup_bars(self.features)):
+            raise ValueError(
+                f"paper.warmup_bars {self.paper.warmup_bars} is below the {need} decision bars "
+                "the feature windows need before every feature is valid"
+            )
+        return self
+
 
 def _apply_override(raw: dict[str, Any], dotted: str, value: object) -> None:
     """Set ``raw[a][b][c] = value`` for ``dotted == "a.b.c"``; the path must already exist."""

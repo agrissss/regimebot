@@ -145,10 +145,12 @@ def test_events_always_list_halts_summarise_counts_and_cap_the_rest(
     assert halt is not None
     assert f"<td>{halt.ts.isoformat()}</td><td>max_drawdown</td><td>halt</td>" in text
     assert "<td>stale_data</td><td>skip_symbol</td><td>60</td>" in text  # count summary
-    assert "plus the first 50 of 61 other events" in text
+    # three days of history cannot warm the default windows: one warmup_incomplete event first
+    assert "<td>warmup_incomplete</td><td>no_trade_until_warm</td><td>1</td>" in text
+    assert "plus the first 50 of 62 other events" in text
     assert (
-        text.count("<td>stale_data</td><td>skip_symbol</td><td>d</td>") == 49
-    )  # 50 others, one is the escaped event
+        text.count("<td>stale_data</td><td>skip_symbol</td><td>d</td>") == 48
+    )  # 50 others: the warm-up event, the escaped event and 48 of these
 
 
 def test_slippage_table_shows_floor_and_realised_values(
@@ -182,8 +184,14 @@ def test_untrusted_text_is_escaped(run: tuple[BacktestResult, Baselines], tmp_pa
 
 def test_report_with_no_trades_still_renders(tmp_path: Path) -> None:
     candles = {BTC: regime_walk(1440, seed=3)}
-    result = random_entry(open_cfg(), candles, {}, T0, T0 + timedelta(days=1), 1, p=0.0)
-    assert not result.trades
+    # windows short enough (48 bars) for the 12 h before start to warm them: no risk event
+    short = {"features.pctile_window": 24, "features.rv_window": 24, "features.ema_slow": 48}
+    short |= {f"features.{w}_window": 24 for w in ("volume", "donchian", "zscore")}
+    cfg = open_cfg(**short, **{"features.ema_fast": 12})
+    result = random_entry(
+        cfg, candles, {}, T0 + timedelta(hours=12), T0 + timedelta(days=1), 1, p=0.0
+    )
+    assert not result.trades and not result.log.risk_events
     text = write_report(result, Baselines(), tmp_path).read_text("utf-8")
     assert "No risk-limit events" in text and "n/a" in text
     header = (tmp_path / "trades.csv").read_text().strip()

@@ -26,7 +26,7 @@ from fakes import Clock, ReplayExchange
 from sqlalchemy import Engine as Database
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
-from synth import BTC, ETH, MINUTE, T0, Scripted, candles_from_closes
+from synth import BTC, ETH, MINUTE, T0, Scripted, candles_from_closes, regime_walk
 from typer.testing import CliRunner
 
 from regimebot.backtest.runner import run_backtest
@@ -36,6 +36,7 @@ from regimebot.db import repo
 from regimebot.db.models import Base, OpenPosition, RegimeRow, RiskDecisionRow, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope
 from regimebot.engine.loop import Engine
+from regimebot.market_state.features import warm_rows
 from regimebot.paper import session as paper_session
 from regimebot.paper import state
 from regimebot.paper.session import PaperSession
@@ -53,6 +54,8 @@ EVERY_5M = 5 * MINUTE
 
 
 def open_cfg(**overrides: object) -> AppConfig:
+    """Default windows and ``paper.warmup_bars`` (3000 bars, all of the market's history: paper
+    features equal the backtest's exactly); every regime's playbook allows the stub."""
     entry = {
         "strategies": ["breakout"],
         "size_mult": 1.0,
@@ -62,7 +65,6 @@ def open_cfg(**overrides: object) -> AppConfig:
     return load_config(
         overrides={
             "exchange.symbols": [BTC, ETH],
-            "paper.warmup_bars": 100,  # all the history: features equal the backtest's exactly
             **{f"playbook.{r.value}": entry for r in Regime},
             **overrides,
         }
@@ -249,7 +251,9 @@ def test_a_scripted_market_trades_exactly_like_the_backtest(tmp_path: Path) -> N
     assert paper.signals == ref.signals
     assert paper.decisions == ref.decisions
     assert paper.regimes == ref.regimes
-    assert paper.risk_events == ref.risk_events == []
+    # the backtest flags its under-warmed start (6 h of history, 31-day windows); paper does not
+    assert {(e.ts, e.kind) for e in ref.risk_events} == {(START, "warmup_incomplete")}
+    assert len(ref.risk_events) == 2 and paper.risk_events == []
     assert paper.equity == ref.equity
     # one decision per decision bar, though three polls fall inside each
     assert [e[0] for e in paper.equity] == [START + k * D for k in range(10)]
@@ -260,6 +264,22 @@ def test_a_scripted_market_trades_exactly_like_the_backtest(tmp_path: Path) -> N
     assert rows["equity"] == [(pd.Timestamp(ts), eq) for ts, eq, _, _ in paper.equity]
     assert rows["open_positions"] == [state.PORTFOLIO_KEY, state.RISK_KEY]
     assert spy.names == {"fetch_candles", "fetch_funding", "fetch_quote"}
+
+
+def test_the_default_warm_up_gives_the_decision_a_fully_valid_feature_row(tmp_path: Path) -> None:
+    """``warmup_bars`` = 3000 decision bars of history (24 more than the 2976 the default
+    windows need) make the window's last row fully valid at a live decision."""
+    cfg = load_config(overrides={"exchange.symbols": [BTC]})
+    db = make_engine(f"sqlite:///{tmp_path / 'warm.db'}")
+    Base.metadata.create_all(db)
+    candles = regime_walk(cfg.paper.warmup_bars * 15, seed=8)
+    with session_scope(db) as s:
+        repo.upsert_candles(s, BTC, "1m", candles)
+    ts = candles.index[-1].to_pydatetime()  # a decision bar boundary: 3000 x 15 minutes in
+    session = PaperSession(cfg, ReplayExchange({}, {}, cfg.costs, Clock(ts)), db, tmp_path / "K")
+    window = session._windows(ts, [BTC])[BTC]
+    assert window.index[-1] == ts and bool(warm_rows(window).iloc[-1])
+    db.dispose()
 
 
 def test_a_decision_fires_once_per_decision_bar_at_any_poll_rate_and_after_a_restart(

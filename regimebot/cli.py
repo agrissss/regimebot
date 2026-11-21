@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Annotated
@@ -28,7 +28,7 @@ from regimebot.db.repo import load_candles, load_funding
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.engine.loop import RunLog
 from regimebot.logging import configure_logging
-from regimebot.market_state.features import compute_features
+from regimebot.market_state.features import compute_features, warmup_bars
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
 from regimebot.paper.session import PaperSession
@@ -88,6 +88,14 @@ app.add_typer(data_app, name="data")
 MAX_GAPS_SHOWN = 10
 
 
+def history_start(cfg: AppConfig) -> datetime:
+    """Where stored history must begin so that decisions from ``backtest.start`` see warm
+    features: ``warmup_bars`` decision bars earlier, rounded up to whole days, plus one day."""
+    width = timedelta(minutes=timeframe_minutes(cfg.exchange.decision_timeframe))
+    days = -(-warmup_bars(cfg.features) * width // timedelta(days=1)) + 1  # ceil, + 1
+    return cfg.backtest.start - timedelta(days=days)
+
+
 def _parse_utc(value: str) -> datetime:
     """ISO date/datetime; a value without a zone is taken as UTC (CLI input boundary)."""
     try:
@@ -99,12 +107,16 @@ def _parse_utc(value: str) -> datetime:
 
 @data_app.command("download")
 def data_download(
-    start: Annotated[str | None, typer.Option(help="ISO start (default: backtest start).")] = None,
+    start: Annotated[
+        str | None,
+        typer.Option(help="ISO start (default: backtest start minus the feature warm-up)."),
+    ] = None,
     end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
 ) -> None:
-    """Download base-timeframe candles and funding for all configured symbols."""
+    """Download base-timeframe candles and funding for all configured symbols, by default from
+    the feature warm-up before the backtest start (``history_start``) to the backtest end."""
     cfg = load_config()
-    start_ts = _parse_utc(start) if start else cfg.backtest.start
+    start_ts = _parse_utc(start) if start else history_start(cfg)
     end_ts = _parse_utc(end) if end else cfg.backtest.end
     exchange = CcxtExchange(cfg.exchange.id)
     engine = make_engine(cfg.database_url)
@@ -136,19 +148,21 @@ def _report_lines(report: ValidationReport, df: pd.DataFrame, short: bool) -> li
 
 @data_app.command("check")
 def data_check() -> None:
-    """Validate stored candles per symbol; exit 1 if any symbol is not ok."""
+    """Validate stored candles per symbol over the backtest range and the feature warm-up before
+    it (``history_start`` to the backtest end); exit 1 if any symbol is not ok."""
     cfg = load_config()
     tf = cfg.exchange.base_timeframe
     width = pd.Timedelta(minutes=timeframe_minutes(tf))
+    start = history_start(cfg)
     engine = make_engine(cfg.database_url)
     all_ok = True
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            df = load_candles(session, symbol, tf, cfg.backtest.start, cfg.backtest.end)
+            df = load_candles(session, symbol, tf, start, cfg.backtest.end)
             report = validate_candles(df, tf)
             # exact: first bar closes at the first grid point >= start, last at the one before end
             short = report.bars == 0 or (
-                df.index[0] > pd.Timestamp(cfg.backtest.start).ceil(width)
+                df.index[0] > pd.Timestamp(start).ceil(width)
                 or df.index[-1] < pd.Timestamp(cfg.backtest.end).ceil(width) - width
             )
             all_ok &= report.ok and not short
@@ -156,6 +170,10 @@ def data_check() -> None:
             for line in _report_lines(report, df, short):
                 typer.echo(f"  {line}")
     if not all_ok:
+        typer.echo(
+            f"the backtest needs {tf} history from {start.isoformat()} (feature warm-up) to "
+            f"{cfg.backtest.end.isoformat()}: run `regimebot data download` to fetch it"
+        )
         raise typer.Exit(1)
 
 
@@ -165,23 +183,26 @@ app.add_typer(regimes_app, name="regimes")
 
 @regimes_app.command("study")
 def regimes_study() -> None:
-    """Print and save the regime study (regimes vs forward returns) per symbol."""
+    """Print and save the regime study (regimes vs forward returns) per symbol, over the
+    backtest range (history before it only warms the features up)."""
     cfg = load_config()
     base, decision = cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe
+    first, end = history_start(cfg), cfg.backtest.end
     out_dir = Path("reports")
     out_dir.mkdir(exist_ok=True)
     engine = make_engine(cfg.database_url)
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            candles = load_candles(session, symbol, base, cfg.backtest.start, cfg.backtest.end)
+            candles = load_candles(session, symbol, base, first, end)
             if candles.empty:
                 typer.echo(f"{symbol}: no candles in the database, run `data download` first")
                 continue
             candles = resample(candles, base, decision)
-            funding = load_funding(session, symbol, cfg.backtest.start, cfg.backtest.end)
+            funding = load_funding(session, symbol, first, end)
             features = compute_features(
                 candles, cfg.features, cfg.regime.compression_pctile, funding
             )
+            features = features[features.index >= cfg.backtest.start]
             table = regime_study(features, classify_frame(features, cfg.regime))
             typer.echo(f"{symbol}\n{table.to_string(float_format=lambda x: f'{x:.4f}')}")
             safe = symbol.replace("/", "_").replace(":", "_")
@@ -208,8 +229,8 @@ _SetOption = Annotated[
 def _research_inputs(
     start: str | None, end: str | None, set_: list[str] | None
 ) -> tuple[AppConfig, dict[str, pd.DataFrame], dict[str, pd.Series]]:
-    """Config (with --set overrides, start/end applied to ``backtest``) and the stored history up
-    to its end; history before start is feature warm-up."""
+    """Config (with --set overrides, start/end applied to ``backtest``) and the stored history
+    from ``history_start`` to its end; history before start is feature warm-up."""
     overrides: dict[str, object] = {}
     for item in set_ or []:
         key, sep, value = item.partition("=")
@@ -225,9 +246,10 @@ def _research_inputs(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     symbols, base = cfg.exchange.symbols, cfg.exchange.base_timeframe
+    first, last = history_start(cfg), cfg.backtest.end
     with session_scope(make_engine(cfg.database_url)) as session:
-        candles = {s: load_candles(session, s, base, None, cfg.backtest.end) for s in symbols}
-        funding = {s: load_funding(session, s, None, cfg.backtest.end) for s in symbols}
+        candles = {s: load_candles(session, s, base, first, last) for s in symbols}
+        funding = {s: load_funding(session, s, first, last) for s in symbols}
     if missing := [s for s, df in candles.items() if df.empty]:
         typer.echo(f"no candles for {', '.join(missing)}: run `data download` first")
         raise typer.Exit(1)
@@ -267,6 +289,11 @@ def backtest_run(
     if halt := next((e for e in events if e.action == "halt" and e.kind in sticky), None):
         typer.echo(
             f"halted at {halt.ts.isoformat()}: {halt.kind} ({halt.detail}), no entries after"
+        )
+    if cold := [e.detail for e in events if e.kind == "warmup_incomplete"]:
+        typer.echo(
+            f"warning: under-warmed start, no trades until warm ({'; '.join(cold)}): "
+            "run `regimebot data download` for the warm-up history"
         )
     typer.echo(f"run {run_id}")
 
@@ -383,8 +410,9 @@ def report(
             log, trades, repo.load_equity(session, run_id), cfg, bt.start, bt.end
         )
         n_signals = repo.count_signals(session, run_id)
-        candles = {s: load_candles(session, s, base, None, bt.end) for s in cfg.exchange.symbols}
-        funding = {s: load_funding(session, s, None, bt.end) for s in cfg.exchange.symbols}
+        first = history_start(cfg)
+        candles = {s: load_candles(session, s, base, first, bt.end) for s in cfg.exchange.symbols}
+        funding = {s: load_funding(session, s, first, bt.end) for s in cfg.exchange.symbols}
     typer.echo("recomputing baselines (buy and hold, random entry) ...")
     baselines = compute_baselines(
         result, candles, funding, n_signals, seeds=tuple(range(random_seeds))

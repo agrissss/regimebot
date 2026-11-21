@@ -11,7 +11,7 @@ from sqlalchemy import Engine, delete
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
-from regimebot.cli import app
+from regimebot.cli import app, history_start
 from regimebot.config import AppConfig, load_config
 from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
 from regimebot.data.history import download_candles, download_funding
@@ -419,18 +419,36 @@ def test_resample_rejects_non_multiple() -> None:
 # --- CLI ------------------------------------------------------------------------------------
 
 
+# Feature windows short enough that the warm-up span (48 decision bars, 12 h) rounds up to one
+# day: history must start two days before the backtest.
+SHORT_WINDOWS = {"features.pctile_window": 24, "features.rv_window": 24, "features.ema_slow": 48}
+SHORT_WINDOWS |= {f"features.{w}_window": 24 for w in ("volume", "donchian", "zscore")}
+SHORT_WINDOWS["features.ema_fast"] = 12
+
+
 def _narrow_cfg(monkeypatch: pytest.MonkeyPatch, start: str, end: str) -> AppConfig:
-    """Config whose backtest range is tiny, patched into the CLI."""
-    base = load_config()
-    cfg = base.model_copy(
-        update={
-            "backtest": base.backtest.model_copy(
-                update={"start": datetime.fromisoformat(start), "end": datetime.fromisoformat(end)}
-            )
-        }
-    )
+    """Config whose backtest range is tiny, with short feature windows, patched into the CLI."""
+    cfg = load_config(overrides={"backtest.start": start, "backtest.end": end, **SHORT_WINDOWS})
     monkeypatch.setattr("regimebot.cli.load_config", lambda: cfg)
     return cfg
+
+
+def test_history_starts_the_feature_warm_up_before_the_backtest_rounded_to_days() -> None:
+    # default: 2976 decision bars of 15m are exactly 31 days, plus one day of margin
+    assert history_start(load_config()) == datetime(2023, 11, 30, tzinfo=UTC)
+    # 48 bars = 12 h, rounded up to one day, plus one
+    cfg = load_config(overrides={"backtest.start": "2024-03-10T06:00:00Z", **SHORT_WINDOWS})
+    assert history_start(cfg) == datetime(2024, 3, 8, 6, tzinfo=UTC)
+
+
+def _store_flat(eng: Engine, cfg: AppConfig, start: datetime, n: int) -> None:
+    idx = pd.date_range(start, periods=n, freq="1min", name="ts")
+    df = pd.DataFrame(
+        {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.0, "volume": 1.0}, index=idx
+    )
+    with session_scope(eng) as s:
+        for sym in cfg.exchange.symbols:
+            upsert_candles(s, sym, "1m", df)
 
 
 def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -438,20 +456,33 @@ def test_data_check_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("DATABASE_URL", url)
     eng = make_engine(url)
     Base.metadata.create_all(eng)
-    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T01:40:00Z")
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T01:40:00Z")
     runner = CliRunner()
     assert runner.invoke(app, ["data", "check"]).exit_code == 1  # no data: not ok
-    n = 100
-    idx = pd.date_range(cfg.backtest.start, periods=n, freq="1min", name="ts")
-    df = pd.DataFrame(
-        {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.0, "volume": 1.0}, index=idx
-    )
-    with session_scope(eng) as s:
-        for sym in cfg.exchange.symbols:
-            upsert_candles(s, sym, "1m", df)
+    start = history_start(cfg)  # 2024-01-01
+    _store_flat(eng, cfg, start, (cfg.backtest.end - start) // MIN)
     res = runner.invoke(app, ["data", "check"])
     assert res.exit_code == 0, res.output
-    assert "OK" in res.output
+    assert "OK" in res.output and f"first={start.isoformat()}" in res.output
+    eng.dispose()
+
+
+def test_data_check_fails_without_warm_up_history_and_says_what_to_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = f"sqlite:///{tmp_path / 'warm.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T01:40:00Z")
+    _store_flat(eng, cfg, cfg.backtest.start, 100)  # the backtest range only
+    res = CliRunner().invoke(app, ["data", "check"])
+    assert res.exit_code == 1
+    assert "shorter than the configured range" in res.output
+    assert (
+        "the backtest needs 1m history from 2024-01-01T00:00:00+00:00 (feature warm-up) to "
+        "2024-01-03T01:40:00+00:00: run `regimebot data download` to fetch it"
+    ) in res.output
     eng.dispose()
 
 
@@ -474,6 +505,27 @@ def test_data_download_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     eng.dispose()
 
 
+def test_data_download_defaults_to_the_warm_up_before_the_backtest_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = f"sqlite:///{tmp_path / 'dlw.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T00:10:00Z")
+    assert history_start(cfg) == T0  # two days before the backtest start
+    fake = FakeExchange(n_bars=2 * 1440 + 10, page_size=1000, n_funding=7)
+    monkeypatch.setattr("regimebot.cli.CcxtExchange", lambda exchange_id: fake)
+    res = CliRunner().invoke(app, ["data", "download"])
+    assert res.exit_code == 0, res.output
+    assert fake.candle_calls[0] == fake.funding_calls[0] == T0
+    with session_scope(eng) as s:
+        candles = load_candles(s, SYM, "1m")
+        assert (candles.index[0], len(candles)) == (T0 + MIN, 2 * 1440 + 10)
+        assert len(load_funding(s, SYM)) == 7  # 00:00 every 8 h from T0 to the start
+    eng.dispose()
+
+
 def test_data_check_fails_on_short_history_and_prints_details(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -481,8 +533,8 @@ def test_data_check_fails_on_short_history_and_prints_details(
     monkeypatch.setenv("DATABASE_URL", url)
     eng = make_engine(url)
     Base.metadata.create_all(eng)
-    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T03:00:00Z")
-    df = _frame(100, start=cfg.backtest.start + timedelta(hours=1))  # starts an hour late
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T03:00:00Z")
+    df = _frame(100, start=history_start(cfg) + timedelta(hours=1))  # starts an hour late
     with session_scope(eng) as s:
         for sym in cfg.exchange.symbols:
             upsert_candles(s, sym, "1m", df)
@@ -493,24 +545,23 @@ def test_data_check_fails_on_short_history_and_prints_details(
 
 
 @pytest.mark.parametrize(
-    ("first_min", "n", "expected_exit"),
-    [(0, 100, 0), (1, 99, 1), (0, 99, 1)],  # complete, first bar missing, last bar missing
+    ("first_missing", "last_missing", "expected_exit"),
+    [(0, 0, 0), (1, 0, 1), (0, 1, 1)],  # complete, first bar missing, last bar missing
 )
 def test_data_check_edge_bars_are_exact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    first_min: int,
-    n: int,
+    first_missing: int,
+    last_missing: int,
     expected_exit: int,
 ) -> None:
     url = f"sqlite:///{tmp_path / 'edge.db'}"
     monkeypatch.setenv("DATABASE_URL", url)
     eng = make_engine(url)
     Base.metadata.create_all(eng)
-    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T01:40:00Z")
-    df = _frame(n, start=cfg.backtest.start + first_min * MIN)
-    with session_scope(eng) as s:
-        for sym in cfg.exchange.symbols:
-            upsert_candles(s, sym, "1m", df)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-03T00:00:00Z", "2024-01-03T01:40:00Z")
+    start = history_start(cfg)  # the first bar closes here, the last one a minute before end
+    total = (cfg.backtest.end - start) // MIN
+    _store_flat(eng, cfg, start + first_missing * MIN, total - first_missing - last_missing)
     assert CliRunner().invoke(app, ["data", "check"]).exit_code == expected_exit
     eng.dispose()

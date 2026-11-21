@@ -65,6 +65,15 @@ def test_pctile_window_must_cover_rv_window() -> None:
         load_config(overrides={"features.pctile_window": 10})
 
 
+def test_paper_warmup_must_cover_the_feature_warm_up() -> None:
+    assert load_config().paper.warmup_bars == 3000  # the default passes (it needs 2976)
+    load_config(overrides={"paper.warmup_bars": 2976})
+    with pytest.raises(ValidationError, match="paper.warmup_bars 2975 is below the 2976"):
+        load_config(overrides={"paper.warmup_bars": 2975})
+    with pytest.raises(ValidationError, match="below the 3096"):  # 96 + 3000
+        load_config(overrides={"features.pctile_window": 3000})
+
+
 def test_fraction_and_timeframe_rejected() -> None:
     with pytest.raises(ValidationError):
         load_config(overrides={"risk.daily_loss": 0.0})

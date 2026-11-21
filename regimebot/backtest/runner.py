@@ -24,10 +24,10 @@ from regimebot.db import repo
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
 from regimebot.execution.fill_model import quote_from_bar_open
-from regimebot.market_state.features import compute_features
+from regimebot.market_state.features import compute_features, warm_rows
 from regimebot.risk.manager import RiskManager
 from regimebot.strategy import Strategy, build_strategies
-from regimebot.types import Bar, ExitReason, Mode, Trade
+from regimebot.types import Bar, ExitReason, Mode, RiskEvent, Trade
 
 WINDOW_ROWS = 400  # trailing feature rows handed to strategies at each decision
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -105,6 +105,24 @@ def _timeline(indexes: Sequence[pd.Index], start: datetime, end: datetime) -> np
     return np.asarray(union[(union >= lo) & (union < hi)])
 
 
+def _warmup_events(
+    features: Mapping[str, pd.DataFrame], start: datetime, end: datetime
+) -> list[RiskEvent]:
+    """One ``warmup_incomplete`` event at ``start`` per symbol whose first decision row in
+    ``[start, end)`` is not fully valid (history before ``start`` too short to warm up): its
+    NaN features mean NO_TRADE until the first warm row, which the detail names."""
+    events = []
+    for symbol, frame in features.items():
+        warm = warm_rows(frame[(frame.index >= start) & (frame.index < end)])
+        if len(warm) and warm.iloc[0]:
+            continue
+        first = warm.index[warm.to_numpy()]
+        when = first[0].isoformat() if len(first) else f"none before {end.isoformat()}"
+        detail = f"{symbol}: features not fully valid at start; first fully valid row: {when}"
+        events.append(RiskEvent(start, "warmup_incomplete", detail, "no_trade_until_warm"))
+    return events
+
+
 def _replay_interval(
     engine: Engine, feeds: Mapping[str, _Feed], k: int, base_width_ns: int
 ) -> None:
@@ -149,7 +167,9 @@ def run_backtest(
     ``[start, end)``; open positions are flattened at the last decision (END_OF_DATA).
 
     ``strategies`` defaults to ``build_strategies(cfg)``. ``candles`` must hold exactly the
-    configured symbols; ``funding`` may lack symbols (no funding charged).
+    configured symbols; ``funding`` may lack symbols (no funding charged). History before
+    ``start`` warms the features up; a symbol still under-warmed at ``start`` gets a
+    ``warmup_incomplete`` risk event there (``_warmup_events``).
     """
     for bound in (start, end):
         if bound.utcoffset() is None:
@@ -163,7 +183,7 @@ def run_backtest(
     base_width_ns = timeframe_minutes(cfg.exchange.base_timeframe) * 60 * 10**9
 
     portfolio = Portfolio(cfg.backtest.initial_equity)
-    log = RunLog()
+    log = RunLog(risk_events=_warmup_events(features, start, end))
     risk = RiskManager(cfg, kill_file)
     strategies = build_strategies(cfg) if strategies is None else strategies
     engine = Engine(cfg, strategies, risk, portfolio, log)

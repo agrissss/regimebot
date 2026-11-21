@@ -225,11 +225,66 @@ def test_a_position_stopped_in_the_bar_closing_at_a_funding_time_pays_none(
     )
 
 
+# --- feature warm-up --------------------------------------------------------------------------
+
+# Every window short: features are fully valid from the 24th decision bar (6 h of history).
+SHORT_WINDOWS = {
+    "features.atr_window": 5,
+    "features.rv_window": 8,
+    "features.pctile_window": 16,
+    "features.adx_window": 5,
+    "features.ema_fast": 4,
+    "features.ema_slow": 12,
+    "features.volume_window": 8,
+    "features.donchian_window": 8,
+    "features.zscore_window": 8,
+}
+
+
+@pytest.mark.parametrize(
+    ("start", "cold"),
+    [
+        (T0, {BTC: T0 + 6 * HOUR, ETH: T0 + 7 * HOUR}),  # no history before start
+        (T0 + 6 * HOUR, {ETH: T0 + 7 * HOUR}),  # BTC has its 6 h, ETH (listed 1 h later) not
+        (T0 + 7 * HOUR, {}),  # both warm: no event
+    ],
+    ids=["no_history", "eth_short", "both_warm"],
+)
+def test_an_under_warmed_start_is_recorded_once_per_cold_symbol(
+    tmp_path: Path, start: datetime, cold: dict[str, datetime]
+) -> None:
+    cfg = load_config(overrides={"exchange.symbols": [BTC, ETH], **SHORT_WINDOWS})
+    candles = {
+        BTC: regime_walk(12 * 60, seed=4),
+        ETH: regime_walk(11 * 60, seed=5, start=T0 + HOUR),
+    }
+    result = run_backtest(cfg, candles, {}, start, T0 + 12 * HOUR, tmp_path / "KILL", [])
+    events = [e for e in result.log.risk_events if e.kind == "warmup_incomplete"]
+    assert [(e.ts, e.action) for e in events] == [(start, "no_trade_until_warm")] * len(cold)
+    for event, (symbol, warm_at) in zip(events, cold.items(), strict=True):
+        assert event.detail.startswith(f"{symbol}: ")
+        assert event.detail.endswith(f"first fully valid row: {warm_at.isoformat()}")
+
+
+def test_a_symbol_that_never_warms_up_is_reported_without_a_warm_row(tmp_path: Path) -> None:
+    result = stub_run(tmp_path, flat(120), T0 + HOUR)  # two hours, default 31-day windows
+    (event,) = result.log.risk_events
+    assert event.kind == "warmup_incomplete" and event.ts == T0
+    end = (T0 + 121 * MINUTE).isoformat()
+    assert event.detail == (
+        f"{BTC}: features not fully valid at start; first fully valid row: none before {end}"
+    )
+    assert len(result.trades) == 1  # NaN features are NO_TRADE, which open_cfg still trades
+
+
 # --- real strategies on random data -----------------------------------------------------------
 
 DAYS = 20
-# close of the fill bar of the 07:30 decision that enters ETH (open until 10:37)
-CUT = datetime(2024, 1, 13, 7, 31, tzinfo=UTC)
+# A 4-day percentile window (default 30 days): with no history before T0 the features warm up
+# by day 5 (96 + 384 decision bars) and leave 15 days of trading.
+WALK_OVERRIDES = {"features.pctile_window": 384}
+# close of the fill bar of the 06:45 decision that enters ETH (open until 09:30)
+CUT = datetime(2024, 1, 13, 6, 46, tzinfo=UTC)
 
 
 def walk_inputs(seed: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
@@ -244,7 +299,7 @@ def walk_inputs(seed: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series
 def walk_run(
     tmp_path: Path, candles: dict[str, pd.DataFrame], funding: dict[str, pd.Series]
 ) -> BacktestResult:
-    cfg = load_config(overrides={"exchange.symbols": [BTC, ETH]})
+    cfg = load_config(overrides={"exchange.symbols": [BTC, ETH], **WALK_OVERRIDES})
     return run_backtest(cfg, candles, funding, T0, T0 + timedelta(days=DAYS), tmp_path / "KILL")
 
 
@@ -381,12 +436,18 @@ def test_cli_backtest_run_persists_a_run(tmp_path: Path, monkeypatch: pytest.Mon
     assert equity.index[0] == pd.Timestamp("2024-01-02", tz="UTC")
     assert equity.index[-1] < pd.Timestamp("2024-01-04", tz="UTC")
     assert "halted at" not in result.output
+    # one day of history cannot warm the default 31-day windows up
+    (warning,) = [line for line in result.output.splitlines() if line.startswith("warning:")]
+    assert "under-warmed start" in warning and all(s in warning for s in (BTC, ETH, SOL))
 
-    # Short feature windows so 3 days of data trade; any entry fee then breaches the drawdown.
+    # Short feature windows (warm after 120 bars, 30 h) so the two days before 2024-01-03 warm
+    # them up and one day trades; any entry fee then breaches the drawdown.
     short = ["features.ema_slow=48", "features.ema_fast=12", "features.pctile_window=96"]
     short += ["features.rv_window=24", "risk.max_drawdown=0.000001"]
+    args = ["backtest", "run", "--start", "2024-01-03", "--end", "2024-01-04"]
     halted = CliRunner().invoke(app, [*args, *(a for kv in short for a in ("--set", kv))])
     assert halted.exit_code == 0, halted.output
+    assert "warning:" not in halted.output
     with session_scope(engine) as session:
         halt_ts, detail = session.execute(
             select(RiskEventRow.ts, RiskEventRow.detail).where(RiskEventRow.kind == "max_drawdown")

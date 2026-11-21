@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from regimebot.config import FeaturesConfig
-from regimebot.market_state.features import compute_features
+from regimebot.config import FeaturesConfig, load_config
+from regimebot.market_state.features import compute_features, warm_rows, warmup_bars
 
 COMPRESSION = 0.3
 
@@ -72,6 +72,10 @@ def test_prefix_invariance_every_column() -> None:
         ema_fast=10, ema_slow=30, volume_window=20, donchian_window=20, zscore_window=20,
     )  # fmt: skip
     candles = random_walk(4000)
+    # Two zero-volume bars, not 1%: a NaN Amihud blanks illiq_pctile for a whole window
+    volume = candles.columns.get_loc("volume")
+    candles.iloc[:, volume] = candles["volume"] + 1.0
+    candles.iloc[[600, 2700], volume] = 0.0
     # Funding on and off the candle grid, including stamps after every cut point.
     stamps = candles.index[::32].append(candles.index[5::97] + pd.Timedelta(minutes=7))
     funding = pd.Series(np.random.default_rng(1).normal(0, 1e-4, len(stamps)), index=stamps)
@@ -79,6 +83,9 @@ def test_prefix_invariance_every_column() -> None:
     assert full["funding"].notna().any()
     assert (full["bars_since_compression"] == 0).any()
     assert full["bars_since_compression"].isna().any()
+    # the percentile ranks (valid from rows 219 and 200) are valid before the cut at 250
+    assert full[["vol_pctile", "illiq_pctile"]].iloc[:250].notna().all(axis=1).any()
+    assert full["illiq_pctile"].iloc[600:800].isna().all()  # the zero-volume bar's window
     for k in (1, 5, 15, 30, 250, 1001, 2500, 3999):
         known = funding[funding.index <= candles.index[k - 1]]  # only what exists at the cut
         prefix = compute_features(candles.iloc[:k], cfg, COMPRESSION, known)
@@ -133,9 +140,10 @@ def test_vol_pctile_endpoints() -> None:
     falling = compute_features(make_candles(list(down)), cfg, COMPRESSION)["vol_pctile"]
     assert rising.iloc[-1] == 1.0  # current maximum
     assert falling.iloc[-1] == pytest.approx(1 / cfg.pctile_window)  # current minimum
-    # first rv at row rv_window; vol_pctile needs rv_window valid rv values
-    assert rising.first_valid_index() == rising.index[2 * cfg.rv_window - 1]
-    assert rising.iloc[: 2 * cfg.rv_window - 1].isna().all()
+    # first rv at row rv_window; vol_pctile needs a full pctile_window of rv values
+    first = cfg.rv_window + cfg.pctile_window - 1  # 24
+    assert rising.first_valid_index() == rising.index[first]
+    assert rising.iloc[:first].isna().all() and rising.iloc[first:].notna().all()
 
 
 def test_adx_high_on_trend_low_on_noise() -> None:
@@ -169,8 +177,55 @@ def test_zero_volume_gives_nan_not_inf() -> None:
 def test_illiq_pctile_first_valid_index() -> None:
     cfg = make_cfg()
     out = compute_features(random_walk(100, seed=3).assign(volume=5.0), cfg, COMPRESSION)
-    # Amihud is valid from row 1 (first ret); needs rv_window valid values
-    assert out["illiq_pctile"].first_valid_index() == out.index[cfg.rv_window]
+    # Amihud is valid from row 1 (first ret); needs a full pctile_window of valid values
+    assert out["illiq_pctile"].first_valid_index() == out.index[cfg.pctile_window]  # 20
+    assert out["illiq_pctile"].iloc[cfg.pctile_window :].notna().all()
+
+
+def test_a_zero_volume_bar_keeps_illiq_pctile_nan_while_in_the_window() -> None:
+    cfg = make_cfg()
+    c = random_walk(100, seed=3).assign(volume=5.0)
+    c.iloc[50, c.columns.get_loc("volume")] = 0.0  # Amihud NaN at row 50
+    illiq = compute_features(c, cfg, COMPRESSION)["illiq_pctile"]
+    assert illiq.iloc[50 : 50 + cfg.pctile_window].isna().all()
+    assert illiq.iloc[50 + cfg.pctile_window :].notna().all()
+
+
+def well_behaved(n: int) -> tuple[pd.DataFrame, pd.Series]:
+    """A random walk with positive volume on every bar, and funding stamped at its start."""
+    c = random_walk(n, seed=11)
+    c["volume"] += 1.0
+    return c, pd.Series([1e-4], index=c.index[:1])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, 25),  # vol_pctile: 5 returns for the first rv, then 20 rv values ranked
+        ({"ema_slow": 40}, 40),
+        ({"adx_window": 16}, 32),
+        ({"rv_window": 20, "pctile_window": 20}, 40),
+    ],
+)
+def test_warmup_bars_is_the_row_count_that_makes_the_last_row_fully_valid(
+    overrides: dict[str, int], expected: int
+) -> None:
+    cfg = make_cfg(**overrides)
+    n = warmup_bars(cfg)
+    assert n == expected
+    candles, funding = well_behaved(n)
+    # compression_pctile 1.0: every valid vol_pctile is "compressed", so bars_since_compression
+    # is valid exactly when vol_pctile is
+    full = compute_features(candles, cfg, 1.0, funding)
+    assert full.iloc[-1].notna().all(), full.iloc[-1][full.iloc[-1].isna()]
+    assert bool(warm_rows(full).iloc[-1])
+    short = compute_features(candles.iloc[:-1], cfg, 1.0, funding)
+    assert short.iloc[-1].isna().any()
+    assert not warm_rows(short).any()
+
+
+def test_warmup_bars_default_config() -> None:
+    assert warmup_bars(load_config().features) == 96 + 2880  # 31 days of 15m bars
 
 
 def test_ret_z_uses_previous_rv() -> None:

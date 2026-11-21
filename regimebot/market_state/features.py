@@ -13,6 +13,33 @@ import pandas as pd
 from regimebot.config import FeaturesConfig
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
+# Valid once the data has a funding stamp / a compressed bar, not after a fixed warm-up.
+DATA_DEPENDENT_COLUMNS = ("funding", "bars_since_compression")
+
+
+def warmup_bars(cfg: FeaturesConfig) -> int:
+    """Decision bars after which every feature column can be valid (see ``compute_features``):
+    the last row of ``compute_features`` on this many rows can be fully valid, on one fewer it
+    cannot. With the default windows it is ``vol_pctile``: ``rv_window`` returns make the first
+    ``rv``, then a full ``pctile_window`` of ``rv`` values is ranked."""
+    first_valid_row = (
+        1,  # ret
+        cfg.atr_window,
+        cfg.rv_window + 1,  # ret_z (rv itself at rv_window)
+        cfg.rv_window + cfg.pctile_window - 1,  # vol_pctile, bars_since_compression
+        cfg.pctile_window,  # illiq_pctile
+        2 * cfg.adx_window - 1,  # adx (plus_di, minus_di at adx_window)
+        cfg.ema_slow - 1,  # ema_fast < ema_slow
+        cfg.volume_window,
+        cfg.donchian_window,
+        cfg.zscore_window - 1,
+    )
+    return max(first_valid_row) + 1
+
+
+def warm_rows(features: pd.DataFrame) -> pd.Series:
+    """True on the rows where every column but ``DATA_DEPENDENT_COLUMNS`` is valid."""
+    return features.drop(columns=list(DATA_DEPENDENT_COLUMNS)).notna().all(axis=1)
 
 
 def _validate(candles: pd.DataFrame) -> pd.DatetimeIndex:
@@ -43,13 +70,14 @@ def _wilder(x: pd.Series, window: int) -> pd.Series:
     return x.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
 
 
-def _pctile_rank(x: pd.Series, window: int, min_obs: int) -> pd.Series:
+def _pctile_rank(x: pd.Series, window: int) -> pd.Series:
     """Fraction of the trailing ``window`` values (current included) that are <= current.
 
     ``method="max"`` gives ties their highest rank, so the current maximum is
-    1.0. Needs at least ``min_obs`` valid values in the window, else NaN.
+    1.0. Needs the full ``window`` of valid values, else NaN: a rank against a shorter history
+    (a few days instead of a month) is a different, noisier feature.
     """
-    return x.rolling(window, min_periods=min_obs).rank(method="max", pct=True)
+    return x.rolling(window, min_periods=window).rank(method="max", pct=True)
 
 
 def _asof_funding(index: pd.DatetimeIndex, funding: pd.Series) -> pd.Series:
@@ -90,9 +118,28 @@ def compute_features(
 
     ``candles``: UTC close-time index, float columns open/high/low/close/volume.
     ``funding``: optional funding-rate series (tz-aware index), as-of joined.
-    ``vol_pctile`` / ``illiq_pctile`` need at least ``rv_window`` valid
-    observations in the trailing ``pctile_window`` (not a full window).
     ``bars_since_compression`` is 0 where ``vol_pctile <= compression_pctile``.
+
+    First row (0-based) at which a column can be valid; ``warmup_bars`` is the largest plus one:
+
+    ====================================  =========================================
+    ``ret``                               1
+    ``atr``, ``atr_pct``                  ``atr_window``
+    ``rv``                                ``rv_window``
+    ``ret_z``                             ``rv_window + 1`` (previous bar's ``rv``)
+    ``vol_pctile``                        ``rv_window + pctile_window - 1`` (full
+                                          ``pctile_window`` of ``rv``)
+    ``illiq_pctile``                      ``pctile_window`` (full window of Amihud)
+    ``plus_di``, ``minus_di`` / ``adx``   ``adx_window`` / ``2 * adx_window - 1``
+    ``ema_fast``, ``ema_slow``            ``ema_fast - 1``, ``ema_slow - 1``
+    ``volume_z``                          ``volume_window``
+    ``donchian_high``, ``donchian_low``   ``donchian_window``
+    ``zscore``, ``roll_mean``             ``zscore_window - 1``
+    ``funding``                           the first funding stamp (data, not config)
+    ``bars_since_compression``            the first compressed bar (data, not config)
+    ====================================  =========================================
+
+    A NaN input (zero volume makes Amihud NaN) keeps a percentile NaN while it is in the window.
     """
     index = _validate(candles)
     close = candles["close"].astype(float)
@@ -108,7 +155,7 @@ def compute_features(
     )
     atr = _wilder(tr, cfg.atr_window)
     rv = ret.rolling(cfg.rv_window).std()
-    vol_pctile = _pctile_rank(rv, cfg.pctile_window, cfg.rv_window)
+    vol_pctile = _pctile_rank(rv, cfg.pctile_window)
 
     prev_volume = volume.shift(1)  # current bar excluded from its own baseline
     volume_z = _safe_div(
@@ -119,7 +166,7 @@ def compute_features(
     zscore = _safe_div(close - roll_mean, close.rolling(cfg.zscore_window).std())
 
     amihud = _safe_div(ret.abs(), close * volume)  # zero volume -> NaN, never inf
-    illiq_pctile = _pctile_rank(amihud, cfg.pctile_window, cfg.rv_window)
+    illiq_pctile = _pctile_rank(amihud, cfg.pctile_window)
 
     compressed = (vol_pctile <= compression_pctile).to_numpy()  # NaN compares False
     pos = pd.Series(np.arange(len(candles), dtype=float), index=candles.index)
