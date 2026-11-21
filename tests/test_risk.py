@@ -333,6 +333,61 @@ def test_no_room_under_a_cap_rejects_with_the_caps_rule(
     assert rejected(decision) == rule
 
 
+def test_pending_entries_in_one_bar_cannot_jointly_breach_a_cap(tmp_path: Path) -> None:
+    # empty 10000 portfolio ; each signal: entry 100, stop 99.5 -> risk qty 100, notional 10000
+    rm, p = manager(tmp_path), book()
+    pending: dict[str, float] = {}
+    # BTC: asset 7500, majors 10000, gross 15000 -> asset binds
+    btc = rm.evaluate(make_signal(BTC, stop=99.5), p, PLAY, MON, pending)
+    assert approved(btc) == ("cap_asset", approx(75.0))
+    pending[BTC] = btc.qty * 100.0  # 7500
+    # ETH: asset 7500, majors 10000 - 7500 = 2500, gross 15000 - 7500 = 7500 -> group binds
+    eth = rm.evaluate(make_signal(ETH, stop=99.5), p, PLAY, MON, pending)
+    assert approved(eth) == ("cap_group", approx(25.0))
+    pending[ETH] = eth.qty * 100.0  # 2500
+    # SOL: majors 10000 - 10000 = 0 -> no room
+    assert rejected(rm.evaluate(make_signal(SOL, stop=99.5), p, PLAY, MON, pending)) == "cap_group"
+    assert sum(pending.values()) == approx(10_000.0)  # = majors cap, < gross cap 15000
+    # without pending each would be judged alone (unchanged behaviour): 7500 again
+    assert approved(rm.evaluate(make_signal(SOL, stop=99.5), p, PLAY, MON)) == (
+        "cap_asset",
+        approx(75.0),
+    )
+
+
+def test_pending_counts_toward_its_own_groups_and_gross(tmp_path: Path) -> None:
+    # groups majors [BTC, ETH, SOL], alts [SOL, XRP] ; open ETH 1000 (majors), pending XRP 8000
+    # signal entry 100, stop 99.5: risk notional 10000 ; gross used 1000 + 8000 = 9000
+    rm = manager(tmp_path, groups=TWO_GROUPS)
+    p = book((ETH, 10.0, 100.0))
+    pending = {XRP: 8000.0}
+    # BTC: asset 7500, majors 10000 - 1000 = 9000, gross 15000 - 9000 = 6000 -> gross binds
+    btc = rm.evaluate(make_signal(BTC, stop=99.5), p, PLAY, MON, pending)
+    assert approved(btc) == ("cap_gross", approx(60.0))
+    # SOL: majors 9000, alts 10000 - 8000 = 2000, gross 6000 -> alts binds
+    sol = rm.evaluate(make_signal(SOL, stop=99.5), p, PLAY, MON, pending)
+    assert approved(sol) == ("cap_group", approx(20.0))
+    assert "alts" in sol.detail
+    # DOGE (no group): asset 7500, gross 6000 -> gross binds
+    doge = rm.evaluate(make_signal(DOGE, stop=99.5), p, PLAY, MON, pending)
+    assert approved(doge) == ("cap_gross", approx(60.0))
+
+
+@pytest.mark.parametrize("notional", [7500.0, 0.0])
+def test_symbol_already_pending_is_position_exists(tmp_path: Path, notional: float) -> None:
+    decision = manager(tmp_path).evaluate(make_signal(BTC), book(), PLAY, MON, {BTC: notional})
+    assert rejected(decision) == "position_exists"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_invalid_pending_notional_raises(tmp_path: Path, bad: float) -> None:
+    rm = manager(tmp_path)
+    state = rm.to_state()
+    with pytest.raises(ValueError, match="pending"):
+        rm.evaluate(make_signal(BTC), book(), PLAY, MON, {ETH: bad})
+    assert rm.to_state() == state  # rejected before any rollover
+
+
 def test_min_notional_boundary(tmp_path: Path) -> None:
     # risk_per_trade 0.0001: risk = 10000 * 0.0001 = 1
     rm = manager(tmp_path, risk_per_trade=0.0001)
@@ -592,6 +647,79 @@ def test_naive_datetimes_are_rejected(tmp_path: Path) -> None:
         rm.on_trade_closed(make_trade(-1.0, naive))
 
 
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("cash", float("nan")), ("cash", float("inf")), ("peak_equity", float("nan"))],
+)
+def test_check_limits_raises_on_non_finite_equity_or_drawdown(
+    tmp_path: Path, field: str, bad: float
+) -> None:
+    # a corrupted portfolio must not silently disable the limits (NaN compares False)
+    rm = manager(tmp_path)
+    p = book()
+    assert rm.check_limits(p, MON) == []
+    state = rm.to_state()
+    setattr(p, field, bad)
+    with pytest.raises(ValueError, match="finite"):
+        rm.check_limits(p, MON + DAY)
+    assert rm.to_state() == state  # nothing recorded, no rollover
+
+
+def test_now_before_the_current_period_changes_nothing(tmp_path: Path) -> None:
+    rm = manager(tmp_path)
+    p = book((DOGE, 100.0, 100.0))
+    wednesday = datetime(2024, 1, 10, 0, 5, tzinfo=UTC)  # second ISO week
+    assert rm.check_limits(p, wednesday) == []
+    p.mark({DOGE: 95.5})  # 9550: daily and weekly breach
+    assert [e.kind for e in rm.check_limits(p, wednesday)] == ["weekly_loss", "daily_loss"]
+    for _ in range(5):
+        rm.on_trade_closed(make_trade(-1.0, wednesday))
+    state = rm.to_state()
+    for earlier in [wednesday - timedelta(minutes=10), wednesday - DAY, wednesday - 7 * DAY]:
+        assert rm.check_limits(p, earlier) == []
+        assert rejected(rm.evaluate(make_signal(), p, PLAY, earlier)) == "kill_switch"
+    assert rm.to_state() == state  # no halt, start equity or streak stop was cleared
+
+
+def test_weekly_halt_clears_across_a_year_boundary(tmp_path: Path) -> None:
+    # ISO week 2025-W01 runs Mon 2024-12-30 .. Sun 2025-01-05 ; daily limit widened to isolate it
+    rm = manager(tmp_path, daily_loss=0.5)
+    p = book((DOGE, 100.0, 100.0))
+    assert rm.check_limits(p, datetime(2024, 12, 30, 9, tzinfo=UTC)) == []  # week start 10000
+    p.mark({DOGE: 96.0})  # 9600 <= 10000 * 0.96
+    tuesday = datetime(2024, 12, 31, 9, tzinfo=UTC)
+    assert [e.kind for e in rm.check_limits(p, tuesday)] == ["weekly_loss"]
+    assert rm.check_limits(p, datetime(2025, 1, 5, 23, 59, tzinfo=UTC)) == []
+    assert rm.halted_reason == "weekly_loss"  # same ISO week despite the new year
+    monday = datetime(2025, 1, 6, 0, 0, tzinfo=UTC)
+    assert rm.check_limits(p, monday) == []
+    assert rm.halted_reason is None
+    assert approved(rm.evaluate(make_signal(), p, PLAY, monday))[0] == "ok"
+
+
+def test_rollovers_apply_when_calls_skip_days(tmp_path: Path) -> None:
+    rm = manager(tmp_path)
+    p = book((DOGE, 100.0, 100.0))
+    assert rm.check_limits(p, datetime(2024, 1, 1, 9, tzinfo=UTC)) == []  # Mon: start 10000
+    p.mark({DOGE: 98.5})  # 9850: daily only
+    assert [e.kind for e in rm.check_limits(p, datetime(2024, 1, 1, 10, tzinfo=UTC))] == [
+        "daily_loss"
+    ]
+    for _ in range(5):
+        rm.on_trade_closed(make_trade(-1.0, datetime(2024, 1, 1, 11, tzinfo=UTC)))
+    # next call Thursday: daily halt and streak stop clear ; day start 9850, floor 9702.25
+    thursday = datetime(2024, 1, 4, 9, tzinfo=UTC)
+    assert rm.check_limits(p, thursday) == []
+    assert (rm.halted_reason, rm.day_stopped, rm.loss_streak) == (None, None, 0)
+    p.mark({DOGE: 96.0})  # 9600: daily (<= 9702.25) and weekly (<= 9600)
+    assert [e.kind for e in rm.check_limits(p, thursday)] == ["weekly_loss", "daily_loss"]
+    # next call two ISO weeks later: both clear and the new period starts at 9600
+    later = datetime(2024, 1, 17, 9, tzinfo=UTC)
+    assert rm.check_limits(p, later) == []
+    assert rm.halted_reason is None
+    assert approved(rm.evaluate(make_signal(), p, PLAY, later))[0] == "ok"
+
+
 def drive(rm: RiskManager, p: Portfolio) -> list[object]:
     """A fixed sequence of calls; returns every decision and event list."""
     out: list[object] = []
@@ -680,10 +808,25 @@ def test_default_kill_file_is_data_kill_at_the_repository_root() -> None:
 # --- property: approvals never breach a cap or the risk budget ------------------------------
 
 
+def largest_allowed(
+    r: RiskConfig, equity: float, symbol: str, used: dict[str, float], risk_notional: float
+) -> float:
+    """Independent oracle: the smallest of the risk-based notional and every cap's room, with
+    ``used`` the notional already committed per symbol (open positions plus pending)."""
+    rooms = [risk_notional, r.max_asset_exposure * equity]
+    for members in TWO_GROUPS.values():
+        if symbol in members:
+            rooms.append(r.max_group_exposure * equity - sum(used.get(s, 0.0) for s in members))
+    rooms.append(r.max_gross_leverage * equity - sum(used.values()))
+    return min(rooms)
+
+
 def test_random_approvals_never_breach_caps_or_the_risk_budget(tmp_path: Path) -> None:
-    """3000 random portfolios, configs and signals. Every approval must keep asset, group and
-    gross exposure (after the new position) within their caps, risk at most risk_per_trade of
-    equity at the stop, and be the largest size those limits allow."""
+    """3000 random configs and portfolios, each with a batch of signals for distinct symbols
+    evaluated in sequence as one decision bar, approved notional accumulating in ``pending``.
+    Every approval must keep asset, group and gross exposure (open positions + pending + the
+    new entry) within their caps, risk at most risk_per_trade of equity at the stop, and be the
+    largest size those limits allow."""
     rng = random.Random(8)
     tol = 1 + 1e-9
     rules: Counter[str] = Counter()
@@ -700,50 +843,52 @@ def test_random_approvals_never_breach_caps_or_the_risk_budget(tmp_path: Path) -
         losses = rng.randint(0, r.streak_stop - 1)
         for _ in range(losses):
             rm.on_trade_closed(make_trade(-1.0))
+        streak_mult = 0.5 if losses >= r.streak_half else 1.0
         p = Portfolio(10 ** rng.uniform(2.5, 5.0))  # 316 .. 100 000
         for symbol in rng.sample([BTC, ETH, SOL, XRP, DOGE], rng.randint(0, 3)):
             price = rng.uniform(1.0, 1000.0)
             qty = p.initial_equity * rng.uniform(0.0, 0.6) / price
             open_position(p, symbol, rng.choice([Side.LONG, Side.SHORT]), qty, price)
             p.mark({symbol: price * rng.uniform(0.8, 1.2)})
-        side = rng.choice([Side.LONG, Side.SHORT])
-        entry = rng.uniform(1.0, 1000.0)
-        stop = entry - side_sign(side) * entry * 10 ** rng.uniform(-4.0, -0.5)
-        if rng.random() < 0.03:
-            stop = 2 * entry - stop  # wrong side
-        symbol = rng.choice([BTC, ETH, SOL, XRP, DOGE])
-        size_mult = rng.choice([1.0, rng.uniform(0.0, 1.0)])
-        play = PLAY.model_copy(update={"size_mult": size_mult})
-        decision = rm.evaluate(make_signal(symbol, side, entry, stop), p, play, MON)
-        rules[f"{'approved' if decision.approved else 'rejected'} {decision.rule}"] += 1
-        if not decision.approved:
-            assert decision.qty == 0.0
-            continue
-
         equity = p.equity
-        notional = decision.qty * entry
-        used = {s: abs(pos.qty) * p.last_prices[s] for s, pos in p.positions.items()}
-        risk_budget = r.risk_per_trade * equity
-        assert decision.qty > 0.0
-        assert notional >= MIN_NOTIONAL
-        assert decision.qty * abs(entry - stop) <= risk_budget * tol
-        assert notional <= r.max_asset_exposure * equity * tol
-        group_rooms = []
-        for members in TWO_GROUPS.values():
-            if symbol in members:
-                group_used = sum(v for s, v in used.items() if s in members)
-                assert group_used + notional <= r.max_group_exposure * equity * tol
-                group_rooms.append(r.max_group_exposure * equity - group_used)
-        assert sum(used.values()) + notional <= r.max_gross_leverage * equity * tol
-        # tight: the size is the smallest of the risk-based size and every cap's room
-        streak_mult = 0.5 if losses >= r.streak_half else 1.0
-        risk_notional = risk_budget * size_mult * streak_mult / abs(entry - stop) * entry
-        gross_room = r.max_gross_leverage * equity - sum(used.values())
-        largest = min(risk_notional, r.max_asset_exposure * equity, gross_room, *group_rooms)
-        assert notional == pytest.approx(largest, rel=1e-9)
+        positions = {s: abs(pos.qty) * p.last_prices[s] for s, pos in p.positions.items()}
+        pending: dict[str, float] = {}
+        for symbol in rng.sample([BTC, ETH, SOL, XRP, DOGE], rng.randint(1, 5)):
+            side = rng.choice([Side.LONG, Side.SHORT])
+            entry = rng.uniform(1.0, 1000.0)
+            stop = entry - side_sign(side) * entry * 10 ** rng.uniform(-4.0, -0.5)
+            if rng.random() < 0.03:
+                stop = 2 * entry - stop  # wrong side
+            size_mult = rng.choice([1.0, rng.uniform(0.0, 1.0)])
+            play = PLAY.model_copy(update={"size_mult": size_mult})
+            decision = rm.evaluate(make_signal(symbol, side, entry, stop), p, play, MON, pending)
+            rules[f"{'approved' if decision.approved else 'rejected'} {decision.rule}"] += 1
+            if not decision.approved:
+                assert decision.qty == 0.0
+                continue
+
+            notional = decision.qty * entry
+            used = {**positions, **pending}  # distinct keys: open symbols are never approved
+            risk_budget = r.risk_per_trade * equity
+            assert decision.qty > 0.0
+            assert notional >= MIN_NOTIONAL
+            assert decision.qty * abs(entry - stop) <= risk_budget * tol
+            assert notional <= r.max_asset_exposure * equity * tol
+            for members in TWO_GROUPS.values():
+                if symbol in members:
+                    group_used = sum(used.get(s, 0.0) for s in members)
+                    assert group_used + notional <= r.max_group_exposure * equity * tol
+            assert sum(used.values()) + notional <= r.max_gross_leverage * equity * tol
+            # tight: the largest size the risk budget and every cap allow
+            risk_notional = risk_budget * size_mult * streak_mult / abs(entry - stop) * entry
+            largest = largest_allowed(r, equity, symbol, used, risk_notional)
+            assert notional == pytest.approx(largest, rel=1e-9)
+            if notional < largest_allowed(r, equity, symbol, positions, risk_notional) * (1 - 1e-9):
+                rules["approved smaller because of pending"] += 1
+            pending[symbol] = notional
 
     # the random cases must reach every branch, or the checks above prove little
-    for rule in ["ok", "cap_asset", "cap_group", "cap_gross"]:
+    for rule in ["ok", "cap_asset", "cap_group", "cap_gross", "smaller because of pending"]:
         assert rules[f"approved {rule}"] > 100, rules
     for rule in ["too_small", "cap_group", "cap_gross", "position_exists", "invalid_stop"]:
         assert rules[f"rejected {rule}"] > 30, rules

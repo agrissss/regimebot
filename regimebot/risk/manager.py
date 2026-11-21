@@ -96,7 +96,12 @@ class RiskManager:
         return self.halted_reason is not None
 
     def evaluate(
-        self, signal: Signal, portfolio: Portfolio, playbook: PlaybookEntry, now: datetime
+        self,
+        signal: Signal,
+        portfolio: Portfolio,
+        playbook: PlaybookEntry,
+        now: datetime,
+        pending: Mapping[str, float] | None = None,
     ) -> RiskDecision:
         """Approve and size ``signal``, or reject it with the first failing rule.
 
@@ -104,8 +109,18 @@ class RiskManager:
         strategy_not_allowed, position_exists, invalid_stop; then sizing, where a cap with no
         room left rejects with its rule (cap_asset, cap_group, cap_gross) and a notional under
         ``MIN_NOTIONAL`` rejects as too_small. Day/week rollovers for ``now`` apply first.
+
+        ``pending`` maps symbol -> notional (quote units) of entries approved but not yet
+        filled. It counts as exposure for every cap, and a pending symbol is position_exists,
+        so several approvals in one decision bar can never jointly breach a cap. Raises
+        ValueError on a pending notional that is not finite and >= 0.
         """
-        self._roll(_utc(now, "now"))
+        now = _utc(now, "now")
+        pending = pending or {}
+        for symbol, notional in pending.items():
+            if not (math.isfinite(notional) and notional >= 0):
+                raise ValueError(f"pending notional for {symbol} must be >= 0, got {notional!r}")
+        self._roll(now)
         equity = portfolio.equity
         if self.halted_reason is not None:
             return _reject("kill_switch", f"halted: {self.halted_reason}")
@@ -120,21 +135,26 @@ class RiskManager:
         if signal.strategy not in playbook.strategies:
             detail = f"{signal.strategy} not in {playbook.strategies}"
             return _reject("strategy_not_allowed", detail)
-        if signal.symbol in portfolio.positions:
-            return _reject("position_exists", f"{signal.symbol} already has an open position")
+        if signal.symbol in portfolio.positions or signal.symbol in pending:
+            return _reject("position_exists", f"{signal.symbol} is already open or pending")
         if problem := _stop_problem(signal):
             return _reject("invalid_stop", problem)
-        return self._size(signal, portfolio, equity, playbook.size_mult)
+        return self._size(signal, portfolio, pending, equity, playbook.size_mult)
 
     def _size(
-        self, signal: Signal, portfolio: Portfolio, equity: float, size_mult: float
+        self,
+        signal: Signal,
+        portfolio: Portfolio,
+        pending: Mapping[str, float],
+        equity: float,
+        size_mult: float,
     ) -> RiskDecision:
         """Risk-based qty, reduced to the smallest cap room; ties go to the earlier cap."""
         streak_mult = STREAK_SIZE_MULT if self.loss_streak >= self.risk.streak_half else 1.0
         risk_amount = equity * self.risk.risk_per_trade * size_mult * streak_mult
         qty = risk_amount / abs(signal.entry - signal.stop)
         notional, rule, detail = qty * signal.entry, "ok", f"risk {risk_amount:.2f} at the stop"
-        for cap_rule, label, room in self._rooms(signal.symbol, portfolio, equity):
+        for cap_rule, label, room in self._rooms(signal.symbol, portfolio, pending, equity):
             if room < notional:
                 notional, rule = room, cap_rule
                 detail = f"{label} room {room:.2f} caps risk {risk_amount:.2f}"
@@ -147,20 +167,21 @@ class RiskManager:
         return RiskDecision(approved=True, qty=qty, rule=rule, detail=detail)
 
     def _rooms(
-        self, symbol: str, portfolio: Portfolio, equity: float
+        self, symbol: str, portfolio: Portfolio, pending: Mapping[str, float], equity: float
     ) -> list[tuple[str, str, float]]:
         """(rule, label, remaining notional) for each cap on ``symbol``: asset, its groups, gross.
 
-        The asset room needs no current exposure: ``position_exists`` rejected open symbols.
+        Used exposure is open positions at their marks plus pending notional. The asset room
+        needs neither: ``position_exists`` rejected open and pending symbols.
         """
         r = self.risk
         rooms = [("cap_asset", "asset", r.max_asset_exposure * equity)]
         for group, members in r.groups.items():
             if symbol in members:
-                used = sum(portfolio.exposure(s) for s in set(members))
+                used = sum(portfolio.exposure(s) + pending.get(s, 0.0) for s in set(members))
                 rooms.append(("cap_group", f"group {group}", r.max_group_exposure * equity - used))
-        gross_room = r.max_gross_leverage * equity - portfolio.gross_exposure
-        rooms.append(("cap_gross", "gross", gross_room))
+        gross_used = portfolio.gross_exposure + sum(pending.values())
+        rooms.append(("cap_gross", "gross", r.max_gross_leverage * equity - gross_used))
         return rooms
 
     def on_trade_closed(self, trade: Trade) -> None:
@@ -189,12 +210,16 @@ class RiskManager:
         max_drawdown, kill file present. The first call of each UTC day / ISO week records that
         period's start equity. A breach of an already active halt returns nothing, so an event
         recurs only once its halt has cleared and the condition holds again (``clear_halt``
-        while drawdown is still at the limit halts again on the next call).
+        while drawdown is still at the limit halts again on the next call). Raises ValueError,
+        before changing any state, on non-finite equity or drawdown: NaN compares False and
+        would silently disable every limit.
         """
         now = _utc(now, "now")
+        equity, drawdown = portfolio.equity, portfolio.drawdown
+        if not (math.isfinite(equity) and math.isfinite(drawdown)):
+            raise ValueError(f"equity {equity!r} and drawdown {drawdown!r} must be finite")
         self._roll(now)
         r = self.risk
-        equity, drawdown = portfolio.equity, portfolio.drawdown
         if self._day_start_equity is None:
             self._day_start_equity = equity
         if self._week_start_equity is None:
