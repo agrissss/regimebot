@@ -54,10 +54,12 @@ def _pctile_rank(x: pd.Series, window: int, min_obs: int) -> pd.Series:
 
 def _asof_funding(index: pd.DatetimeIndex, funding: pd.Series) -> pd.Series:
     """Last funding value stamped at or before each candle time (NaN before the first)."""
-    if not isinstance(funding.index, pd.DatetimeIndex) or funding.index.tz is None:
-        raise ValueError("funding must have a tz-aware DatetimeIndex")
+    fidx = funding.index
+    if not isinstance(fidx, pd.DatetimeIndex) or fidx.tz is None or str(fidx.tz) != "UTC":
+        raise ValueError("funding must have a UTC DatetimeIndex")
+    if fidx.has_duplicates:
+        raise ValueError("funding index has duplicate stamps")
     f = funding.dropna().sort_index()
-    f = f[~f.index.duplicated(keep="last")]
     # side="right" - 1 = last stamp <= t; never a stamp after t.
     pos = f.index.searchsorted(index, side="right") - 1
     vals = np.where(pos >= 0, f.to_numpy(dtype=float)[np.maximum(pos, 0)], np.nan)

@@ -79,8 +79,9 @@ def test_prefix_invariance_every_column() -> None:
     assert full["funding"].notna().any()
     assert (full["bars_since_compression"] == 0).any()
     assert full["bars_since_compression"].isna().any()
-    for k in (30, 250, 1001, 2500, 3999):
-        prefix = compute_features(candles.iloc[:k], cfg, COMPRESSION, funding)
+    for k in (1, 5, 15, 30, 250, 1001, 2500, 3999):
+        known = funding[funding.index <= candles.index[k - 1]]  # only what exists at the cut
+        prefix = compute_features(candles.iloc[:k], cfg, COMPRESSION, known)
         pd.testing.assert_frame_equal(
             prefix, full.iloc[:k], check_exact=False, rtol=1e-9, atol=0, check_freq=False
         )
@@ -132,7 +133,9 @@ def test_vol_pctile_endpoints() -> None:
     falling = compute_features(make_candles(list(down)), cfg, COMPRESSION)["vol_pctile"]
     assert rising.iloc[-1] == 1.0  # current maximum
     assert falling.iloc[-1] == pytest.approx(1 / cfg.pctile_window)  # current minimum
-    assert rising.iloc[: cfg.rv_window].isna().all()  # needs rv_window valid rv values
+    # first rv at row rv_window; vol_pctile needs rv_window valid rv values
+    assert rising.first_valid_index() == rising.index[2 * cfg.rv_window - 1]
+    assert rising.iloc[: 2 * cfg.rv_window - 1].isna().all()
 
 
 def test_adx_high_on_trend_low_on_noise() -> None:
@@ -161,6 +164,13 @@ def test_zero_volume_gives_nan_not_inf() -> None:
     out = compute_features(c, make_cfg(volume_window=5), COMPRESSION)
     assert np.isnan(out["illiq_pctile"].iloc[150])
     assert not np.isinf(out.to_numpy(dtype=float)).any()
+
+
+def test_illiq_pctile_first_valid_index() -> None:
+    cfg = make_cfg()
+    out = compute_features(random_walk(100, seed=3).assign(volume=5.0), cfg, COMPRESSION)
+    # Amihud is valid from row 1 (first ret); needs rv_window valid values
+    assert out["illiq_pctile"].first_valid_index() == out.index[cfg.rv_window]
 
 
 def test_ret_z_uses_previous_rv() -> None:
@@ -205,10 +215,17 @@ def test_input_validation(bad: str) -> None:
         compute_features(c, make_cfg(), COMPRESSION)
 
 
-def test_naive_funding_rejected() -> None:
+@pytest.mark.parametrize("tz", [None, "Europe/Riga"])
+def test_non_utc_funding_rejected(tz: str | None) -> None:
+    f = pd.Series([0.1], index=pd.DatetimeIndex(["2024-01-01"], tz=tz))
+    with pytest.raises(ValueError, match="UTC"):
+        compute_features(random_walk(50), make_cfg(), COMPRESSION, f)
+
+
+def test_duplicate_funding_stamps_rejected() -> None:
     c = random_walk(50)
-    f = pd.Series([0.1], index=pd.DatetimeIndex(["2024-01-01"]))
-    with pytest.raises(ValueError):
+    f = pd.Series([0.1, 0.2], index=[c.index[3], c.index[3]])
+    with pytest.raises(ValueError, match="duplicate"):
         compute_features(c, make_cfg(), COMPRESSION, f)
 
 

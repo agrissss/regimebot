@@ -72,6 +72,8 @@ class FeaturesConfig(_Model):
     def _fast_below_slow(self) -> "FeaturesConfig":
         if self.ema_fast >= self.ema_slow:
             raise ValueError("ema_fast must be smaller than ema_slow")
+        if self.pctile_window < self.rv_window:
+            raise ValueError("pctile_window must be at least rv_window")
         return self
 
 

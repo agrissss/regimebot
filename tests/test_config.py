@@ -59,6 +59,11 @@ def test_ema_fast_must_be_below_slow() -> None:
         load_config(overrides={"features.ema_fast": 384})
 
 
+def test_pctile_window_must_cover_rv_window() -> None:
+    with pytest.raises(ValidationError, match="pctile_window"):
+        load_config(overrides={"features.pctile_window": 10})
+
+
 def test_fraction_and_timeframe_rejected() -> None:
     with pytest.raises(ValidationError):
         load_config(overrides={"risk.daily_loss": 0.0})
