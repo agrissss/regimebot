@@ -662,11 +662,15 @@ def test_a_run_cannot_be_run_by_two_sessions_at_once(tmp_path: Path) -> None:
     [
         (state.PORTFOLIO_KEY, {"queued_exits": {BTC: "soon"}}, "soon"),
         (state.RISK_KEY, {"halts": ["bogus"]}, "unknown halt kinds"),
+        (state.PORTFOLIO_KEY, {"last_prices": None}, "malformed '__portfolio__' state row"),
+        (state.PORTFOLIO_KEY, {"cash": None}, "malformed '__portfolio__' state row"),
+        (state.RISK_KEY, {"pnl_by_day": None}, "malformed '__risk__' state row"),
+        (state.RISK_KEY, None, "malformed '__risk__' state row"),  # the row emptied: KeyError
     ],
-    ids=["bad_engine_state", "bad_risk_state"],
+    ids=["bad_exit_reason", "bad_halt", "null_marks", "null_cash", "null_pnl", "empty_risk"],
 )
 def test_a_failed_restore_changes_nothing_and_keeps_no_lock(
-    tmp_path: Path, row: str, corruption: dict[str, Any], error: str
+    tmp_path: Path, row: str, corruption: dict[str, Any] | None, error: str
 ) -> None:
     rig = make_rig(tmp_path)
     first = rig.session()
@@ -675,7 +679,7 @@ def test_a_failed_restore_changes_nothing_and_keeps_no_lock(
     first.close()
     with session_scope(rig.db) as s:
         saved = repo.load_open_positions(s, run_id)[row]
-        repo.save_open_position(s, run_id, row, saved | corruption)
+        repo.save_open_position(s, run_id, row, {} if corruption is None else saved | corruption)
     fresh = rig.session()
     pristine = resumable_state(fresh)
     with pytest.raises(ValueError, match=error):
@@ -684,6 +688,44 @@ def test_a_failed_restore_changes_nothing_and_keeps_no_lock(
     again = rig.session()  # the failed start released the run's lock
     with pytest.raises(ValueError, match=error):
         again.start(resume_run_id=run_id)
+
+
+class DiesInWarmUp:
+    """The process is killed during the warm-up's first candle download."""
+
+    def __init__(self, inner: ReplayExchange) -> None:
+        self.inner = inner
+
+    def fetch_candles(self, *args: Any) -> Any:
+        raise KeyboardInterrupt
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+def test_a_resume_killed_during_its_warm_up_does_not_look_stopped(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path)
+
+    def ctrl_c(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    first = rig.session(sleep=ctrl_c)
+    run_id = first.start()
+    first.run_forever()  # one poll, then a clean stop: stopped_at is stored
+    first.close()
+
+    def stopped_at() -> Any:
+        with Session(rig.db) as s:
+            return repo.load_open_positions(s, run_id)[state.PORTFOLIO_KEY]["stopped_at"]
+
+    assert stopped_at() == (START + LAG).isoformat()
+    dying = rig.session(exchange=DiesInWarmUp(rig.exchange))
+    with pytest.raises(KeyboardInterrupt):
+        dying.start(resume_run_id=run_id)
+    assert stopped_at() is None  # cleared once locked, before the warm-up
+    with Session(rig.db) as s:
+        status = state.latest_status(s)
+    assert status is not None and status.stopped_at is None
 
 
 # --- exits, the kill switch and halts ---------------------------------------------------------

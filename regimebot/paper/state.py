@@ -10,6 +10,8 @@ holds an exclusive lock on ``paper_run_<id>.lock`` next to the kill file (``lock
 
 import fcntl
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -154,18 +156,23 @@ def restore(session: Session, run_id: int, engine: Engine) -> Cursors:
     if PORTFOLIO_KEY not in rows or RISK_KEY not in rows:
         raise ValueError(f"run {run_id} has no saved paper state")
     saved, risk_state = rows.pop(PORTFOLIO_KEY), rows.pop(RISK_KEY)
-    positions = {symbol: Position.from_state(state) for symbol, state in rows.items()}
-    last_prices = {s: float(v) for s, v in saved["last_prices"].items()}
+    with _parsing(run_id, "open position"):
+        positions = {symbol: Position.from_state(state) for symbol, state in rows.items()}
+    with _parsing(run_id, PORTFOLIO_KEY):
+        last_prices = {s: float(v) for s, v in saved["last_prices"].items()}
+        cursors = Cursors(
+            _utc(saved["last_decision"]),
+            {s: _utc(v) for s, v in saved["last_bar"].items()},
+            {s: _utc(v) for s, v in saved["last_funding"].items()},
+        )
+        cash, peak = float(saved["cash"]), float(saved["peak_equity"])
+        engine_state = {key: saved[key] for key in ("queued_exits", "last_close")}
     if missing := sorted(set(positions) - set(last_prices)):
         raise ValueError(f"run {run_id}: no mark for open positions {missing}")
-    cursors = Cursors(
-        _utc(saved["last_decision"]),
-        {s: _utc(v) for s, v in saved["last_bar"].items()},
-        {s: _utc(v) for s, v in saved["last_funding"].items()},
-    )
-    cash, peak = float(saved["cash"]), float(saved["peak_equity"])
-    RiskManager(engine.cfg, engine.risk.kill_file).load_state(risk_state)  # validate it first
-    engine.load_state({key: saved[key] for key in ("queued_exits", "last_close")})  # or raise
+    with _parsing(run_id, RISK_KEY):
+        RiskManager(engine.cfg, engine.risk.kill_file).load_state(risk_state)  # validate first
+    with _parsing(run_id, PORTFOLIO_KEY):
+        engine.load_state(engine_state)  # validates before assigning
     engine.risk.load_state(risk_state)  # cannot fail now
     portfolio = engine.portfolio
     portfolio.cash, portfolio.peak_equity = cash, peak
@@ -190,6 +197,23 @@ def clear_halts(session: Session, run_id: int, cfg: AppConfig, kill_file: Path) 
     risk.clear_halt()
     repo.save_open_position(session, run_id, RISK_KEY, risk.to_state())
     return list(saved["halts"])
+
+
+@contextmanager
+def _parsing(run_id: int, row: str) -> Iterator[None]:
+    """Turn any parse error in saved state into a ValueError naming the row (the CLI reports
+    ValueError cleanly; a KeyError or AttributeError would show a traceback)."""
+    try:
+        yield
+    except (KeyError, AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"run {run_id}: malformed {row!r} state row: {exc!r}") from None
+
+
+def clear_stopped(session: Session, run_id: int) -> None:
+    """Drop a clean-stop marker from ``run_id``'s state row (a resume is starting)."""
+    saved = repo.load_open_positions(session, run_id).get(PORTFOLIO_KEY)
+    if isinstance(saved, dict) and saved.get("stopped_at") is not None:
+        repo.save_open_position(session, run_id, PORTFOLIO_KEY, saved | {"stopped_at": None})
 
 
 def _utc(text: str) -> datetime:

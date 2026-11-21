@@ -75,7 +75,9 @@ class PaperSession:
 
     Fills: spreads come from quotes fetched just before ``on_decision``; after it, each symbol
     with a queued order fills at a fresh quote, stamped with the session clock, with the last
-    closed bar's volume for participation. A failed quote means no spread and no fill for that
+    closed bar's volume for participation. A fill can lag the decision by those quote fetches
+    (each up to about 91 s while the exchange retries); the engine's entry expiry at T + one
+    decision width bounds the lag of an entry. A failed quote means no spread and no fill for that
     symbol at this decision: a queued entry then expires at the next decision (the engine's
     rule), a queued exit is retried on every poll until it fills. The kill file is checked on
     every poll: it halts (open or flat) and flattens at once, not only at the next decision.
@@ -136,8 +138,10 @@ class PaperSession:
         are appended to the same run. Base bars that closed while the process was down are
         replayed in order through ``on_minute`` at the first poll, so a stop or target hit during
         the downtime is honoured at the bar where it happened. Decisions missed during the
-        downtime are NOT replayed: the first poll skips (and alerts) a decision whose wait has
-        ended, and the session continues at the next live decision. Queued entries are not
+        downtime are NOT replayed: the first poll skips a decision whose wait has ended (logged
+        at info, not alerted: it closed before this process started), and the session continues
+        at the next live decision. A ``stopped_at`` marker of the previous clean stop is cleared
+        as soon as the run is locked, before the warm-up. Queued entries are not
         saved: ``run_forever`` cancels them on a clean stop, while after a hard kill (SIGKILL)
         an approved entry is left without a closing decision row.
         """
@@ -161,6 +165,8 @@ class PaperSession:
             with Session(self._db) as session:
                 state.check_resumable(session, resume_run_id, self.cfg)  # fail before warm-up
             self._lock(resume_run_id)
+            with session_scope(self._db) as session:  # a resume dying in warm-up is not "stopped"
+                state.clear_stopped(session, resume_run_id)
         for symbol in self._symbols:
             self._download(symbol, now - self._history, now)
         with session_scope(self._db) as session:
@@ -199,6 +205,7 @@ class PaperSession:
         once per incident, and the next poll runs as usual.
         """
         self._stop_signal = None
+        self._stopped_at = None
         previous = {
             sig: signal.signal(sig, self._request_stop) for sig in (signal.SIGINT, signal.SIGTERM)
         }
@@ -435,7 +442,7 @@ class PaperSession:
         with_bar = [s for s in self._symbols if s in latest and latest[s] >= ts]
         windows = self._windows(ts, with_bar)
         quotes = {s: q for s in self._symbols if (q := self._quote(s)) is not None}
-        if self._missed(ts):  # each quote may have retried for half a minute
+        if self._missed(ts):  # a quote can take about 91 s: 5 retries (31 s backoff) + timeouts
             return None
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice
