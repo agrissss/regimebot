@@ -6,7 +6,12 @@ import pandas as pd
 import pytest
 from synth import BTC, T0, regime_walk
 
-from regimebot.backtest.baselines import buy_and_hold, random_entry
+from regimebot.backtest.baselines import (
+    buy_and_hold,
+    calibrate_p,
+    compute_baselines,
+    random_entry,
+)
 from regimebot.config import AppConfig, CostsConfig, load_config
 from regimebot.types import Regime
 
@@ -68,17 +73,10 @@ def walk_cfg() -> tuple[AppConfig, dict[str, pd.DataFrame]]:
     return cfg, {BTC: regime_walk(3 * 1440, seed=5)}
 
 
-def run_random(seed: int, signals: int = 60) -> list[tuple[object, ...]]:
+def run_random(seed: int, p: float = 0.2) -> list[tuple[object, ...]]:
     cfg, candles = walk_cfg()
     result = random_entry(
-        cfg,
-        candles,
-        {},
-        T0 + timedelta(days=1),
-        T0 + timedelta(days=3),
-        seed,
-        n_reference_signals=signals,
-        n_decision_bars=192,
+        cfg, candles, {}, T0 + timedelta(days=1), T0 + timedelta(days=3), seed, p=p
     )
     return [(s.ts, s.side, s.stop, s.strategy) for s in result.log.signals]
 
@@ -91,5 +89,53 @@ def test_random_entry_is_deterministic_for_a_seed_and_differs_across_seeds() -> 
     assert {row[1] for row in first} == {"long", "short"}
 
 
-def test_random_entry_with_no_reference_signals_never_enters() -> None:
-    assert run_random(1, signals=0) == []
+def test_random_entry_with_zero_probability_never_enters() -> None:
+    assert run_random(1, p=0.0) == []
+
+
+def calibration_inputs() -> dict[str, object]:
+    cfg, candles = walk_cfg()
+    return {
+        "cfg": cfg,
+        "candles": candles,
+        "funding": {},
+        "start": T0 + timedelta(days=1),
+        "end": T0 + timedelta(days=3),
+    }
+
+
+def test_calibration_matches_the_reference_signal_count() -> None:
+    inputs = calibration_inputs()
+    reference = len(run_random(9, p=0.15))
+    assert reference > 5
+    p = calibrate_p(**inputs, n_reference_signals=reference, n_decision_bars=192)  # type: ignore[arg-type]  # dict of kwargs
+    counts = [len(run_random(seed, p=p)) for seed in (0, 1, 2)]
+    mean = sum(counts) / len(counts)
+    assert abs(mean - reference) <= max(0.35 * reference, 3), (counts, reference, p)
+
+
+def test_calibration_handles_no_realised_signals_and_no_reference() -> None:
+    inputs = calibration_inputs()
+    # naive p0 is about 1e-9, so nothing is signalled (N1 == 0): finite, within [0, 1]
+    p = calibrate_p(**inputs, n_reference_signals=1, n_decision_bars=10**9)  # type: ignore[arg-type]  # dict of kwargs
+    assert 0.0 <= p <= 1.0
+    assert calibrate_p(**inputs, n_reference_signals=0, n_decision_bars=192) == 0.0  # type: ignore[arg-type]  # dict of kwargs
+
+
+def test_compute_baselines_is_deterministic_for_a_seed_tuple() -> None:
+    cfg, candles = walk_cfg()
+    ref = random_entry(cfg, candles, {}, T0, T0 + timedelta(days=3), 4, p=0.1)
+    a = compute_baselines(ref, candles, {}, len(ref.log.signals), seeds=(0, 1))
+    b = compute_baselines(ref, candles, {}, len(ref.log.signals), seeds=(0, 1))
+    assert a.random_p == b.random_p and a.random_seeds == (0, 1)
+    assert [len(r.log.signals) for r in a.random_entry] == [
+        len(r.log.signals) for r in b.random_entry
+    ]
+    assert [r.trades for r in a.random_entry] == [r.trades for r in b.random_entry]
+
+
+def test_buy_and_hold_rejects_a_symbol_without_bars() -> None:
+    with pytest.raises(ValueError, match="no decision bars.*B"):
+        buy_and_hold(
+            {"A": decision_closes([1.0]), "B": decision_closes([1.0]).iloc[:0]}, 100.0, FREE
+        )

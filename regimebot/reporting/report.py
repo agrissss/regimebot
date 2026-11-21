@@ -9,8 +9,9 @@ import base64
 import html
 import io
 import math
+from collections import Counter
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Literal
 
@@ -22,15 +23,18 @@ from regimebot.backtest.runner import BacktestResult
 from regimebot.config import config_hash
 from regimebot.reporting.metrics import (
     Metrics,
+    active_period,
     best_trades_dropped,
     breakdown,
     compute_metrics,
     daily_equity,
+    first_permanent_halt,
     max_drawdown,
+    median_or_nan,
     sharpe_ratio,
     sortino_ratio,
 )
-from regimebot.types import RiskEvent
+from regimebot.types import RiskEvent, Trade
 
 RISK_WARNING = (
     "Crypto trading involves substantial risk, and you can lose all of the money you put in.",
@@ -59,23 +63,23 @@ def _num(x: float, fmt: str = ".2f") -> str:
     return format(x, fmt)
 
 
-def money(x: float) -> str:
+def _money(x: float) -> str:
     return _num(x, ",.2f")
 
 
-def pct(x: float) -> str:
+def _pct(x: float) -> str:
     return "n/a" if math.isnan(x) else _num(x * 100) + "%"
 
 
-def ratio(x: float) -> str:
+def _ratio(x: float) -> str:
     return _num(x)
 
 
-def bps(x: float) -> str:
+def _bps(x: float) -> str:
     return "n/a" if math.isnan(x) else _num(x) + " bps"
 
 
-def count(x: float) -> str:
+def _count(x: float) -> str:
     return _num(x, ",.0f")
 
 
@@ -100,12 +104,23 @@ def _equity_chart(result: BacktestResult, baselines: Baselines, path: Path) -> s
     ax = fig.subplots()
     ax.plot(result.equity.index, result.equity.to_numpy(), label="strategy")
     if baselines.buy_and_hold is not None:
+        bh = baselines.buy_and_hold
+        ax.plot(bh.index, bh.to_numpy(), label="buy and hold (active period)")
+    if (
+        baselines.buy_and_hold_full is not None
+        and baselines.buy_and_hold is not baselines.buy_and_hold_full
+    ):
+        full = baselines.buy_and_hold_full
+        ax.plot(full.index, full.to_numpy(), label="buy and hold (full period)", linestyle=":")
+    for i, rnd in enumerate(baselines.random_entry):
         ax.plot(
-            baselines.buy_and_hold.index, baselines.buy_and_hold.to_numpy(), label="buy and hold"
+            rnd.equity.index,
+            rnd.equity.to_numpy(),
+            label="random entry (each seed)" if i == 0 else None,
+            color="gray",
+            alpha=0.5,
+            linewidth=0.8,
         )
-    if baselines.random_entry is not None:
-        rnd = baselines.random_entry.equity
-        ax.plot(rnd.index, rnd.to_numpy(), label="random entry")
     ax.set_title("Equity (after all modelled costs)")
     ax.legend()
     fig.autofmt_xdate()
@@ -139,36 +154,73 @@ def _bh_column(bh: pd.Series | None, initial: float) -> dict[str, str]:
         return {}
     final = float(bh.iloc[-1])
     return {
-        "Net P&L": money(final - initial),
-        "Return": pct(final / initial - 1),
-        "Max drawdown": pct(max_drawdown(bh, initial)),
-        "Sharpe (daily, annualised)": ratio(sharpe_ratio(bh)),
-        "Sortino (daily, annualised)": ratio(sortino_ratio(bh)),
+        "Net P&L": _money(final - initial),
+        "Return": _pct(final / initial - 1),
+        "Max drawdown": _pct(max_drawdown(bh, initial)),
+        "Sharpe (daily, annualised)": _ratio(sharpe_ratio(bh)),
+        "Sortino (daily, annualised)": _ratio(sortino_ratio(bh)),
     }
 
 
 def _metric_column(m: Metrics) -> dict[str, str]:
     return {
-        "Net P&L": money(m.net_pnl),
-        "Return": pct(m.return_pct),
-        "Max drawdown": pct(m.max_drawdown),
-        "Sharpe (daily, annualised)": ratio(m.sharpe),
-        "Sortino (daily, annualised)": ratio(m.sortino),
-        "Profit factor": ratio(m.profit_factor),
-        "Win rate": pct(m.win_rate),
-        "Average win": money(m.avg_win),
-        "Average loss": money(m.avg_loss),
-        "Expectancy (R per trade)": ratio(m.expectancy_r),
-        "Trades": count(m.n_trades),
-        "Average bars held": ratio(m.avg_bars_held),
-        "Exposure (share of decision bars in a position)": pct(m.exposure_pct),
-        "Turnover (entry notional / initial equity)": ratio(m.turnover),
-        "Fees paid": money(m.fees),
-        "Funding paid (negative = received)": money(m.funding),
-        "Target hit rate": pct(m.target_hit_rate),
-        "Stop-out rate": pct(m.stop_out_rate),
-        "Net P&L without the best 5% of trades": money(m.net_pnl_without_best_5pct),
+        "Net P&L": _money(m.net_pnl),
+        "Return": _pct(m.return_pct),
+        "Max drawdown": _pct(m.max_drawdown),
+        "Sharpe (daily, annualised)": _ratio(m.sharpe),
+        "Sortino (daily, annualised)": _ratio(m.sortino),
+        "Profit factor": _ratio(m.profit_factor),
+        "Win rate": _pct(m.win_rate),
+        "Average win": _money(m.avg_win),
+        "Average loss": _money(m.avg_loss),
+        "Expectancy (R per trade)": _ratio(m.expectancy_r),
+        "Trades": _count(m.n_trades),
+        "Average bars held": _ratio(m.avg_bars_held),
+        "Exposure (share of decision bars in a position)": _pct(m.exposure_pct),
+        "Turnover (entry notional / initial equity)": _ratio(m.turnover),
+        "Fees paid": _money(m.fees),
+        "Funding paid (negative = received)": _money(m.funding),
+        "Target hit rate": _pct(m.target_hit_rate),
+        "Stop-out rate": _pct(m.stop_out_rate),
+        "Net P&L without the best 5% of trades": _money(m.net_pnl_without_best_5pct),
     }
+
+
+def _active_metrics(result: BacktestResult) -> tuple[Metrics, RiskEvent | None]:
+    """Metrics over the active period (up to a permanent halt) and that halt event, if any."""
+    trades, equity, halt = active_period(result.trades, result.equity, result.log.risk_events)
+    initial = result.cfg.backtest.initial_equity
+    return compute_metrics(trades, equity, initial, result.log.fills), halt
+
+
+def _median_metrics(all_metrics: Sequence[Metrics]) -> Metrics:
+    """Field-wise median over seeds (NaN ignored)."""
+    values = {
+        f.name: median_or_nan([float(getattr(m, f.name)) for m in all_metrics])
+        for f in fields(Metrics)
+    }
+    values["n_trades"] = round(values["n_trades"])
+    return Metrics(**values)  # type: ignore[arg-type]  # n_trades was rounded to an int above
+
+
+def _random_column(baselines: Baselines) -> dict[str, str]:
+    if not baselines.random_entry:
+        return {}
+    metrics = [_active_metrics(r)[0] for r in baselines.random_entry]
+    col = _metric_column(_median_metrics(metrics))
+    pnls = [m.net_pnl for m in metrics]
+    col["Net P&L"] = f"{_money(median_or_nan(pnls))} ({_money(min(pnls))} to {_money(max(pnls))})"
+    return col
+
+
+def _halt_sentence(result: BacktestResult, halt: RiskEvent | None) -> str:
+    if halt is None:
+        return ""
+    return (
+        f"<p><strong>Trading halted on {html.escape(halt.ts.isoformat())} "
+        f"({html.escape(halt.kind)}). No entries after that; results below cover "
+        f"{result.start.isoformat()} to {html.escape(halt.ts.isoformat())}.</strong></p>"
+    )
 
 
 def _headline(result: BacktestResult, baselines: Baselines, strategy: Metrics) -> str:
@@ -176,16 +228,57 @@ def _headline(result: BacktestResult, baselines: Baselines, strategy: Metrics) -
     cols = [
         _metric_column(strategy),
         _bh_column(baselines.buy_and_hold, initial),
-        {} if baselines.random_entry is None else _metric_column(_metrics(baselines.random_entry)),
+        _random_column(baselines),
     ]
     rows = [[label, *(c.get(label, "n/a") for c in cols)] for label in cols[0]]
-    return _table(["Metric", "Strategy", "Buy and hold", "Random entry (one seed)"], rows)
-
-
-def _metrics(result: BacktestResult) -> Metrics:
-    return compute_metrics(
-        result.trades, result.equity, result.cfg.backtest.initial_equity, result.log.fills
+    out = _table(
+        ["Metric", "Strategy", "Buy and hold", "Random entry (median of seeds, range)"], rows
     )
+    full = baselines.buy_and_hold_full
+    if full is not None and full is not baselines.buy_and_hold:
+        c = _bh_column(full, initial)
+        out += (
+            "<p>Buy and hold over the full period "
+            f"{result.start.isoformat()} to {result.end.isoformat()} (not comparable with the "
+            f"columns above): net P&amp;L {c['Net P&L']}, return {c['Return']}, "
+            f"max drawdown {c['Max drawdown']}.</p>"
+        )
+    return out
+
+
+def _random_html(result: BacktestResult, baselines: Baselines) -> str:
+    if not baselines.random_entry:
+        return "<p>Random-entry baseline not computed (n/a).</p>"
+    rows = []
+    ref, _ = _active_metrics(result)
+    rows.append(
+        [
+            "Strategy (reference)",
+            _count(baselines.reference_signals)
+            if baselines.reference_signals is not None
+            else "n/a",
+            _count(ref.n_trades),
+            _money(ref.net_pnl),
+            "yes" if first_permanent_halt(result.log.risk_events) else "no",
+        ]
+    )
+    for seed, run in zip(baselines.random_seeds, baselines.random_entry, strict=True):
+        m, halt = _active_metrics(run)
+        rows.append(
+            [f"Random seed {seed}", _count(len(run.log.signals)), _count(m.n_trades),
+             _money(m.net_pnl), "yes" if halt else "no"]
+        )  # fmt: skip
+    p = baselines.random_p
+    note = (
+        "<p>Random entry reruns the real engine, playbook and risk limits with entries drawn at "
+        f"random (calibrated probability {'n/a' if p is None else f'{p:.5f}'} per question, set "
+        "so the number of signals matches the strategy's). It uses breakout's ATR stop and "
+        "target geometry and is only asked in regimes where breakout is allowed, so it never "
+        "trades regimes the playbook closes to breakout (such as range). Each seed runs under the "
+        "same risk limits as the strategy and is reported over its own active period if it "
+        f"halts. Seeds used: {', '.join(str(x) for x in baselines.random_seeds)}.</p>"
+    )
+    return _table(["Run", "Signals", "Trades", "Net P&L", "Permanent halt"], rows) + note
 
 
 def _breakdown_html(
@@ -193,7 +286,7 @@ def _breakdown_html(
 ) -> str:
     df = breakdown(result.trades, by)
     rows = [
-        [str(key), count(r.n), pct(r.win_rate), money(r.net_pnl), ratio(r.expectancy_r)]
+        [str(key), _count(r.n), _pct(r.win_rate), _money(r.net_pnl), _ratio(r.expectancy_r)]
         for key, r in df.iterrows()
     ]
     return _table(
@@ -205,16 +298,17 @@ def _slippage_html(result: BacktestResult, m: Metrics) -> str:
     costs = result.cfg.costs
     floor = costs.half_spread_bps + costs.slippage_bps
     rows = [
-        ["Modelled floor (half spread + fixed slippage)", bps(floor), bps(floor)],
+        ["Modelled floor (half spread + fixed slippage)", _bps(floor), _bps(floor)],
         [
             "Realised average slippage of taker fills",
-            bps(m.avg_entry_slippage_bps),
-            bps(m.avg_exit_slippage_bps),
+            _bps(m.avg_entry_slippage_bps),
+            _bps(m.avg_exit_slippage_bps),
         ],
     ]
     note = (
         "<p>The floor is what the cost model charges even on a tiny order. Realised slippage also "
-        "includes the volume-impact term, and exits by stop pay it on top of the stop price. "
+        "includes the volume-impact term, the move from the decision close to the next open "
+        "(entries fill there), and gaps through stop prices. "
         f"Taker fee: {_num(costs.taker_fee_bps)} bps per side. All of it is already in the P&amp;L "
         "above.</p>"
     )
@@ -222,15 +316,24 @@ def _slippage_html(result: BacktestResult, m: Metrics) -> str:
 
 
 def _events_html(events: Sequence[RiskEvent]) -> str:
+    """Counts by kind, every halt event, then at most ``MAX_EVENT_ROWS`` other events."""
     if not events:
         return "<p>No risk-limit events were triggered.</p>"
-    rows = [[e.ts.isoformat(), e.kind, e.action, e.detail] for e in events[:MAX_EVENT_ROWS]]
-    note = (
-        f"<p>{len(events)} events; showing the first {MAX_EVENT_ROWS}.</p>"
-        if len(events) > MAX_EVENT_ROWS
-        else ""
+    counts = Counter((e.kind, e.action) for e in events)
+    summary = _table(
+        ["Kind", "Action", "Count"], [[k, a, _count(n)] for (k, a), n in sorted(counts.items())]
     )
-    return note + _table(["Time (UTC)", "Kind", "Action", "Detail"], rows)
+    halts = [e for e in events if e.action == "halt"]
+    others = [e for e in events if e.action != "halt"]
+    shown = halts + others[:MAX_EVENT_ROWS]
+    rows = [[e.ts.isoformat(), e.kind, e.action, e.detail] for e in shown]
+    note = ""
+    if len(others) > MAX_EVENT_ROWS:
+        note = (
+            f"<p>All {len(halts)} halt events are listed, plus the first {MAX_EVENT_ROWS} of "
+            f"{len(others)} other events.</p>"
+        )
+    return summary + note + _table(["Time (UTC)", "Kind", "Action", "Detail"], rows)
 
 
 def _section(title: str, body: str) -> str:
@@ -247,8 +350,10 @@ def write_report(
     ``drawdown.png`` into ``out_dir`` and return the HTML path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = result.cfg
-    metrics = _metrics(result)
-    pd.DataFrame([asdict(t) for t in result.trades]).to_csv(out_dir / "trades.csv", index=False)
+    metrics, halt = _active_metrics(result)
+    pd.DataFrame(
+        [asdict(t) for t in result.trades], columns=[f.name for f in fields(Trade)]
+    ).to_csv(out_dir / "trades.csv", index=False)
     _daily_pnl(result.equity, cfg.backtest.initial_equity).to_csv(out_dir / "daily_pnl.csv")
     equity_png = _equity_chart(result, baselines, out_dir / "equity.png")
     drawdown_png = _drawdown_chart(result, out_dir / "drawdown.png")
@@ -269,19 +374,23 @@ def write_report(
     symbols = ", ".join(cfg.exchange.symbols)
     info = (
         f"<p>Config hash: <code>{html.escape(config_hash(cfg))}</code><br>"
-        f"Period: {result.start.isoformat()} to {result.end.isoformat()} (UTC)<br>"
+        f"Backtest period: {result.start.isoformat()} to {result.end.isoformat()} (UTC)<br>"
         f"Symbols: {html.escape(symbols)}<br>"
-        f"Initial equity: {money(cfg.backtest.initial_equity)}</p>"
-        "<p>This is one in-sample backtest on past data. Every number is net of modelled taker "
-        "fees, spread, slippage and funding. Buy and hold ignores funding and volume impact. "
-        "The random-entry column is a single random seed, so treat it as one sample, not a "
-        "distribution. If the strategy does not clearly beat both columns after costs, "
-        "there is no evidence of an edge.</p>"
+        f"Initial equity: {_money(cfg.backtest.initial_equity)}</p>"
+        f"{_halt_sentence(result, halt)}"
+        "<p>This is one in-sample backtest on past data. Every number is net of all modelled "
+        "fees (taker and maker), spread, slippage and funding. Buy and hold ignores funding and "
+        "volume impact. The random-entry column summarises a few seeds, which is still a small "
+        "sample. If the strategy does not clearly beat both columns after costs, there is no "
+        "evidence of an edge.</p>"
     )
     parts = [
         warning,
         _section("Run", info),
-        _section("Headline metrics", _headline(result, baselines, metrics)),
+        _section(
+            "Headline metrics", _halt_sentence(result, halt) + _headline(result, baselines, metrics)
+        ),
+        _section("Random-entry baseline", _random_html(result, baselines)),
         _section(
             "Equity and drawdown",
             f'<img alt="equity curve" src="data:image/png;base64,{equity_png}">'
@@ -297,7 +406,7 @@ def write_report(
             "Result without the best 5% of trades",
             f"<p>Net P&amp;L with the best {best_trades_dropped(metrics.n_trades)} "
             "trade(s) removed: "
-            f"{money(metrics.net_pnl_without_best_5pct)} (all trades: {money(metrics.net_pnl)}). "
+            f"{_money(metrics.net_pnl_without_best_5pct)} (all trades: {_money(metrics.net_pnl)}). "
             "If this is far lower or negative, the result depends on a few lucky trades.</p>",
         ),
         variants,

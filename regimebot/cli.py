@@ -333,20 +333,33 @@ def report(
     variants_tried: Annotated[
         int | None, typer.Option(help="Parameter variants tried before this one (shown).")
     ] = None,
+    random_seeds: Annotated[
+        int, typer.Option(min=0, help="Number of random-entry seeds (0, 1, ... N-1); 0 skips.")
+    ] = 3,
 ) -> None:
     """Rebuild the HTML report for a stored backtest into reports/run_<id>/.
 
     Trades, fills, risk events and equity come from the database; the baselines are recomputed
     from stored candles with the run's stored config (the random-entry rerun takes a minute or two).
     """
-    engine = make_engine(load_config().database_url)
+    database_url = load_config().database_url
+    engine = make_engine(database_url)
     with session_scope(engine) as session:
         try:
             run = repo.load_run(session, run_id)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from None
-        stored = json.loads(run.config_json) | {"database_url": load_config().database_url}
-        cfg = AppConfig.model_validate(stored)
+        if run.mode != "backtest":
+            raise typer.BadParameter(
+                f"run {run_id} is a {run.mode} run; only backtests have reports"
+            )
+        try:
+            cfg = AppConfig.model_validate(
+                json.loads(run.config_json) | {"database_url": database_url}
+            )
+        except ValidationError as exc:
+            typer.echo(f"run {run_id}: stored config no longer validates:\n{exc}", err=True)
+            raise typer.Exit(1) from None
         bt, base = cfg.backtest, cfg.exchange.base_timeframe
         trades = repo.load_trades(session, run_id)
         log = RunLog(
@@ -361,6 +374,8 @@ def report(
         candles = {s: load_candles(session, s, base, None, bt.end) for s in cfg.exchange.symbols}
         funding = {s: load_funding(session, s, None, bt.end) for s in cfg.exchange.symbols}
     typer.echo("recomputing baselines (buy and hold, random entry) ...")
-    baselines = compute_baselines(result, candles, funding, n_signals)
+    baselines = compute_baselines(
+        result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
+    )
     path = write_report(result, baselines, Path("reports") / f"run_{run_id}", variants_tried)
     typer.echo(f"wrote {path}")

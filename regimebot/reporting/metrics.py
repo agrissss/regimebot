@@ -5,6 +5,7 @@ prints NaN as "n/a". Daily statistics use the last equity value of each UTC day.
 """
 
 import math
+import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -12,15 +13,23 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from regimebot.types import ExitReason, Fill, OrderSide, Side, Trade
+from regimebot.types import ExitReason, Fill, OrderSide, RiskEvent, Side, Trade
 
 DAYS_PER_YEAR = 365  # crypto trades every day
 BEST_TRADES_DROPPED = 0.05
 _FLAT_STD = 1e-12  # a deviation below this is rounding noise, not risk
+PERMANENT_HALTS = ("max_drawdown", "manual_kill")  # stay until cleared by hand: trading ends
 
 
 @dataclass(frozen=True, slots=True)
 class Metrics:
+    """Headline numbers of one run. Units: ``net_pnl``, ``avg_win``, ``avg_loss``, ``fees``,
+    ``funding`` and ``net_pnl_without_best_5pct`` are currency; ``return_pct``, ``max_drawdown``,
+    ``win_rate``, ``exposure_pct``, ``target_hit_rate`` and ``stop_out_rate`` are fractions
+    (0.1 = 10%); ``avg_*_slippage_bps`` are basis points; ``expectancy_r`` is in R multiples;
+    ``turnover`` is a multiple of initial equity; ``sharpe``, ``sortino`` and ``profit_factor``
+    are plain ratios. NaN means "not computable from this data"."""
+
     net_pnl: float
     return_pct: float  # fraction of initial equity
     max_drawdown: float  # fraction, >= 0
@@ -203,3 +212,30 @@ def breakdown(
         }
     )
     return out.sort_index()
+
+
+def first_permanent_halt(events: Sequence[RiskEvent]) -> RiskEvent | None:
+    """The earliest halt that ends trading (``max_drawdown`` or ``manual_kill``), if any."""
+    halts = [e for e in events if e.kind in PERMANENT_HALTS and e.action == "halt"]
+    return min(halts, key=lambda e: e.ts, default=None)
+
+
+def active_period(
+    trades: Sequence[Trade], equity: pd.Series, events: Sequence[RiskEvent]
+) -> tuple[list[Trade], pd.Series, RiskEvent | None]:
+    """Trades and equity up to the first permanent halt (everything when there is none).
+
+    After such a halt the strategy sits flat, and averaging that into Sharpe or exposure would
+    flatter it, so headline metrics use this window.
+    """
+    halt = first_permanent_halt(events)
+    if halt is None:
+        return list(trades), equity, None
+    kept = [t for t in trades if t.entry_ts <= halt.ts]
+    return kept, equity[equity.index <= halt.ts], halt
+
+
+def median_or_nan(values: Sequence[float]) -> float:
+    """Median ignoring NaN; NaN when nothing is left."""
+    kept = [v for v in values if not math.isnan(v)]
+    return statistics.median(kept) if kept else math.nan

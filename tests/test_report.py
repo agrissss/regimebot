@@ -1,5 +1,7 @@
 """Report files, honesty content and HTML safety."""
 
+import math
+from dataclasses import fields
 from datetime import timedelta
 from pathlib import Path
 
@@ -11,12 +13,13 @@ from typer.testing import CliRunner
 from regimebot.backtest.baselines import Baselines, compute_baselines, random_entry
 from regimebot.backtest.runner import BacktestResult
 from regimebot.cli import app
-from regimebot.config import config_hash, load_config
+from regimebot.config import AppConfig, config_hash, load_config
 from regimebot.db import repo
 from regimebot.db.models import Run
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
+from regimebot.reporting.metrics import active_period, compute_metrics, first_permanent_halt
 from regimebot.reporting.report import RISK_WARNING, write_report
-from regimebot.types import Regime, RiskEvent
+from regimebot.types import Mode, Regime, RiskEvent, Trade
 
 HEADINGS = [
     "Risk warning",
@@ -32,8 +35,7 @@ HEADINGS = [
 ]
 
 
-@pytest.fixture(scope="module")
-def run() -> tuple[BacktestResult, Baselines]:
+def open_cfg(**extra: object) -> AppConfig:
     entry = {
         "strategies": ["breakout"],
         "size_mult": 1.0,
@@ -41,14 +43,25 @@ def run() -> tuple[BacktestResult, Baselines]:
         "force_close": False,
     }
     overrides: dict[str, object] = {f"playbook.{r.value}": entry for r in Regime}
-    cfg = load_config(overrides={"exchange.symbols": [BTC], **overrides})
+    return load_config(overrides={"exchange.symbols": [BTC], **overrides, **extra})
+
+
+@pytest.fixture(scope="module")
+def run() -> tuple[BacktestResult, Baselines]:
+    """A reference that halts permanently (tiny max drawdown), with baselines for two seeds."""
+    cfg = open_cfg(**{"risk.max_drawdown": 0.003})
     candles, start, end = {BTC: regime_walk(3 * 1440, seed=5)}, T0, T0 + timedelta(days=3)
-    result = random_entry(
-        cfg, candles, {}, start, end, 7, n_reference_signals=90, n_decision_bars=288
+    result = random_entry(cfg, candles, {}, start, end, 7, p=0.3)
+    assert result.trades and first_permanent_halt(result.log.risk_events) is not None
+    halt = first_permanent_halt(result.log.risk_events)
+    assert halt is not None and halt.ts < result.equity.index[-1]
+    result.log.risk_events.append(RiskEvent(start, "<b>kind</b>", "<script>x</script>", "skip"))
+    result.log.risk_events.extend(
+        RiskEvent(halt.ts + timedelta(minutes=i), "stale_data", "d", "skip_symbol")
+        for i in range(60)
     )
-    assert result.trades
-    result.log.risk_events.append(RiskEvent(start, "<b>kind</b>", "<script>x</script>", "halt"))
-    return result, compute_baselines(result, candles, {}, n_signals=len(result.log.signals))
+    baselines = compute_baselines(result, candles, {}, len(result.log.signals), seeds=(0, 1))
+    return result, baselines
 
 
 def test_files_are_created_and_html_is_self_contained(
@@ -75,7 +88,7 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     text = write_report(result, baselines, tmp_path, n_variants_tried=12).read_text("utf-8")
     assert text.index("Risk warning") < min(text.index(h) for h in HEADINGS[1:])
     for h in HEADINGS:
-        assert f"<h2>{h}</h2>" in text or f">{h}</h2>" in text
+        assert f">{h}</h2>" in text
     for sentence in RISK_WARNING:
         assert sentence in text
     assert len(RISK_WARNING) == 6
@@ -83,6 +96,66 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     assert "12 parameter variants" in text and "likely overstated" in text
     assert "Buy and hold" in text and "Random entry" in text
     assert "Parameter variants tried" in text
+    assert "all modelled fees (taker and maker)" in text
+    assert "gaps through stop prices" in text and "next open" in text
+    assert "only asked in regimes where breakout is allowed" in text
+    assert "Seeds used: 0, 1" in text and "Random seed 1" in text and "Strategy (reference)" in text
+
+
+def test_halted_run_reports_the_active_period_and_truncated_baselines(
+    run: tuple[BacktestResult, Baselines], tmp_path: Path
+) -> None:
+    result, baselines = run
+    text = write_report(result, baselines, tmp_path).read_text("utf-8")
+    halt = first_permanent_halt(result.log.risk_events)
+    assert halt is not None
+    sentence = f"Trading halted on {halt.ts.isoformat()} ({halt.kind}). No entries after that;"
+    assert text.count(sentence) == 2  # headline block and Run section
+    assert f"results below cover {result.start.isoformat()} to {halt.ts.isoformat()}" in text
+    # metrics are those of the truncated trades and equity
+    trades, equity, _ = active_period(result.trades, result.equity, result.log.risk_events)
+    assert len(equity) < len(result.equity)
+    m = compute_metrics(trades, equity, result.cfg.backtest.initial_equity, result.log.fills)
+    assert f"<td>{m.net_pnl:,.2f}</td>" in text
+    assert (
+        f"<td>{'n/a' if math.isnan(m.sharpe) else f'{m.sharpe:.2f}'}</td>" in text
+        and f"<td>{m.exposure_pct * 100:.2f}%</td>" in text
+    )
+    # buy and hold: active period beside the strategy, the full period as a separate line
+    bh, full = baselines.buy_and_hold, baselines.buy_and_hold_full
+    assert bh is not None and full is not None
+    assert bh.index[-1] <= halt.ts < full.index[-1]
+    initial = result.cfg.backtest.initial_equity
+    assert f"<td>{bh.iloc[-1] - initial:,.2f}</td>" in text
+    assert "Buy and hold over the full period" in text and f"{full.iloc[-1] - initial:,.2f}" in text
+
+
+def test_events_always_list_halts_summarise_counts_and_cap_the_rest(
+    run: tuple[BacktestResult, Baselines], tmp_path: Path
+) -> None:
+    result, baselines = run
+    text = write_report(result, baselines, tmp_path).read_text("utf-8")
+    halt = first_permanent_halt(result.log.risk_events)
+    assert halt is not None
+    assert f"<td>{halt.ts.isoformat()}</td><td>max_drawdown</td><td>halt</td>" in text
+    assert "<td>stale_data</td><td>skip_symbol</td><td>60</td>" in text  # count summary
+    assert "plus the first 50 of 61 other events" in text
+    assert (
+        text.count("<td>stale_data</td><td>skip_symbol</td><td>d</td>") == 49
+    )  # 50 others, one is the escaped event
+
+
+def test_slippage_table_shows_floor_and_realised_values(
+    run: tuple[BacktestResult, Baselines], tmp_path: Path
+) -> None:
+    result, baselines = run
+    text = write_report(result, baselines, tmp_path).read_text("utf-8")
+    m = compute_metrics(result.trades, result.equity, 1.0, result.log.fills)
+    costs = result.cfg.costs
+    floor = f"{costs.half_spread_bps + costs.slippage_bps:.2f} bps"
+    assert f"<td>{floor}</td><td>{floor}</td>" in text
+    entry, exit_ = m.avg_entry_slippage_bps, m.avg_exit_slippage_bps
+    assert f"<td>{entry:.2f} bps</td><td>{exit_:.2f} bps</td>" in text
 
 
 def test_variants_section_absent_when_not_supplied_and_missing_baselines_show_na(
@@ -102,14 +175,13 @@ def test_untrusted_text_is_escaped(run: tuple[BacktestResult, Baselines], tmp_pa
 
 
 def test_report_with_no_trades_still_renders(tmp_path: Path) -> None:
-    cfg = load_config(overrides={"exchange.symbols": [BTC]})
     candles = {BTC: regime_walk(1440, seed=3)}
-    result = random_entry(
-        cfg, candles, {}, T0, T0 + timedelta(days=1), 1, n_reference_signals=0, n_decision_bars=96
-    )
+    result = random_entry(open_cfg(), candles, {}, T0, T0 + timedelta(days=1), 1, p=0.0)
     assert not result.trades
     text = write_report(result, Baselines(), tmp_path).read_text("utf-8")
     assert "No risk-limit events" in text and "n/a" in text
+    header = (tmp_path / "trades.csv").read_text().strip()
+    assert header == ",".join(f.name for f in fields(Trade))
 
 
 def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
@@ -141,4 +213,8 @@ def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
     html_text = (tmp_path / "reports" / f"run_{run.id}" / "report.html").read_text("utf-8")
     assert "3 parameter variants" in html_text and run.config_hash in html_text
     assert runner.invoke(app, ["report", "999"]).exit_code != 0
+    with session_scope(engine) as session:
+        paper_id = repo.create_run(session, Mode.PAPER, load_config())
+    refused = runner.invoke(app, ["report", str(paper_id)])
+    assert refused.exit_code != 0 and "paper run" in refused.output
     engine.dispose()

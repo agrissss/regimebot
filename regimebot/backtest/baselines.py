@@ -7,27 +7,40 @@ signal adds over coin flips with the same stop/target geometry and similar trade
 
 import math
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import structlog
 
 from regimebot.backtest.runner import BacktestResult, run_backtest
 from regimebot.config import AppConfig, BreakoutConfig, CostsConfig
 from regimebot.data.resample import resample
+from regimebot.reporting.metrics import first_permanent_halt
 from regimebot.strategy.base import build_signal
 from regimebot.types import Regime, Side, Signal
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
 class Baselines:
-    """Either part may be None (not computed): the report then shows "n/a"."""
+    """What the strategy is compared with; missing parts show as "n/a" in the report.
+
+    ``buy_and_hold`` covers the strategy's active period (up to a permanent halt), and
+    ``buy_and_hold_full`` the whole backtest. ``random_entry`` holds one result per seed, all run
+    with the calibrated entry probability ``random_p``.
+    """
 
     buy_and_hold: pd.Series | None = None
-    random_entry: BacktestResult | None = None
+    buy_and_hold_full: pd.Series | None = None
+    random_entry: tuple[BacktestResult, ...] = ()
+    random_seeds: tuple[int, ...] = ()
+    random_p: float | None = None
+    reference_signals: int | None = None
 
 
 def buy_and_hold(
@@ -45,6 +58,8 @@ def buy_and_hold(
     """
     if not candles:
         raise ValueError("buy_and_hold needs at least one symbol")
+    if empty := [s for s, df in candles.items() if df.empty]:
+        raise ValueError(f"no decision bars in the window for {', '.join(empty)}")
     slip = (costs.half_spread_bps + costs.slippage_bps) / 1e4
     fee = costs.taker_fee_bps / 1e4
     index = pd.DatetimeIndex(sorted(set().union(*(df.index for df in candles.values()))))
@@ -102,22 +117,44 @@ def random_entry(
     end: datetime,
     seed: int,
     *,
-    n_reference_signals: int,
-    n_decision_bars: int,
+    p: float,
 ) -> BacktestResult:
-    """Rerun the engine with random entries at the reference's signal frequency.
+    """Rerun the real engine with entries at random, probability ``p`` per call.
 
-    p = reference signals / (decision bars * symbols), i.e. the per-call rate of the reference
-    (the engine asks each symbol once per decision bar). The engine only asks while flat and
-    in an allowed regime, so the realised count is near, not equal to, the reference.
+    The engine only asks a strategy while a symbol is flat, trading is not halted and the regime
+    allows "breakout", so ``p`` per call is not a per-bar rate; ``calibrate_p`` finds the value
+    that reproduces a reference signal count.
     """
-    calls = max(n_decision_bars * len(cfg.exchange.symbols), 1)
-    p = min(max(n_reference_signals / calls, 0.0), 1.0)
-    strategy = RandomEntry(cfg.strategies.breakout, p, seed)
+    strategy = RandomEntry(cfg.strategies.breakout, min(max(p, 0.0), 1.0), seed)
     with tempfile.TemporaryDirectory() as tmp:
         return run_backtest(
             cfg, candles, funding, start, end, Path(tmp) / "KILL", strategies=[strategy]
         )
+
+
+def calibrate_p(
+    cfg: AppConfig,
+    candles: Mapping[str, pd.DataFrame],
+    funding: Mapping[str, pd.Series],
+    start: datetime,
+    end: datetime,
+    *,
+    n_reference_signals: int,
+    n_decision_bars: int,
+    seed: int = 0,
+) -> float:
+    """Entry probability that makes random entry signal about as often as the reference.
+
+    Start from the naive p0 = signals / (decision bars * symbols), run once, count the realised
+    signals N1 and rescale: p1 = min(1, p0 * reference / max(N1, 1)). One pass is enough
+    because signals grow roughly in proportion to p.
+    """
+    calls = max(n_decision_bars * len(cfg.exchange.symbols), 1)
+    p0 = min(max(n_reference_signals / calls, 0.0), 1.0)
+    n1 = len(random_entry(cfg, candles, funding, start, end, seed, p=p0).log.signals)
+    p1 = min(1.0, p0 * n_reference_signals / max(n1, 1))
+    log.info("random_entry_calibrated", p0=p0, n1=n1, reference=n_reference_signals, p1=p1)
+    return p1
 
 
 def compute_baselines(
@@ -125,29 +162,40 @@ def compute_baselines(
     candles: Mapping[str, pd.DataFrame],
     funding: Mapping[str, pd.Series],
     n_signals: int,
-    seed: int = 0,
+    seeds: Sequence[int] = (0, 1, 2),
 ) -> Baselines:
-    """Both baselines for ``result`` from base-timeframe ``candles`` (``n_signals`` = the
-    reference run's signal count)."""
+    """Baselines for ``result`` from base-timeframe ``candles`` (``n_signals`` = the reference
+    run's signal count). Buy and hold is given for the active period (up to the reference's
+    first permanent halt) and the full period; random entry runs once per seed at a calibrated
+    probability, under the same risk limits as the reference."""
     cfg = result.cfg
     decision = {
         s: resample(df, cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe)
         for s, df in candles.items()
     }
-    window = {
-        s: df[(df.index >= pd.Timestamp(result.start)) & (df.index < pd.Timestamp(result.end))]
-        for s, df in decision.items()
-    }
-    bh = buy_and_hold(window, cfg.backtest.initial_equity, cfg.costs)
-    n_bars = len(result.equity.index.unique())
-    rnd = random_entry(
-        cfg,
-        candles,
-        funding,
-        result.start,
-        result.end,
-        seed,
-        n_reference_signals=n_signals,
-        n_decision_bars=n_bars,
-    )
-    return Baselines(bh, rnd)
+    lo, hi = pd.Timestamp(result.start), pd.Timestamp(result.end)
+    window = {s: df[(df.index >= lo) & (df.index < hi)] for s, df in decision.items()}
+    full = buy_and_hold(window, cfg.backtest.initial_equity, cfg.costs)
+    halt = first_permanent_halt(result.log.risk_events)
+    active = full
+    if halt is not None:
+        until = {s: df[df.index <= halt.ts] for s, df in window.items()}
+        active = buy_and_hold(until, cfg.backtest.initial_equity, cfg.costs)
+    seeds = tuple(seeds)
+    runs: tuple[BacktestResult, ...] = ()
+    p = None
+    if seeds:
+        p = calibrate_p(
+            cfg,
+            candles,
+            funding,
+            result.start,
+            result.end,
+            n_reference_signals=n_signals,
+            n_decision_bars=len(result.equity.index.unique()),
+            seed=seeds[0],
+        )
+        runs = tuple(
+            random_entry(cfg, candles, funding, result.start, result.end, s, p=p) for s in seeds
+        )
+    return Baselines(active, full, runs, seeds, p, n_signals)
