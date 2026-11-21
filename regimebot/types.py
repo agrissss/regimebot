@@ -131,7 +131,7 @@ class RiskEvent:
     action: str  # what the system did, e.g. "halt", "flatten", "skip_symbol"
 
 
-def side_sign(side: Side) -> int:
+def side_sign(side: Side | str) -> int:
     """Return +1 for LONG and -1 for SHORT (multiplier for price moves).
 
     Accepts the plain strings too (DB/pandas values); anything else raises ValueError.

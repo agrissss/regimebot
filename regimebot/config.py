@@ -24,6 +24,7 @@ Timeframe = Literal["1m", "5m", "15m", "1h", "4h"]
 StrategyName = Literal["breakout", "trend", "mean_reversion"]
 Fraction = Annotated[float, Field(gt=0, le=1)]
 NonNegative = Annotated[float, Field(ge=0)]
+Bps = Annotated[float, Field(ge=0, le=1000)]  # 1000 bps = 10%
 UnitFraction = Annotated[float, Field(ge=0, le=1)]  # 0 allowed, e.g. size_mult 0.0
 
 _TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
@@ -49,12 +50,24 @@ class ExchangeConfig(_Model):
 
 
 class CostsConfig(_Model):
-    taker_fee_bps: NonNegative
-    maker_fee_bps: NonNegative
-    half_spread_bps: NonNegative
-    slippage_bps: NonNegative
-    impact_bps_per_pct: NonNegative
+    taker_fee_bps: Bps
+    maker_fee_bps: Bps
+    half_spread_bps: Bps
+    slippage_bps: Bps
+    impact_bps_per_pct: Bps
     max_participation: Fraction
+
+    @model_validator(mode="after")
+    def _worst_case_cost_bounded(self) -> "CostsConfig":
+        # Worst case: spread + fixed slippage + impact at 100% of bar volume. Keeps a SELL
+        # price (bid * (1 - bps / 1e4)) far from zero.
+        worst = self.half_spread_bps + self.slippage_bps + 100 * self.impact_bps_per_pct
+        if worst >= 1000:
+            raise ValueError(
+                f"worst-case taker cost {worst:.0f} bps (half_spread + slippage + "
+                "100 * impact_bps_per_pct) must be below 1000 bps"
+            )
+        return self
 
 
 class FeaturesConfig(_Model):

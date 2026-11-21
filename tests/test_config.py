@@ -151,7 +151,15 @@ def test_empty_or_non_mapping_yaml_rejected(tmp_path: Path) -> None:
 def test_side_sign() -> None:
     assert side_sign(Side.LONG) == 1
     assert side_sign(Side.SHORT) == -1
-    assert side_sign("long") == 1  # type: ignore[arg-type]  # untyped DB/pandas value
-    assert side_sign("short") == -1  # type: ignore[arg-type]  # untyped DB/pandas value
+    assert side_sign("long") == 1
+    assert side_sign("short") == -1
     with pytest.raises(ValueError):
-        side_sign("sideways")  # type: ignore[arg-type]  # invalid on purpose
+        side_sign("sideways")
+
+
+def test_cost_bounds() -> None:
+    load_config()  # default passes
+    with pytest.raises(ValidationError, match="worst-case taker cost"):
+        load_config(overrides={"costs.impact_bps_per_pct": 10.0})  # 1000 + 3 bps
+    with pytest.raises(ValidationError):
+        load_config(overrides={"costs.slippage_bps": 1001.0})
