@@ -224,10 +224,13 @@ def _random_column(baselines: Baselines) -> dict[str, str]:
 def _halt_sentence(result: BacktestResult, halt: RiskEvent | None) -> str:
     if halt is None:
         return ""
+    _, equity, _ = active_period(result.trades, result.equity, result.log.risk_events)
+    end = equity.index[-1] if len(equity) else halt.ts  # the snapshot that realises the flatten
     return (
         f"<p><strong>Trading halted on {html.escape(halt.ts.isoformat())} "
         f"({html.escape(halt.kind)}). No entries after that; results below cover "
-        f"{result.start.isoformat()} to {html.escape(halt.ts.isoformat())}.</strong></p>"
+        f"{result.start.isoformat()} to {end.isoformat()} "
+        "(includes the kill-switch flatten).</strong></p>"
     )
 
 

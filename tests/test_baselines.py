@@ -157,10 +157,8 @@ def test_a_symbol_without_bars_by_the_cut_stays_cash() -> None:
         }
     )
     window = {"A": early, "B": late}
-    full = buy_and_hold(window, 1000.0, FREE)
     # A: 500 buys 5 units, worth 1000 at 200; B: 500 stays cash
-    assert _hold_until(window, cut, cfg, full).tolist() == [1000.0, 1500.0]
-    assert _hold_until({"B": late}, cut, cfg, full).tolist() == [1000.0, 1000.0]
+    assert _hold_until(window, cut, cfg).tolist() == [1000.0, 1500.0]
 
 
 def test_seeds_run_only_inside_the_halted_reference_period() -> None:

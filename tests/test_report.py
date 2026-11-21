@@ -99,8 +99,8 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     assert "all modelled fees (taker and maker)" in text
     assert "gaps through stop prices" in text and "next open" in text
     assert "only asked in regimes where breakout is allowed" in text
-    for run in baselines.random_entry:  # the per-seed table shows each period end
-        _, eq, _ = active_period(run.trades, run.equity, run.log.risk_events)
+    for seed_run in baselines.random_entry:  # the per-seed table shows each period end
+        _, eq, _ = active_period(seed_run.trades, seed_run.equity, seed_run.log.risk_events)
         assert f"<td>{eq.index[-1].isoformat()}</td>" in text
     assert "Period end (UTC)" in text and "Decision bars" in text
     assert "Seeds used: 0, 1" in text and "Random seed 1" in text and "Strategy (reference)" in text
@@ -115,9 +115,11 @@ def test_halted_run_reports_the_active_period_and_truncated_baselines(
     assert halt is not None
     sentence = f"Trading halted on {halt.ts.isoformat()} ({halt.kind}). No entries after that;"
     assert text.count(sentence) == 2  # headline block and Run section
-    assert f"results below cover {result.start.isoformat()} to {halt.ts.isoformat()}" in text
-    # metrics are those of the truncated trades and equity
     trades, equity, _ = active_period(result.trades, result.equity, result.log.risk_events)
+    cover = f"results below cover {result.start.isoformat()} to {equity.index[-1].isoformat()} "
+    assert cover + "(includes the kill-switch flatten)" in text
+    assert equity.index[-1] > halt.ts  # the realising snapshot is the bar after the halt
+    # metrics are those of the truncated trades and equity
     assert len(equity) < len(result.equity)
     m = compute_metrics(trades, equity, result.cfg.backtest.initial_equity, result.log.fills)
     assert f"<td>{m.net_pnl:,.2f}</td>" in text

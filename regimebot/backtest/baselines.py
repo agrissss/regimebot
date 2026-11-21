@@ -181,7 +181,7 @@ def compute_baselines(
     active, end = full, result.end
     if halt is not None:
         cut = active_equity.index[-1]  # the same cut as the strategy's headline metrics
-        active = _hold_until(window, cut, cfg, full)
+        active = _hold_until(window, cut, cfg)
         end = cut.to_pydatetime() + timedelta(microseconds=1)  # decisions are in [start, end)
     seeds = tuple(seeds)
     runs: tuple[BacktestResult, ...] = ()
@@ -201,15 +201,12 @@ def compute_baselines(
     return Baselines(active, full, runs, seeds, p, n_signals)
 
 
-def _hold_until(
-    window: Mapping[str, pd.DataFrame], cut: pd.Timestamp, cfg: AppConfig, full: pd.Series
-) -> pd.Series:
+def _hold_until(window: Mapping[str, pd.DataFrame], cut: pd.Timestamp, cfg: AppConfig) -> pd.Series:
     """Buy and hold up to ``cut``; a symbol with no bar by then stays cash (its share of equity)."""
     until = {s: df[df.index <= cut] for s, df in window.items()}
     held = {s: df for s, df in until.items() if not df.empty}
     initial = cfg.backtest.initial_equity
     cash = initial * (len(until) - len(held)) / len(until)
-    if not held:
-        return pd.Series(initial, index=full.index[full.index <= cut], name="equity")
+    # held is never empty: the cut is a decision time, so the earliest symbol has a bar by then
     equity = buy_and_hold(held, initial * len(held) / len(until), cfg.costs)
     return (equity + cash).rename("equity")
