@@ -175,6 +175,8 @@ def run_backtest(
                 windows[symbol] = feed.features.iloc[max(0, pos - WINDOW_ROWS + 1) : pos + 1]
         engine.on_decision(ts, windows)
     if decision_times:
+        # ponytail: base bars after the last decision (under one decision bar, before ``end``)
+        # are not replayed, so a stop or target there is missed; replay them first if it matters.
         engine.flatten_all(decision_times[-1], dict(portfolio.last_prices), ExitReason.END_OF_DATA)
 
     equity = pd.Series(
