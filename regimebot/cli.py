@@ -292,12 +292,13 @@ def backtest_walk_forward(
 
     Slow: every window runs one backtest per grid combination plus one test run.
     """
+    out = Path("reports")
+    out.mkdir(parents=True, exist_ok=True)  # before the long computation, so it fails fast
     cfg, candles, funding = _research_inputs(start, end, set_)
     try:
         res = walk_forward(cfg, candles, funding, cfg.backtest.start, cfg.backtest.end)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
-    out = Path("reports")
     pd.DataFrame([asdict(t) for t in res.oos_trades]).to_csv(
         out / "walk_forward_oos_trades.csv", index=False
     )
@@ -305,6 +306,11 @@ def backtest_walk_forward(
         f"out-of-sample: windows={len(res.windows)} trades={len(res.oos_trades)} "
         f"net_pnl={res.oos_net_pnl:.2f} n_variants_tried={res.n_variants_tried}"
     )
+    if res.n_test_windows_halted:
+        summary += (
+            f"\n{res.n_test_windows_halted} of {len(res.windows)} test windows hit the drawdown "
+            "halt and stopped early; use --set risk.max_drawdown=1.0 for full windows."
+        )
     _show(res.windows, out / "walk_forward_windows.csv", summary)
     typer.echo(f"wrote {out / 'walk_forward_oos_trades.csv'}")
 
@@ -320,9 +326,10 @@ def backtest_robustness(
     set_: _SetOption = None,
 ) -> None:
     """Parameter sensitivity, doubled costs, and max gross leverage 1.0 vs 1.5."""
+    out = Path("reports")
+    out.mkdir(parents=True, exist_ok=True)  # before the long computation, so it fails fast
     cfg, candles, funding = _research_inputs(start, end, set_)
     a, b = cfg.backtest.start, cfg.backtest.end
-    out = Path("reports")
     try:
         sens = sensitivity(cfg, candles, funding, a, b, param or DEFAULT_ROBUSTNESS_PARAMS)
     except ValueError as exc:

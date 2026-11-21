@@ -5,13 +5,14 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
-from synth import BTC, T0, Scripted, regime_walk
+from synth import BTC, T0, Scripted, candles_from_closes, regime_walk
 
 from regimebot.backtest import robustness
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
 from regimebot.backtest.runner import run_backtest
-from regimebot.config import AppConfig, load_config
+from regimebot.config import AppConfig, load_config, with_overrides
 from regimebot.reporting.metrics import compute_metrics
 from regimebot.types import Regime
 
@@ -46,6 +47,7 @@ def test_sensitivity_shape_and_base_row_equals_plain_run() -> None:
         "net_pnl",
         "profit_factor",
         "n_trades",
+        "halted_at",
         "note",
     ]
     assert list(df.variant) == ["-20%", "base", "+20%"] * 2
@@ -130,3 +132,18 @@ def test_cost_stress_multiplies_all_five_cost_fields(monkeypatch: pytest.MonkeyP
     for k in robustness.COST_KEYS:
         assert getattr(stressed.costs, k) == pytest.approx(3.0 * getattr(base.costs, k))
     assert stressed.costs.max_participation == base.costs.max_participation
+
+
+def test_halted_at_column_is_set_only_when_a_run_hits_the_drawdown_halt() -> None:
+    falling = {BTC: candles_from_closes(200.0 - 0.01 * np.arange(3 * 1440))}
+    base = open_cfg()
+    for max_dd, expect_halt in ((0.01, True), (1.0, False)):
+        cfg = with_overrides(base, {"risk.max_drawdown": max_dd})
+        tables = [
+            sensitivity(cfg, falling, {}, T0, END, ["risk.risk_per_trade"], strategies=stub()),
+            cost_stress(cfg, falling, {}, T0, END, strategies=stub()),
+            leverage_compare(cfg, falling, {}, T0, END, strategies=stub()),
+        ]
+        for df in tables:
+            assert (df.halted_at != "").all() == expect_halt
+            assert (df.halted_at == "").all() != expect_halt

@@ -68,7 +68,7 @@ def sensitivity(
         bases[param] = _get(cfg, param)
         if isinstance(bases[param], bool) or not isinstance(bases[param], int | float):
             raise ValueError(f"{param} is not a numeric parameter (value {bases[param]!r})")
-    base_m, _ = run_metrics(cfg, candles, funding, start, end, strategies)
+    base_m, _, base_halt = run_metrics(cfg, candles, funding, start, end, strategies)
     rows = []
     for param, base in bases.items():
         for label, factor in ((f"-{rel:.0%}", 1 - rel), ("base", 1.0), (f"+{rel:.0%}", 1 + rel)):
@@ -77,6 +77,7 @@ def sensitivity(
                 value = max(1, round(value))
             row: dict[str, Any] = {"param": param, "variant": label, "value": value, "note": ""}
             m: Metrics | None = base_m
+            halted = base_halt
             if value == base:
                 if label != "base":
                     row["note"] = "unchanged after rounding"
@@ -85,15 +86,27 @@ def sensitivity(
                     variant = with_overrides(cfg, {param: value})
                 except ValueError as exc:
                     m = None
-                    row.update(net_pnl=math.nan, profit_factor=math.nan, n_trades=math.nan)
+                    row.update(
+                        net_pnl=math.nan, profit_factor=math.nan, n_trades=math.nan, halted_at=""
+                    )
                     row["note"] = f"invalid: {str(exc).splitlines()[0]}"
                 else:
-                    m, _ = run_metrics(variant, candles, funding, start, end, strategies)
+                    m, _, halted = run_metrics(variant, candles, funding, start, end, strategies)
                     log.info("sensitivity", param=param, variant=label, value=value)
             if m is not None:
                 row.update(net_pnl=m.net_pnl, profit_factor=m.profit_factor, n_trades=m.n_trades)
+                row["halted_at"] = halted
             rows.append(row)
-    cols = ["param", "variant", "value", "net_pnl", "profit_factor", "n_trades", "note"]
+    cols = [
+        "param",
+        "variant",
+        "value",
+        "net_pnl",
+        "profit_factor",
+        "n_trades",
+        "halted_at",
+        "note",
+    ]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -110,7 +123,7 @@ def cost_stress(
     stressed = with_overrides(cfg, {f"costs.{k}": getattr(cfg.costs, k) * mult for k in COST_KEYS})
     rows = []
     for label, c in (("base", cfg), ("stressed", stressed)):
-        m, _ = run_metrics(c, candles, funding, start, end, strategies)
+        m, _, halted = run_metrics(c, candles, funding, start, end, strategies)
         log.info("cost_stress", variant=label)
         rows.append(
             {
@@ -119,6 +132,7 @@ def cost_stress(
                 "profit_factor": m.profit_factor,
                 "n_trades": m.n_trades,
                 "fees": m.fees,
+                "halted_at": halted,
             }
         )
     return pd.DataFrame(rows)
@@ -135,7 +149,7 @@ def leverage_compare(
     """Two rows for ``risk.max_gross_leverage`` 1.0 and 1.5."""
     rows = []
     for lev in (1.0, 1.5):
-        m, _ = run_metrics(
+        m, _, halted = run_metrics(
             with_overrides(cfg, {"risk.max_gross_leverage": lev}),
             candles,
             funding,
@@ -150,6 +164,7 @@ def leverage_compare(
                 "net_pnl": m.net_pnl,
                 "max_drawdown": m.max_drawdown,
                 "n_trades": m.n_trades,
+                "halted_at": halted,
             }
         )
     return pd.DataFrame(rows)

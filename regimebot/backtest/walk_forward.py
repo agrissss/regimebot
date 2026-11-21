@@ -24,7 +24,7 @@ import structlog
 
 from regimebot.backtest.runner import run_backtest
 from regimebot.config import AppConfig, with_overrides
-from regimebot.reporting.metrics import Metrics, compute_metrics
+from regimebot.reporting.metrics import Metrics, compute_metrics, first_permanent_halt
 from regimebot.strategy import Strategy
 from regimebot.types import Trade
 
@@ -44,6 +44,7 @@ class WalkForwardResult:
     oos_trades: list[Trade]
     n_variants_tried: int
     oos_net_pnl: float
+    n_test_windows_halted: int  # test windows that stopped early on a permanent risk halt
 
 
 def run_metrics(
@@ -53,12 +54,15 @@ def run_metrics(
     start: datetime,
     end: datetime,
     strategies: Sequence[Strategy] | None = None,
-) -> tuple[Metrics, list[Trade]]:
-    """One backtest on a fresh kill file path (it does not exist, so nothing is halted)."""
+) -> tuple[Metrics, list[Trade], str]:
+    """One backtest on a fresh kill file path (it does not exist, so nothing is halted).
+
+    The third item is the ISO time of the run's first permanent halt (max drawdown), or ""."""
     with tempfile.TemporaryDirectory() as tmp:
         result = run_backtest(cfg, candles, funding, start, end, Path(tmp) / "KILL", strategies)
     metrics = compute_metrics(result.trades, result.equity, cfg.backtest.initial_equity)
-    return metrics, result.trades
+    halt = first_permanent_halt(result.log.risk_events)
+    return metrics, result.trades, halt.ts.isoformat() if halt else ""
 
 
 def _qualifies(m: Metrics, min_trades: int) -> bool:
@@ -95,16 +99,23 @@ def walk_forward(
         test_end = train_end + test
         best: tuple[float, dict[str, float], AppConfig] | None = None
         best_m: Metrics | None = None
+        best_halt = ""
         for n, (params, variant) in enumerate(zip(combos, variants, strict=True), 1):
-            m, _ = run_metrics(variant, candles, funding, train_start, train_end, strategies)
+            m, _, halted = run_metrics(
+                variant, candles, funding, train_start, train_end, strategies
+            )
             log.info("walk_forward_train", window=i, combo=n, of=len(combos), n_trades=m.n_trades)
             if _qualifies(m, wf.min_trades) and (best is None or m.profit_factor > best[0]):
-                best, best_m = (m.profit_factor, params, variant), m
+                best, best_m, best_halt = (m.profit_factor, params, variant), m, halted
         chosen, test_cfg = (best[1], best[2]) if best else ({}, cfg)
         if best_m is None:  # nothing qualified: report the unmodified config's train run
             log.warning("walk_forward_no_qualifying_params", window=i, min_trades=wf.min_trades)
-            best_m, _ = run_metrics(cfg, candles, funding, train_start, train_end, strategies)
-        tm, trades = run_metrics(test_cfg, candles, funding, train_end, test_end, strategies)
+            best_m, _, best_halt = run_metrics(
+                cfg, candles, funding, train_start, train_end, strategies
+            )
+        tm, trades, test_halt = run_metrics(
+            test_cfg, candles, funding, train_end, test_end, strategies
+        )
         log.info("walk_forward_test", window=i, n_trades=tm.n_trades, net_pnl=tm.net_pnl)
         oos.extend(trades)
         rows.append(
@@ -119,9 +130,11 @@ def walk_forward(
                 "train_n_trades": best_m.n_trades,
                 "train_profit_factor": best_m.profit_factor,
                 "train_net_pnl": best_m.net_pnl,
+                "train_halted_at": best_halt,
                 "test_n_trades": tm.n_trades,
                 "test_profit_factor": tm.profit_factor,
                 "test_net_pnl": tm.net_pnl,
+                "test_halted_at": test_halt,
             }
         )
         i += 1
@@ -136,4 +149,5 @@ def walk_forward(
         oos_trades=sorted(oos, key=lambda t: t.entry_ts),
         n_variants_tried=len(rows) * len(combos),
         oos_net_pnl=float(windows["test_net_pnl"].sum()),
+        n_test_windows_halted=int((windows["test_halted_at"] != "").sum()),
     )

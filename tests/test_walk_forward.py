@@ -9,13 +9,18 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
-from synth import BTC, T0, Scripted, regime_walk
+from synth import BTC, T0, Scripted, candles_from_closes, regime_walk
+from typer.testing import CliRunner
 
 from regimebot.backtest import walk_forward as wf
 from regimebot.backtest.runner import BacktestResult
+from regimebot.cli import app
 from regimebot.config import AppConfig, load_config, with_overrides
+from regimebot.db import repo
+from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.engine.loop import RunLog
 from regimebot.strategy import Strategy
 from regimebot.types import ExitReason, Regime, Side, Trade
@@ -227,3 +232,76 @@ def test_real_engine_end_to_end(tmp_path: Path) -> None:
     # same signals, only costs differ: the cheaper slippage has the higher PF on every train span
     assert all(json.loads(p) == {"costs.slippage_bps": 1.0} for p in res.windows.params)
     assert all(t.entry_ts >= T0 + 2 * DAY for t in res.oos_trades)
+
+
+def falling_cfg(max_drawdown: float) -> AppConfig:
+    entry = {
+        "strategies": ["breakout"],
+        "size_mult": 1.0,
+        "allow_entries": True,
+        "force_close": False,
+    }
+    return with_overrides(
+        cfg_with({"costs.slippage_bps": [1.0]}, min_trades=1),
+        {"risk.max_drawdown": max_drawdown, **{f"playbook.{r.value}": entry for r in Regime}},
+    )
+
+
+FALLING = {BTC: candles_from_closes(200.0 - 0.01 * np.arange(5 * 1440))}  # a long loser
+
+
+def test_halted_windows_are_flagged_and_counted() -> None:
+    stub = [Scripted("breakout", stop_dist=0.3, target_dist=0.6)]
+    end = T0 + 5 * DAY
+    res = wf.walk_forward(falling_cfg(0.01), FALLING, {}, T0, end, strategies=stub)
+    w = res.windows
+    assert len(w) == 3 and res.n_test_windows_halted == 3
+    for _, r in w.iterrows():
+        assert r.test_start <= datetime.fromisoformat(r.test_halted_at) < r.test_end
+        assert r.train_start <= datetime.fromisoformat(r.train_halted_at) < r.train_end
+    full = wf.walk_forward(falling_cfg(1.0), FALLING, {}, T0, end, strategies=stub)
+    assert full.n_test_windows_halted == 0
+    assert (full.windows.test_halted_at == "").all() and (full.windows.train_halted_at == "").all()
+
+
+def _seed_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    url = f"sqlite:///{tmp_path / 'cli.db'}"
+    upgrade_to_head(url)
+    engine = make_engine(url)
+    with session_scope(engine) as session:
+        repo.upsert_candles(session, BTC, "1m", regime_walk(5 * 1440, seed=1))
+    engine.dispose()
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.chdir(tmp_path)  # no reports/ directory here
+
+
+def test_cli_walk_forward_creates_reports_dir_and_writes_csvs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_db(tmp_path, monkeypatch)
+    sets = [
+        "exchange.symbols=[BTC/USDT:USDT]",
+        "walk_forward.train_days=2",
+        "walk_forward.test_days=1",
+        "walk_forward.min_trades=1",
+        "walk_forward.grid={costs.slippage_bps: [1.0, 2.0]}",
+    ]
+    args = ["backtest", "walk-forward", "--start", "2024-01-01", "--end", "2024-01-06"]
+    result = CliRunner().invoke(app, [*args, *(a for kv in sets for a in ("--set", kv))])
+    assert result.exit_code == 0, result.output
+    assert "n_variants_tried=6" in result.output
+    assert result.output.index("n_variants_tried") < result.output.index("not evidence")
+    for name in ("walk_forward_windows.csv", "walk_forward_oos_trades.csv"):
+        assert (tmp_path / "reports" / name).exists()
+
+
+def test_cli_robustness_creates_reports_dir_and_writes_csvs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_db(tmp_path, monkeypatch)
+    args = ["backtest", "robustness", "--param", "risk.risk_per_trade", "--start", "2024-01-03"]
+    args += ["--end", "2024-01-05", "--set", "exchange.symbols=[BTC/USDT:USDT]"]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    for name in ("sensitivity.csv", "cost_stress.csv", "leverage_compare.csv"):
+        assert (tmp_path / "reports" / name).exists()
