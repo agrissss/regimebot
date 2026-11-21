@@ -560,9 +560,11 @@ Create `regimebot/execution/fill_model.py` and `regimebot/engine/portfolio.py`.
 - `market_fill(symbol, ts, side: OrderSide, qty, bid, ask, ref_price, bar_volume, costs, cap_participation: bool) -> Fill | None`
   Taker. Base price is `ask` for BUY, `bid` for SELL. Participation =
   `qty / bar_volume` (if `bar_volume <= 0`: return None when
-  `cap_participation`, else treat participation as `max_participation`).
-  When `cap_participation` (entries), qty is cut to
-  `max_participation * bar_volume`; exits are never cut. Slippage bps =
+  `cap_participation`). When `cap_participation` (entries), qty is cut to
+  `max_participation * bar_volume`. Exits are never cut; their participation
+  for the impact term is `min(qty / bar_volume, 1.0)`, and 1.0 when
+  `bar_volume <= 0`, so an exit always fills and never gets cheaper as
+  volume falls. Slippage bps =
   `slippage_bps + impact_bps_per_pct * participation * 100` (participation
   after the cut), applied against the trader. Fee = `taker_fee_bps` of
   notional. `Fill.slippage_bps` is measured against `ref_price`, signed so
@@ -573,13 +575,14 @@ Create `regimebot/execution/fill_model.py` and `regimebot/engine/portfolio.py`.
   A SELL stop triggers when `bar.low <= stop_price`; trigger price is
   `min(stop_price, bar.open)` (gap through the stop fills at the open). BUY
   stop mirrored with `bar.high` and `max`. Then half spread and slippage are
-  applied against the trader as in `market_fill` (no participation cut), taker
-  fee, `ref_price = stop_price`.
+  applied against the trader as in an exit `market_fill` (same bounded
+  participation from `bar.volume`), taker fee, `ref_price = stop_price`.
 - `target_fill(symbol, bar: Bar, side: OrderSide, qty, target_price, costs) -> Fill | None`
   A SELL limit fills when `bar.high > target_price` (strictly through, a touch
-  is not a fill) at exactly `target_price` (or `bar.open` if the bar opens
-  beyond it), maker fee, zero slippage against `ref_price = target_price`
-  (a favourable open gap gives negative slippage_bps). BUY mirrored.
+  is not a fill) at exactly `target_price`, even when the bar opens beyond it
+  (a resting limit trades at its own price; no price improvement is
+  assumed), maker fee, zero slippage against `ref_price = target_price`.
+  BUY mirrored.
 - `funding_payment(side: Side, qty, mark_price, rate) -> float`: cost to the
   position, positive = paid. Longs pay when rate > 0, shorts receive.
 
@@ -703,8 +706,9 @@ Engine methods (the engine is identical in backtest and paper):
      the playbook allows, in config order; first signal wins; record it;
      `risk.evaluate`; record the decision; if approved queue a market entry.
 - `fill_queued(symbol, ts, bid, ask, bar_volume) -> None`: executes queued
-  market entries (participation-capped; a None fill cancels the entry and is
-  recorded as a decision with rule `no_liquidity`) and queued exits via
+  market entries (participation-capped; a None fill, or a fill whose
+  notional is under 10 quote units, cancels the entry and is recorded as a
+  decision with rule `no_liquidity`) and queued exits via
   `fill_model.market_fill`, updating portfolio, risk (`on_trade_closed`) and
   the log. Entry `ref_price` is the signal's entry; exit `ref_price` is the
   last decision close.
