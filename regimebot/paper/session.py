@@ -35,11 +35,12 @@ from regimebot.db import repo
 from regimebot.db.session import session_scope
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
+from regimebot.market_state.features import warm_rows
 from regimebot.paper import state
 from regimebot.reporting.alerts import alert
 from regimebot.risk.manager import RiskManager
 from regimebot.strategy import Strategy, build_strategies
-from regimebot.types import Bar, Mode, Quote
+from regimebot.types import Bar, Mode, Quote, RiskEvent
 
 log = structlog.get_logger(__name__)
 
@@ -76,7 +77,9 @@ class PaperSession:
     and alerted as ``decision_missed`` unless it closed before this process started (a routine
     start or resume, logged at info). Only symbols with bar T stored
     get a window; the others are recorded as ``stale_data`` by the engine and not traded.
-    ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends.
+    ``alert("stale_data")`` fires once per incident, ``stale_data_recovered`` when it ends. A
+    window whose last row is not fully valid (too little warm history) records
+    ``warmup_incomplete`` at every decision and is alerted the same way.
 
     Fills: spreads come from quotes fetched just before ``on_decision``; after it, each symbol
     with a queued order fills at a fresh quote, stamped with the session clock, with the last
@@ -453,6 +456,7 @@ class PaperSession:
             return None
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice
+        self._check_warm(ts, windows)
         self.engine.on_decision(ts, windows, spreads)
         log.info(
             "paper_decision",
@@ -462,6 +466,21 @@ class PaperSession:
             positions=sorted(self.portfolio.positions),
         )
         return quotes
+
+    def _check_warm(self, ts: datetime, windows: dict[str, pd.DataFrame]) -> None:
+        """Record a ``warmup_incomplete`` risk event at ``ts`` for every symbol whose window's
+        last row is not fully valid (it cannot be classified: no trade), alerted once per
+        incident like ``stale_data``. A symbol without a window keeps its incident as it was."""
+        for symbol in self._symbols:
+            if (window := windows.get(symbol)) is None:
+                continue
+            problem = None
+            if not warm_rows(window).iloc[-1]:
+                problem = f"features not fully valid at {ts.isoformat()}"
+                detail = f"{symbol}: {problem}"
+                event = RiskEvent(ts, "warmup_incomplete", detail, "no_trade_until_warm")
+                self.log.risk_events.append(event)
+            self._track("warmup_incomplete", symbol, problem)
 
     def _windows(self, ts: datetime, symbols: list[str]) -> dict[str, pd.DataFrame]:
         """Trailing ``WINDOW_ROWS`` feature rows of ``symbols`` from the stored history, exactly

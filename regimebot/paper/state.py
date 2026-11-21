@@ -277,6 +277,16 @@ class PaperStatus:
     risk_events: list[RiskEvent]  # the last STATUS_EVENTS, oldest first
 
 
+def latest_open_run(session: Session) -> int | None:
+    """Id of the most recent paper run that has not ended, or None."""
+    return session.scalar(
+        select(Run.id)
+        .where(Run.mode == str(Mode.PAPER), Run.ended_at.is_(None))
+        .order_by(Run.id.desc())
+        .limit(1)
+    )
+
+
 def latest_status(session: Session) -> PaperStatus | None:
     """Status of the most recent paper run, or None when there is none."""
     run = session.scalars(

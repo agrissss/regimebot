@@ -14,6 +14,7 @@ import pandas as pd
 import typer
 import yaml
 from pydantic import ValidationError
+from sqlalchemy import Engine
 
 from regimebot.backtest.baselines import compute_baselines
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
@@ -36,7 +37,13 @@ from regimebot.market_state.features import compute_features, warmup_bars
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
 from regimebot.paper.session import EXCHANGE_MAX_RETRIES, EXCHANGE_TIMEOUT_MS, PaperSession
-from regimebot.paper.state import clear_halts, end_paper_run, latest_status, lock_run
+from regimebot.paper.state import (
+    clear_halts,
+    end_paper_run,
+    latest_open_run,
+    latest_status,
+    lock_run,
+)
 from regimebot.reporting.metrics import compute_metrics, first_permanent_halt
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
@@ -464,14 +471,40 @@ paper_app = typer.Typer(
 app.add_typer(paper_app, name="paper")
 
 
+def _resume_target(resume: str | None, db: Engine) -> int | None:
+    """The run ``paper run --resume`` continues: a run id, or for ``latest`` the most recent
+    open paper run (None, a new run, when there is none)."""
+    if resume is None:
+        return None
+    if resume == "latest":
+        with session_scope(db) as session:
+            run_id = latest_open_run(session)
+        if run_id is None:
+            _say("--resume latest: no open paper run, starting a new one")
+        else:
+            _say(f"--resume latest: resuming open paper run {run_id}")
+        return run_id
+    try:
+        return int(resume)
+    except ValueError:
+        raise typer.BadParameter(
+            f"expected a run id or `latest`, got {resume!r}", param_hint="--resume"
+        ) from None
+
+
 @paper_app.command("run")
 def paper_run(
     resume: Annotated[
-        int | None, typer.Option(help="Continue this open paper run (its id from the banner).")
+        str | None,
+        typer.Option(
+            help="Continue this open paper run (its id from the banner), or `latest`: the most "
+            "recent open paper run, else a new one (safe for a supervisor to restart)."
+        ),
     ] = None,
 ) -> None:
     """Paper-trade the configured symbols until Ctrl-C or SIGTERM. Simulated fills only: no
-    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it and
+    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it,
+    `--resume latest` continues the most recent open run (or starts one when none is open), and
     `paper end RUN_ID` ends it for good.
 
     Logs are JSON lines on stdout; the banner goes to stderr.
@@ -479,6 +512,8 @@ def paper_run(
     cfg = load_config()
     configure_logging()
     _say("PAPER TRADING: simulated fills only, no orders are sent to any exchange.")
+    db = make_engine(cfg.database_url)
+    resume_id = _resume_target(resume, db)
     _say(
         f"warming up {cfg.paper.warmup_bars} {cfg.exchange.decision_timeframe} bars of history ..."
     )
@@ -486,17 +521,25 @@ def paper_run(
     exchange = CcxtExchange(
         cfg.exchange.id, max_retries=EXCHANGE_MAX_RETRIES, timeout_ms=EXCHANGE_TIMEOUT_MS
     )
-    session = PaperSession(cfg, exchange, make_engine(cfg.database_url), DEFAULT_KILL_FILE)
+    session = PaperSession(cfg, exchange, db, DEFAULT_KILL_FILE)
     try:
-        run_id = session.start(resume)
+        run_id = session.start(resume_id)
     except ValueError as exc:  # not a resumable paper run
         raise typer.BadParameter(str(exc), param_hint="--resume") from None
+    try:
+        _run_session(cfg, session, run_id, resumed=resume_id is not None)
+    finally:
+        session.close()  # release the run lock (process exit would too)
+
+
+def _run_session(cfg: AppConfig, session: PaperSession, run_id: int, resumed: bool) -> None:
+    """Print the banner, poll until stopped, then say how to resume or end the run."""
     _say(
         "\n".join(
             [
                 "=" * 72,
                 "PAPER TRADING - simulated fills only, no orders are sent to any exchange",
-                f"run id:    {run_id} ({'resumed' if resume is not None else 'new'})",
+                f"run id:    {run_id} ({'resumed' if resumed else 'new'})",
                 f"symbols:   {', '.join(cfg.exchange.symbols)}, polling every "
                 f"{cfg.paper.poll_seconds}s",
                 f"kill file: {DEFAULT_KILL_FILE} (`regimebot kill` flattens at the next poll)",

@@ -94,8 +94,11 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     assert len(RISK_WARNING) == 6
     assert config_hash(result.cfg) in text
     assert "12 parameter variants" in text and "likely overstated" in text
-    # BTC alone, in the default group capped at 1.0: the 1.5 gross cap cannot be reached
-    assert "Leverage: configured gross cap 1.50x, effective cap 1.00x (one group" in text
+    # BTC alone: its 0.75 asset cap binds before the 1.0 group cap and the 1.5 gross cap
+    assert (
+        "Leverage: configured gross cap 1.50x, effective cap 0.75x "
+        "(1 symbol x the 0.75x per-asset cap binds)"
+    ) in text
     assert "Buy and hold" in text and "Random entry" in text
     assert "Parameter variants tried" in text
     assert "all modelled fees (taker and maker)" in text

@@ -98,4 +98,4 @@ walk_forward:
 paper:
   poll_seconds: 10
   stale_after_seconds: 180
-  warmup_bars: 3000            # decision bars loaded before trading starts
+  warmup_bars: 3400            # decision bars loaded before trading starts (2,976 needed)

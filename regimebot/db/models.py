@@ -149,6 +149,8 @@ class FillRow(Base):
     fee: Mapped[float]
     slippage_bps: Mapped[float]
     liquidity: Mapped[str] = mapped_column(String(8))
+    bid: Mapped[float | None]  # the quote a taker fill was priced from (migration 0002)
+    ask: Mapped[float | None]
 
 
 class TradeRow(Base):

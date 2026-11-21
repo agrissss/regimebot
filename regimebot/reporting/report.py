@@ -20,7 +20,7 @@ from matplotlib.figure import Figure  # Figure renders with Agg and needs no GUI
 
 from regimebot.backtest.baselines import Baselines
 from regimebot.backtest.runner import BacktestResult
-from regimebot.config import config_hash, effective_gross_cap
+from regimebot.config import config_hash, gross_cap_limits
 from regimebot.reporting.metrics import (
     Metrics,
     active_period,
@@ -402,8 +402,16 @@ def write_report(
         )
     symbols = ", ".join(cfg.exchange.symbols)
     gross_cap = cfg.risk.max_gross_leverage
-    effective_cap = effective_gross_cap(cfg.risk, cfg.exchange.symbols)
-    why = " (one group holds every symbol: its cap binds)" if effective_cap < gross_cap else ""
+    limits = gross_cap_limits(cfg.risk, cfg.exchange.symbols)
+    effective_cap = min(limits.values())
+    n = len(set(cfg.exchange.symbols))
+    reasons = {
+        "group": "one group holds every symbol: its cap binds",
+        "asset": f"{n} symbol{'' if n == 1 else 's'} x the "
+        f"{_num(cfg.risk.max_asset_exposure)}x per-asset cap binds",
+    }
+    binding = [text for cap, text in reasons.items() if limits.get(cap) == effective_cap]
+    why = f" ({'; '.join(binding)})" if effective_cap < gross_cap else ""
     info = (
         f"<p>Config hash: <code>{html.escape(config_hash(cfg))}</code><br>"
         f"Backtest period: {result.start.isoformat()} to {result.end.isoformat()} (UTC)<br>"

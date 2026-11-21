@@ -41,8 +41,10 @@ def _make_fill(
     ref_price: float,
     fee_bps: float,
     liquidity: str,
+    quote: tuple[float, float] | None = None,
 ) -> Fill:
     worse = 1 if side == OrderSide.BUY else -1  # BUY: a higher price is worse
+    bid, ask = (None, None) if quote is None else quote
     return Fill(
         symbol=symbol,
         ts=ts,
@@ -53,6 +55,8 @@ def _make_fill(
         fee=qty * price * fee_bps / 1e4,
         slippage_bps=worse * (price - ref_price) / ref_price * 1e4,
         liquidity=liquidity,
+        bid=bid,
+        ask=ask,
     )
 
 
@@ -81,7 +85,7 @@ def market_fill(
     Entries (``cap_participation``) are cut to ``max_participation * bar_volume`` and get no fill
     (None) on a bar without volume; impact uses the cut qty. Exits are never cut and always
     fill: their participation is ``min(qty / bar_volume, 1)``, and 1 on a bar without volume,
-    so an exit never gets cheaper as the bar thins.
+    so an exit never gets cheaper as the bar thins. The fill records ``bid`` and ``ask``.
     """
     side = OrderSide(side)  # a plain "buy"/"sell" is fine; anything else raises ValueError
     for name, value in (("qty", qty), ("bid", bid), ("ask", ask), ("ref_price", ref_price)):
@@ -102,7 +106,9 @@ def market_fill(
         price = ask * (1 + slip_bps / 1e4)
     else:
         price = bid * (1 - slip_bps / 1e4)
-    return _make_fill(symbol, ts, side, qty, price, ref_price, costs.taker_fee_bps, "taker")
+    return _make_fill(
+        symbol, ts, side, qty, price, ref_price, costs.taker_fee_bps, "taker", (bid, ask)
+    )
 
 
 def stop_fill(

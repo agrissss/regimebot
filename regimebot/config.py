@@ -180,13 +180,21 @@ class RiskConfig(_Model):
     streak_stop: PositiveInt
 
 
+def gross_cap_limits(risk: RiskConfig, symbols: Sequence[str]) -> dict[str, float]:
+    """Each cap's bound on gross exposure (multiple of equity): ``gross``; ``group`` when one
+    group holds every configured symbol (its exposure is then the gross exposure); ``asset``:
+    the number of symbols times ``max_asset_exposure``."""
+    limits = {"gross": risk.max_gross_leverage}
+    if any(set(symbols) <= set(members) for members in risk.groups.values()):
+        limits["group"] = risk.max_group_exposure
+    limits["asset"] = len(set(symbols)) * risk.max_asset_exposure
+    return limits
+
+
 def effective_gross_cap(risk: RiskConfig, symbols: Sequence[str]) -> float:
-    """The gross exposure (multiple of equity) the caps let a run reach: the lower of
-    ``max_gross_leverage`` and, when one group holds every configured symbol (its exposure is
-    then the gross exposure), ``max_group_exposure``; otherwise the gross cap."""
-    one_group = any(set(symbols) <= set(members) for members in risk.groups.values())
-    gross = risk.max_gross_leverage
-    return min(gross, risk.max_group_exposure) if one_group else gross
+    """The gross exposure (multiple of equity) the caps let a run reach: the lowest of
+    ``gross_cap_limits``."""
+    return min(gross_cap_limits(risk, symbols).values())
 
 
 class BacktestConfig(_Model):
@@ -243,7 +251,8 @@ class AppConfig(_Model):
         if self.paper.warmup_bars < (need := warmup_bars(self.features)):
             raise ValueError(
                 f"paper.warmup_bars {self.paper.warmup_bars} is below the {need} decision bars "
-                "the feature windows need before every feature is valid"
+                f"the feature windows need before every feature is valid: raise "
+                f"paper.warmup_bars to at least {need}"
             )
         return self
 

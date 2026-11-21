@@ -54,7 +54,8 @@ class RunLog:
 
     ``decisions`` are ``(index into signals, ts, RiskDecision)``; an entry cancelled after
     approval adds a second decision for the same signal. ``regimes`` carry the inputs the
-    classifier read (NaN stored as None). ``equity`` rows are ``(ts, equity, gross_exposure,
+    classifier read (NaN stored as None; ``spread_bps`` only when a live spread was given).
+    ``equity`` rows are ``(ts, equity, gross_exposure,
     drawdown)``, one per decision (and per ``flatten_all``).
     """
 
@@ -299,6 +300,8 @@ class Engine:
             spread = None if spreads is None else spreads.get(symbol)
             regime = classify(row, self.cfg.regime, ts, spread)
             inputs = {k: None if math.isnan(v := row[k]) else v for k in REGIME_INPUTS}
+            if spread is not None:  # a live quote (paper): the classifier read it too
+                inputs["spread_bps"] = spread
         self.log.regimes.append((symbol, ts, regime, inputs))
         return regime
 

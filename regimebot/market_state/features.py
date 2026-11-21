@@ -15,6 +15,7 @@ from regimebot.config import FeaturesConfig
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 # Valid once the data has a funding stamp / a compressed bar, not after a fixed warm-up.
 DATA_DEPENDENT_COLUMNS = ("funding", "bars_since_compression")
+_MAX_FLOAT = float(np.finfo(np.float64).max)
 
 
 def warmup_bars(cfg: FeaturesConfig) -> int:
@@ -129,7 +130,8 @@ def compute_features(
     ``ret_z``                             ``rv_window + 1`` (previous bar's ``rv``)
     ``vol_pctile``                        ``rv_window + pctile_window - 1`` (full
                                           ``pctile_window`` of ``rv``)
-    ``illiq_pctile``                      ``pctile_window`` (full window of Amihud)
+    ``illiq_pctile``                      ``pctile_window`` (full window of Amihud; a
+                                          zero-volume bar ranks as the most illiquid)
     ``plus_di``, ``minus_di`` / ``adx``   ``adx_window`` / ``2 * adx_window - 1``
     ``ema_fast``, ``ema_slow``            ``ema_fast - 1``, ``ema_slow - 1``
     ``volume_z``                          ``volume_window``
@@ -139,7 +141,8 @@ def compute_features(
     ``bars_since_compression``            the first compressed bar (data, not config)
     ====================================  =========================================
 
-    A NaN input (zero volume makes Amihud NaN) keeps a percentile NaN while it is in the window.
+    A NaN input keeps a percentile NaN while it is in the window. Zero volume does not make
+    Amihud NaN: a bar with zero volume and a valid return gets the largest finite float.
     """
     index = _validate(candles)
     close = candles["close"].astype(float)
@@ -165,7 +168,9 @@ def compute_features(
     roll_mean = close.rolling(cfg.zscore_window).mean()
     zscore = _safe_div(close - roll_mean, close.rolling(cfg.zscore_window).std())
 
-    amihud = _safe_div(ret.abs(), close * volume)  # zero volume -> NaN, never inf
+    # Zero volume with a valid return is maximally illiquid: the largest finite float ranks it so
+    # and keeps the window full (rolling rank treats inf as missing, which would blank it).
+    amihud = _safe_div(ret.abs(), close * volume).mask((volume == 0) & ret.notna(), _MAX_FLOAT)
     illiq_pctile = _pctile_rank(amihud, cfg.pctile_window)
 
     compressed = (vol_pctile <= compression_pctile).to_numpy()  # NaN compares False

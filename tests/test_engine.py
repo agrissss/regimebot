@@ -102,6 +102,16 @@ def test_signal_is_sized_queued_and_filled_at_the_quote_not_the_close(tmp_path: 
     assert engine.portfolio.cash == approx(10_000 - 1.2505000375)
 
 
+def test_a_live_spread_is_stored_with_the_regime_inputs(tmp_path: Path) -> None:
+    engine = make(tmp_path, symbols=(BTC, ETH))
+    engine.on_decision(T1, {s: window(T1, 100.0) for s in (BTC, ETH)}, spreads={BTC: 2.5})
+    inputs = {symbol: inputs for symbol, _, _, inputs in engine.log.regimes}
+    assert inputs[BTC]["spread_bps"] == 2.5  # what the classifier was given
+    assert "spread_bps" not in inputs[ETH]  # no quote, no spread: nothing made up
+    decide(engine, T2, {BTC: 100.0, ETH: 100.0})  # a backtest decision: no spreads at all
+    assert [set(i) for _, ts, _, i in engine.log.regimes if ts == T2] == [set(REGIME_INPUTS)] * 2
+
+
 def test_participation_cap_gives_a_partial_entry(tmp_path: Path) -> None:
     engine = make(tmp_path, Scripted("trend"))
     decide(engine, T1, {BTC: 100.0})

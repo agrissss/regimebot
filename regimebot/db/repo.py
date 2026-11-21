@@ -383,6 +383,8 @@ def save_fills(session: Session, run_id: int, fills: Sequence[Fill]) -> None:
             "fee": f.fee,
             "slippage_bps": f.slippage_bps,
             "liquidity": f.liquidity,
+            "bid": f.bid,
+            "ask": f.ask,
         }
         for f in fills
     ]
@@ -403,6 +405,8 @@ def load_fills(session: Session, run_id: int) -> list[Fill]:
             r.fee,
             r.slippage_bps,
             r.liquidity,
+            r.bid,
+            r.ask,
         )
         for r in session.scalars(stmt)
     ]
