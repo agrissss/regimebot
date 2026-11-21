@@ -45,7 +45,7 @@ Keep a final stretch of history that no decision about the strategy has used, an
 
 This is a rule you follow; the code has no holdout feature and no holdout period is configured. Practical form: run all development with `--end` before the holdout start, then run the final candidate once on the holdout (`--start`, `--end`), and report whatever comes out. If you look at it, change something and look again, it is no longer a holdout.
 
-Be honest about the current state: the first results below used 2024-01-01 to 2026-01-01 as development data, so that range is not a holdout. The backtests end at 2026-01-01, so 2026-01-01 onwards has never been used for any parameter or design choice and is a clean holdout. It is also a falling market, unlike the 2024-2025 test period. The next experiment is a single run of the frozen default configuration on that holdout (drawdown halt on and off, and 30 random-entry seeds), with pass criteria written down before the run (below), followed by 2021-2023. Results will be added when run. Paper trading forward in time is a further clean test.
+Be honest about the current state: the first results below used 2024-01-01 to 2026-01-01 as development data, so that range is not a holdout. The backtests end at 2026-01-01, so 2026-01-01 onwards has never been used for any parameter or design choice and is a clean holdout. It is also a falling market, unlike the 2024-2025 test period. That holdout was then run once against the criteria below; the result follows them. Paper trading forward in time is a further clean test.
 
 #### Pre-registered criteria for the 2026 holdout
 
@@ -61,6 +61,35 @@ Written before the run, dated 2026-11-21.
 - Whether the result stays positive with costs doubled is not required, but it will be reported.
 - Anything else is a fail, and a fail closes the question for this rule set as specified.
 - One secondary check, stated in advance: breakout alone has net P&L above 0 on the holdout. It tests the per-strategy observation in the README (breakout was the least bad strategy, positive before fees) and is reported as exploratory whatever the outcome.
+
+#### Result of the 2026 holdout (run once, 2026-11-21): FAIL
+
+Frozen `config/default.yaml`, 2026-01-01 to 2026-11-21, 10,000 USDT, 30 random-entry seeds. Runs 7 (default limits) and 8 (drawdown halt off).
+
+| Criterion (halt off, run 8) | Required | Result | |
+|---|---|---|---|
+| Net P&L after all costs | above 0 | -3,983.88 (-39.84%) | fail |
+| Profit factor | at least 1.15 | 0.60 | fail |
+| Trades | at least 100 | 503 | pass |
+| Random-entry seeds beaten | at least 27 of 30 | 2 of 30 (random median -2,693.29, range -4,534.47 to -1,010.98) | fail |
+| Maximum drawdown | at most 20% | 45.04% | fail |
+
+Buy and hold over the same period: -4,097.71 (max drawdown 51.13%). Fees 1,559.12, funding 23.34. Expectancy -0.31 R per trade (95% bootstrap interval -0.43 to -0.17). Costs x0.5: -3,110.72; costs x2: -5,247.55. By strategy: breakout 74 trades, -344.04; mean reversion 141, -1,429.66; trend 288, -2,210.19. By side: longs -2,312.09, shorts -1,671.79.
+
+Secondary check (exploratory): breakout alone net P&L above 0. Result -344.04: not met. The after-the-fact observation that breakout was the least bad strategy did not turn into a profit out of sample.
+
+With the default limits (run 7) the drawdown halt stopped trading on 2026-03-16 after 124 trades at -369.37 (-3.69%, profit factor 0.88, max drawdown 10.16%); buy and hold lost 2,230.69 over those weeks, and the strategy beat 22 of 30 random seeds over that shortened period. The limits did what they are for: they capped the loss.
+
+Per the criteria above, this closes the question for this rule set as specified: it has no edge after costs, in a rising market (2024-2025) or a falling one (2026). The planned 2021-2023 run is therefore not needed to decide and has not been run. Any new idea is a new rule set and needs its own development data and its own untouched holdout; 2026 can no longer serve as one.
+
+Commands:
+
+```bash
+.venv/bin/regimebot data download --end 2026-11-21T00:00:00+00:00
+.venv/bin/regimebot backtest run --start 2026-01-01T00:00:00+00:00 --end 2026-11-21T00:00:00+00:00
+.venv/bin/regimebot backtest run --start 2026-01-01T00:00:00+00:00 --end 2026-11-21T00:00:00+00:00 --set risk.max_drawdown=1.0
+.venv/bin/regimebot report RUN_ID --random-seeds 30
+```
 
 ### 4. Sensitivity
 
