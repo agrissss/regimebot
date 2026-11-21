@@ -625,7 +625,12 @@ split only if it passes ~300 lines).
 by UTC day and ISO week, consecutive losing trades, `halted_reason: str | None`,
 `day_stopped: date | None`.
 
-- `evaluate(signal: Signal, portfolio: Portfolio, playbook: PlaybookEntry, now: datetime) -> RiskDecision`
+- `evaluate(signal: Signal, portfolio: Portfolio, playbook: PlaybookEntry, now: datetime, pending: Mapping[str, float] | None = None) -> RiskDecision`
+  `pending` maps symbol to the notional of entries already approved but not
+  yet filled (the engine's queue). Pending notional counts as exposure for
+  the asset, group and gross caps, and a symbol present in `pending` is
+  rejected as `position_exists`, so several approvals in one decision bar
+  can never jointly breach a cap.
   Checks in this order, first failure rejects with that rule name:
   1. `kill_switch` (halted, or `kill_file` exists)
   2. `day_stopped` (streak stop hit today)
@@ -704,7 +709,9 @@ Engine methods (the engine is identical in backtest and paper):
      exits for every open position (reason KILL) and skip entries.
   5. For each symbol without a position or queued order: run the strategies
      the playbook allows, in config order; first signal wins; record it;
-     `risk.evaluate`; record the decision; if approved queue a market entry.
+     `risk.evaluate` (passing the notional of entries already queued in this
+     decision as `pending`); record the decision; if approved queue a market
+     entry.
 - `fill_queued(symbol, ts, bid, ask, bar_volume) -> None`: executes queued
   market entries (participation-capped; a None fill, or a fill whose
   notional is under 10 quote units, cancels the entry and is recorded as a
