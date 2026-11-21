@@ -388,10 +388,11 @@ def test_no_look_ahead_end_to_end(tmp_path: Path, walk: BacktestResult) -> None:
 # --- persistence and CLI ----------------------------------------------------------------------
 
 
+@pytest.mark.db
 def test_persist_result_round_trips_trades_equity_and_links(
-    tmp_path: Path, walk: BacktestResult
+    database_url: str, walk: BacktestResult
 ) -> None:
-    engine = make_engine(f"sqlite:///{tmp_path / 'bt.db'}")
+    engine = make_engine(database_url)
     Base.metadata.create_all(engine)
     with session_scope(engine) as session:
         run_id = persist_result(session, walk, note="unit")

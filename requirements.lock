@@ -40,13 +40,11 @@ propcache==0.5.4
 pycares==5.2.1
 pycparser==3.12
 pydantic==2.14.4
-pydantic-settings==2.16.3
 pydantic_core==2.50.5
 Pygments==2.21.0
 pyparsing==3.3.3
 pytest==9.2.0
 python-dateutil==4.0.0
-python-dotenv==1.2.4
 PyYAML==6.0.4
 requests==2.34.2
 rich==15.0.0

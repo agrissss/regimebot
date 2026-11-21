@@ -133,14 +133,16 @@ def make_rig(
     cfg: AppConfig | None = None,
     at: set[datetime] | None = None,
     shift: timedelta = timedelta(0),
+    database_url: str | None = None,
 ) -> Rig:
-    """A rig on ``market()`` moved ``shift`` later (``at`` must then be shifted too)."""
+    """A rig on ``market()`` moved ``shift`` later (``at`` must then be shifted too), on a
+    SQLite file under ``tmp_path`` unless a ``database_url`` is given."""
     cfg = cfg or open_cfg()
     candles, funding = market()
     candles = {s: df.shift(freq=shift) for s, df in candles.items()}
     funding = {s: rates.shift(freq=shift) for s, rates in funding.items()}
     clock = Clock(START + shift + LAG)
-    db = make_engine(f"sqlite:///{tmp_path / 'paper.db'}")
+    db = make_engine(database_url or f"sqlite:///{tmp_path / 'paper.db'}")
     Base.metadata.create_all(db)
     exchange = ReplayExchange(candles, funding, cfg.costs, clock)
     return Rig(cfg, exchange, clock, db, tmp_path / "KILL", at)
@@ -566,6 +568,25 @@ def resumable_state(session: PaperSession) -> dict[str, Any]:
         "risk": session.risk.to_state(),
         "engine": session.engine.to_state(),
     }
+
+
+@pytest.mark.db
+def test_paper_state_saved_mid_position_is_restored_exactly(
+    tmp_path: Path, database_url: str
+) -> None:
+    rig = make_rig(tmp_path, database_url=database_url)
+    session = rig.session()
+    run_id = session.start()
+    rig.poll(session, T2 + 2 * D + 5 * MINUTE, every=EVERY_5M)  # BTC open, ETH's stop trailed
+    before = resumable_state(session)
+    trailed = before["positions"][ETH]
+    assert sorted(before["positions"]) == [BTC, ETH] and trailed["stop"] > trailed["initial_stop"]
+    session.close()
+    resumed = rig.session()
+    assert resumed.start(resume_run_id=run_id) == run_id
+    assert resumable_state(resumed) == before
+    resumed.close()
+    rig.db.dispose()
 
 
 def test_resume_mid_position_three_times_matches_an_uninterrupted_run(

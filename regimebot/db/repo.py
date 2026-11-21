@@ -8,6 +8,7 @@ bulk-inserts, and does not commit (``session_scope`` does).
 
 import dataclasses
 import json
+import os
 import subprocess
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
@@ -235,19 +236,27 @@ def load_funding(
 _REPO_DIR = Path(__file__).resolve().parent  # inside the repo this package lives in
 
 
+def _git(*args: str) -> str:
+    out = subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True, timeout=5, cwd=_REPO_DIR
+    )
+    return out.stdout.strip()
+
+
 def _git_sha() -> str:
+    """The code version a run records: the ``GIT_SHA`` env var when set (the Docker image has no
+    git), else the short HEAD sha plus ``-dirty`` when tracked files have uncommitted changes;
+    "unknown" when neither is available."""
+    if sha := os.environ.get("GIT_SHA"):
+        return sha
     try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-            cwd=_REPO_DIR,
-        )
+        head = _git("rev-parse", "--short", "HEAD")
+        dirty = _git("status", "--porcelain", "--untracked-files=no")
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-    return out.stdout.strip() or "unknown"
+    if not head:
+        return "unknown"
+    return f"{head}-dirty" if dirty else head
 
 
 def create_run(session: Session, mode: Mode, cfg: AppConfig, note: str = "") -> int:

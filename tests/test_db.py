@@ -1,3 +1,7 @@
+"""Repository and database tests. All are marked ``db``: the CI Postgres job runs them against
+``TEST_DATABASE_URL`` (see the ``database_url`` fixture); by default they use SQLite."""
+
+import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,12 +32,14 @@ from regimebot.types import (
     Trade,
 )
 
+pytestmark = pytest.mark.db
+
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
-def engine(tmp_path: Path) -> Iterator[Engine]:
-    eng = make_engine(f"sqlite:///{tmp_path / 'sub' / 'test.db'}")
+def engine(database_url: str) -> Iterator[Engine]:
+    eng = make_engine(database_url)
     Base.metadata.create_all(eng)
     yield eng
     eng.dispose()
@@ -61,10 +67,12 @@ def make_candles(n: int = 5) -> pd.DataFrame:
     )
 
 
-def test_make_engine_creates_dir_and_enables_fk_and_wal(engine: Engine) -> None:
+def test_make_engine_creates_dir_and_enables_fk_and_wal(tmp_path: Path) -> None:
+    engine = make_engine(f"sqlite:///{tmp_path / 'sub' / 'test.db'}")  # SQLite-only behaviour
     with engine.connect() as c:
         assert c.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
         assert c.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+    engine.dispose()
 
 
 def test_session_scope_rolls_back_on_error(engine: Engine, cfg: AppConfig) -> None:
@@ -189,8 +197,32 @@ def test_load_run_and_count_signals(session: Session, cfg: AppConfig) -> None:
 
 
 def test_git_sha_unknown_when_git_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GIT_SHA", raising=False)
     monkeypatch.setenv("PATH", "")
     assert repo._git_sha() == "unknown"
+
+
+def test_git_sha_env_var_wins_over_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_SHA", "abc1234")  # the Docker image: no .git, sha baked in
+    monkeypatch.setenv("PATH", "")
+    assert repo._git_sha() == "abc1234"
+
+
+@pytest.mark.parametrize(("status", "expected"), [("", "abc1234"), (" M x.py", "abc1234-dirty")])
+def test_git_sha_marks_uncommitted_changes_dirty(
+    monkeypatch: pytest.MonkeyPatch, status: str, expected: str
+) -> None:
+    monkeypatch.delenv("GIT_SHA", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        out = "abc1234\n" if cmd[1] == "rev-parse" else status
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(repo.subprocess, "run", fake_run)
+    assert repo._git_sha() == expected
+    assert calls[1] == ["git", "status", "--porcelain", "--untracked-files=no"]
 
 
 def make_trade(i: int = 0) -> Trade:
@@ -312,23 +344,27 @@ def test_upsert_rejects_unsupported_dialect(cfg: AppConfig) -> None:
             repo.upsert_candles(s, "BTC", "1m", make_candles())
 
 
-def test_migration_matches_models(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path / 'm.db'}"
-    upgrade_to_head(url)
-    insp = inspect(create_engine(url))
+def test_migration_matches_models(database_url: str) -> None:
+    upgrade_to_head(database_url)
+    eng = create_engine(database_url)
+    insp = inspect(eng)
     tables = set(insp.get_table_names()) - {"alembic_version"}
     assert tables == set(Base.metadata.tables)
     for name, table in Base.metadata.tables.items():
         assert {c["name"] for c in insp.get_columns(name)} == {c.name for c in table.columns}
         assert {i["name"] for i in insp.get_indexes(name)} == {i.name for i in table.indexes}
+    eng.dispose()
 
 
-def test_cli_db_upgrade_uses_database_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = tmp_path / "cli" / "x.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{path}")
+def test_cli_db_upgrade_uses_database_url(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", database_url)  # SQLite: its directory does not exist yet
     result = CliRunner().invoke(app, ["db", "upgrade"])
     assert result.exit_code == 0, result.output
-    assert "runs" in inspect(create_engine(f"sqlite:///{path}")).get_table_names()
+    eng = create_engine(database_url)
+    assert "runs" in inspect(eng).get_table_names()
+    eng.dispose()
 
 
 def test_candle_timestamps_and_funding_bounds(engine: Engine) -> None:
