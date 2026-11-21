@@ -7,12 +7,14 @@ import pytest
 from synth import BTC, T0, regime_walk
 
 from regimebot.backtest.baselines import (
+    _hold_until,
     buy_and_hold,
     calibrate_p,
     compute_baselines,
     random_entry,
 )
 from regimebot.config import AppConfig, CostsConfig, load_config
+from regimebot.reporting.metrics import active_period, first_permanent_halt
 from regimebot.types import Regime
 
 FREE = CostsConfig(
@@ -61,7 +63,7 @@ def test_two_symbols_share_equally_and_cash_waits_for_a_late_symbol() -> None:
     assert eq.tolist() == [1000.0, 1000.0, 1500.0]
 
 
-def walk_cfg() -> tuple[AppConfig, dict[str, pd.DataFrame]]:
+def walk_cfg(**extra: object) -> tuple[AppConfig, dict[str, pd.DataFrame]]:
     entry = {
         "strategies": ["breakout"],
         "size_mult": 1.0,
@@ -69,7 +71,7 @@ def walk_cfg() -> tuple[AppConfig, dict[str, pd.DataFrame]]:
         "force_close": False,
     }
     overrides: dict[str, object] = {f"playbook.{r.value}": entry for r in Regime}
-    cfg = load_config(overrides={"exchange.symbols": [BTC], **overrides})
+    cfg = load_config(overrides={"exchange.symbols": [BTC], **overrides, **extra})
     return cfg, {BTC: regime_walk(3 * 1440, seed=5)}
 
 
@@ -93,33 +95,33 @@ def test_random_entry_with_zero_probability_never_enters() -> None:
     assert run_random(1, p=0.0) == []
 
 
-def calibration_inputs() -> dict[str, object]:
+def calibrate(n_reference_signals: int, n_decision_bars: int) -> float:
     cfg, candles = walk_cfg()
-    return {
-        "cfg": cfg,
-        "candles": candles,
-        "funding": {},
-        "start": T0 + timedelta(days=1),
-        "end": T0 + timedelta(days=3),
-    }
+    return calibrate_p(
+        cfg,
+        candles,
+        {},
+        T0 + timedelta(days=1),
+        T0 + timedelta(days=3),
+        n_reference_signals=n_reference_signals,
+        n_decision_bars=n_decision_bars,
+    )
 
 
 def test_calibration_matches_the_reference_signal_count() -> None:
-    inputs = calibration_inputs()
     reference = len(run_random(9, p=0.15))
     assert reference > 5
-    p = calibrate_p(**inputs, n_reference_signals=reference, n_decision_bars=192)  # type: ignore[arg-type]  # dict of kwargs
+    p = calibrate(reference, 192)
     counts = [len(run_random(seed, p=p)) for seed in (0, 1, 2)]
     mean = sum(counts) / len(counts)
     assert abs(mean - reference) <= max(0.35 * reference, 3), (counts, reference, p)
 
 
-def test_calibration_handles_no_realised_signals_and_no_reference() -> None:
-    inputs = calibration_inputs()
-    # naive p0 is about 1e-9, so nothing is signalled (N1 == 0): finite, within [0, 1]
-    p = calibrate_p(**inputs, n_reference_signals=1, n_decision_bars=10**9)  # type: ignore[arg-type]  # dict of kwargs
-    assert 0.0 <= p <= 1.0
-    assert calibrate_p(**inputs, n_reference_signals=0, n_decision_bars=192) == 0.0  # type: ignore[arg-type]  # dict of kwargs
+def test_calibration_with_no_realised_signals_keeps_the_naive_probability() -> None:
+    p0 = 1 / 10**9  # one reference signal over 1e9 calls: the first pass signals nothing
+    assert run_random(0, p=p0) == []  # N1 == 0
+    assert calibrate(1, 10**9) == min(1.0, p0 * 1)  # p1 = p0 * reference / max(N1, 1)
+    assert calibrate(0, 192) == 0.0
 
 
 def test_compute_baselines_is_deterministic_for_a_seed_tuple() -> None:
@@ -139,3 +141,38 @@ def test_buy_and_hold_rejects_a_symbol_without_bars() -> None:
         buy_and_hold(
             {"A": decision_closes([1.0]), "B": decision_closes([1.0]).iloc[:0]}, 100.0, FREE
         )
+
+
+def test_a_symbol_without_bars_by_the_cut_stays_cash() -> None:
+    early = decision_closes([100.0, 200.0, 300.0])
+    late = decision_closes([10.0, 20.0, 30.0]).iloc[2:]  # first bar after the cut
+    cut = early.index[1]
+    cfg = load_config(
+        overrides={
+            "exchange.symbols": ["A", "B"],
+            "backtest.initial_equity": 1000.0,
+            "costs.taker_fee_bps": 0,
+            "costs.half_spread_bps": 0,
+            "costs.slippage_bps": 0,
+        }
+    )
+    window = {"A": early, "B": late}
+    full = buy_and_hold(window, 1000.0, FREE)
+    # A: 500 buys 5 units, worth 1000 at 200; B: 500 stays cash
+    assert _hold_until(window, cut, cfg, full).tolist() == [1000.0, 1500.0]
+    assert _hold_until({"B": late}, cut, cfg, full).tolist() == [1000.0, 1000.0]
+
+
+def test_seeds_run_only_inside_the_halted_reference_period() -> None:
+    cfg, candles = walk_cfg(**{"risk.max_drawdown": 0.003})
+    end = T0 + timedelta(days=3)
+    reference = random_entry(cfg, candles, {}, T0, end, 7, p=0.3)
+    assert first_permanent_halt(reference.log.risk_events) is not None
+    cut = active_period(reference.trades, reference.equity, reference.log.risk_events)[1].index[-1]
+    assert cut < reference.equity.index[-1]
+    base = compute_baselines(reference, candles, {}, len(reference.log.signals), seeds=(0, 1))
+    assert len(base.random_entry) == 2
+    for run in base.random_entry:
+        assert run.equity.index.max() <= cut
+        assert all(f.ts <= cut for f in run.log.fills)
+    assert base.buy_and_hold is not None and base.buy_and_hold.index[-1] == cut

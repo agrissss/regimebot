@@ -193,6 +193,14 @@ def _active_metrics(result: BacktestResult) -> tuple[Metrics, RiskEvent | None]:
     return compute_metrics(trades, equity, initial, result.log.fills), halt
 
 
+def _period(result: BacktestResult) -> tuple[str, str]:
+    """(last timestamp, number of decision bars) of a run's active period."""
+    _, equity, _ = active_period(result.trades, result.equity, result.log.risk_events)
+    if equity.empty:
+        return "n/a", "0"
+    return equity.index[-1].isoformat(), _count(len(equity.index.unique()))
+
+
 def _median_metrics(all_metrics: Sequence[Metrics]) -> Metrics:
     """Field-wise median over seeds (NaN ignored)."""
     values = {
@@ -259,6 +267,7 @@ def _random_html(result: BacktestResult, baselines: Baselines) -> str:
             else "n/a",
             _count(ref.n_trades),
             _money(ref.net_pnl),
+            *_period(result),
             "yes" if first_permanent_halt(result.log.risk_events) else "no",
         ]
     )
@@ -266,7 +275,7 @@ def _random_html(result: BacktestResult, baselines: Baselines) -> str:
         m, halt = _active_metrics(run)
         rows.append(
             [f"Random seed {seed}", _count(len(run.log.signals)), _count(m.n_trades),
-             _money(m.net_pnl), "yes" if halt else "no"]
+             _money(m.net_pnl), *_period(run), "yes" if halt else "no"]
         )  # fmt: skip
     p = baselines.random_p
     note = (
@@ -275,10 +284,25 @@ def _random_html(result: BacktestResult, baselines: Baselines) -> str:
         "so the number of signals matches the strategy's). It uses breakout's ATR stop and "
         "target geometry and is only asked in regimes where breakout is allowed, so it never "
         "trades regimes the playbook closes to breakout (such as range). Each seed runs under the "
-        "same risk limits as the strategy and is reported over its own active period if it "
-        f"halts. Seeds used: {', '.join(str(x) for x in baselines.random_seeds)}.</p>"
+        "same risk limits as the strategy, over the strategy's active period (start to the period "
+        "end shown), and is reported over its own active period if it halts earlier. "
+        f"Seeds used: {', '.join(str(x) for x in baselines.random_seeds)}.</p>"
     )
-    return _table(["Run", "Signals", "Trades", "Net P&L", "Permanent halt"], rows) + note
+    return (
+        _table(
+            [
+                "Run",
+                "Signals",
+                "Trades",
+                "Net P&L",
+                "Period end (UTC)",
+                "Decision bars",
+                "Permanent halt",
+            ],
+            rows,
+        )
+        + note
+    )
 
 
 def _breakdown_html(

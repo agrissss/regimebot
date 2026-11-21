@@ -99,6 +99,10 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     assert "all modelled fees (taker and maker)" in text
     assert "gaps through stop prices" in text and "next open" in text
     assert "only asked in regimes where breakout is allowed" in text
+    for run in baselines.random_entry:  # the per-seed table shows each period end
+        _, eq, _ = active_period(run.trades, run.equity, run.log.risk_events)
+        assert f"<td>{eq.index[-1].isoformat()}</td>" in text
+    assert "Period end (UTC)" in text and "Decision bars" in text
     assert "Seeds used: 0, 1" in text and "Random seed 1" in text and "Strategy (reference)" in text
 
 
@@ -124,7 +128,7 @@ def test_halted_run_reports_the_active_period_and_truncated_baselines(
     # buy and hold: active period beside the strategy, the full period as a separate line
     bh, full = baselines.buy_and_hold, baselines.buy_and_hold_full
     assert bh is not None and full is not None
-    assert bh.index[-1] <= halt.ts < full.index[-1]
+    assert bh.index[-1] == equity.index[-1] >= halt.ts and bh.index[-1] < full.index[-1]
     initial = result.cfg.backtest.initial_equity
     assert f"<td>{bh.iloc[-1] - initial:,.2f}</td>" in text
     assert "Buy and hold over the full period" in text and f"{full.iloc[-1] - initial:,.2f}" in text

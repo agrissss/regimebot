@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 import pytest
 
-from regimebot.reporting.metrics import breakdown, compute_metrics, max_drawdown
-from regimebot.types import ExitReason, Fill, OrderSide, Regime, Side, Trade
+from regimebot.reporting.metrics import active_period, breakdown, compute_metrics, max_drawdown
+from regimebot.types import ExitReason, Fill, OrderSide, Regime, RiskEvent, Side, Trade
 
 D1 = datetime(2024, 1, 1, tzinfo=UTC)
 INITIAL = 1000.0
@@ -178,3 +178,23 @@ def test_breakdown_by_symbol_values_and_empty() -> None:
     assert df.loc["BTC"].tolist() == [2, 0.5, 10, 0.25]  # 30 - 20; R (1.5 - 1) / 2
     assert df.loc["ETH"].tolist() == [2, 0.5, 0, 0.0]  # 10 - 10; R (0.5 - 0.5) / 2
     assert breakdown([], "regime").empty
+
+
+def test_halted_run_keeps_the_snapshot_that_realises_the_kill_flatten() -> None:
+    # Halt at 02:00; the kill trade exits at 02:00 but its loss first shows at the 03:00 snapshot.
+    killed = trade("BTC", "breakout", Side.LONG, Regime.RANGE, 1, 100, -50, -1.0,
+                   ExitReason.KILL, hm(1), hm(2), 0.0, 0.0, 4)  # fmt: skip
+    late = trade("BTC", "breakout", Side.LONG, Regime.RANGE, 1, 100, 999, 1.0,
+                 ExitReason.TARGET, hm(4), hm(5), 0.0, 0.0, 4)  # fmt: skip
+    equity = pd.Series(
+        [1000.0, 1000.0, 960.0, 950.0, 950.0, 950.0],  # 00:00 .. 05:00; 960 = mark before flatten
+        index=pd.DatetimeIndex([hm(h) for h in range(6)]),
+    )
+    events = [RiskEvent(hm(2), "max_drawdown", "d", "halt")]
+    trades, kept, halt = active_period([killed, late], equity, events)
+    assert trades == [killed] and halt is not None  # the trade entered after the halt is dropped
+    assert kept.index[-1] == hm(3) and len(kept) == 4  # includes 03:00, drops 04:00 and 05:00
+    m = compute_metrics(trades, kept, INITIAL)
+    assert m.net_pnl == -50
+    assert m.return_pct == pytest.approx(m.net_pnl / INITIAL)  # 950 / 1000 - 1 = -0.05
+    assert m.max_drawdown == pytest.approx(0.05)  # (1000 - 950) / 1000, not 40 / 1000

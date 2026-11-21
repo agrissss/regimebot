@@ -226,13 +226,19 @@ def active_period(
     """Trades and equity up to the first permanent halt (everything when there is none).
 
     After such a halt the strategy sits flat, and averaging that into Sharpe or exposure would
-    flatter it, so headline metrics use this window.
+    flatter it, so headline metrics use this window. The flatten that follows a halt fills at
+    the next price, so its realised loss first shows in the first snapshot strictly after both
+    the halt and the last kept trade's exit; equity is cut right after that snapshot, so return
+    and drawdown agree with the trades' net P&L and the flat stretch after it is excluded.
     """
     halt = first_permanent_halt(events)
     if halt is None:
         return list(trades), equity, None
     kept = [t for t in trades if t.entry_ts <= halt.ts]
-    return kept, equity[equity.index <= halt.ts], halt
+    after = max([halt.ts, *(t.exit_ts for t in kept)])
+    later = equity.index[equity.index > after]
+    cut = later[0] if len(later) else equity.index[-1] if len(equity) else after
+    return kept, equity[equity.index <= cut], halt
 
 
 def median_or_nan(values: Sequence[float]) -> float:

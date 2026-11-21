@@ -9,7 +9,7 @@ import math
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +19,7 @@ import structlog
 from regimebot.backtest.runner import BacktestResult, run_backtest
 from regimebot.config import AppConfig, BreakoutConfig, CostsConfig
 from regimebot.data.resample import resample
-from regimebot.reporting.metrics import first_permanent_halt
+from regimebot.reporting.metrics import active_period
 from regimebot.strategy.base import build_signal
 from regimebot.types import Regime, Side, Signal
 
@@ -166,8 +166,9 @@ def compute_baselines(
 ) -> Baselines:
     """Baselines for ``result`` from base-timeframe ``candles`` (``n_signals`` = the reference
     run's signal count). Buy and hold is given for the active period (up to the reference's
-    first permanent halt) and the full period; random entry runs once per seed at a calibrated
-    probability, under the same risk limits as the reference."""
+    first permanent halt, cut as in ``active_period``) and the full period; random entry runs once
+    per seed at a calibrated probability, under the same risk limits, over that same active
+    period (so frequency and window match the strategy's)."""
     cfg = result.cfg
     decision = {
         s: resample(df, cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe)
@@ -176,11 +177,12 @@ def compute_baselines(
     lo, hi = pd.Timestamp(result.start), pd.Timestamp(result.end)
     window = {s: df[(df.index >= lo) & (df.index < hi)] for s, df in decision.items()}
     full = buy_and_hold(window, cfg.backtest.initial_equity, cfg.costs)
-    halt = first_permanent_halt(result.log.risk_events)
-    active = full
+    _, active_equity, halt = active_period(result.trades, result.equity, result.log.risk_events)
+    active, end = full, result.end
     if halt is not None:
-        until = {s: df[df.index <= halt.ts] for s, df in window.items()}
-        active = buy_and_hold(until, cfg.backtest.initial_equity, cfg.costs)
+        cut = active_equity.index[-1]  # the same cut as the strategy's headline metrics
+        active = _hold_until(window, cut, cfg, full)
+        end = cut.to_pydatetime() + timedelta(microseconds=1)  # decisions are in [start, end)
     seeds = tuple(seeds)
     runs: tuple[BacktestResult, ...] = ()
     p = None
@@ -190,12 +192,24 @@ def compute_baselines(
             candles,
             funding,
             result.start,
-            result.end,
+            end,
             n_reference_signals=n_signals,
-            n_decision_bars=len(result.equity.index.unique()),
+            n_decision_bars=len(active_equity.index.unique()),
             seed=seeds[0],
         )
-        runs = tuple(
-            random_entry(cfg, candles, funding, result.start, result.end, s, p=p) for s in seeds
-        )
+        runs = tuple(random_entry(cfg, candles, funding, result.start, end, s, p=p) for s in seeds)
     return Baselines(active, full, runs, seeds, p, n_signals)
+
+
+def _hold_until(
+    window: Mapping[str, pd.DataFrame], cut: pd.Timestamp, cfg: AppConfig, full: pd.Series
+) -> pd.Series:
+    """Buy and hold up to ``cut``; a symbol with no bar by then stays cash (its share of equity)."""
+    until = {s: df[df.index <= cut] for s, df in window.items()}
+    held = {s: df for s, df in until.items() if not df.empty}
+    initial = cfg.backtest.initial_equity
+    cash = initial * (len(until) - len(held)) / len(until)
+    if not held:
+        return pd.Series(initial, index=full.index[full.index <= cut], name="equity")
+    equity = buy_and_hold(held, initial * len(held) / len(until), cfg.costs)
+    return (equity + cash).rename("equity")
