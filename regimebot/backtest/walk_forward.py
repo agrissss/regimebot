@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 import structlog
 
-from regimebot.backtest.runner import run_backtest
+from regimebot.backtest.runner import BacktestResult, run_backtest
 from regimebot.config import AppConfig, with_overrides
 from regimebot.reporting.metrics import Metrics, compute_metrics, first_permanent_halt
 from regimebot.strategy import Strategy
@@ -54,15 +54,16 @@ def run_metrics(
     start: datetime,
     end: datetime,
     strategies: Sequence[Strategy] | None = None,
-) -> tuple[Metrics, list[Trade], str]:
-    """One backtest on a fresh kill file path (it does not exist, so nothing is halted).
-
-    The third item is the ISO time of the run's first permanent halt (max drawdown), or ""."""
+) -> tuple[Metrics, BacktestResult, str]:
+    """One backtest on a fresh kill file path (it does not exist, so nothing is halted): its
+    metrics over the whole run, the result, and the ISO time of its first permanent halt (max
+    drawdown) or ""."""
     with tempfile.TemporaryDirectory() as tmp:
         result = run_backtest(cfg, candles, funding, start, end, Path(tmp) / "KILL", strategies)
-    metrics = compute_metrics(result.trades, result.equity, cfg.backtest.initial_equity)
+    initial, gross = cfg.backtest.initial_equity, result.gross_exposure
+    metrics = compute_metrics(result.trades, result.equity, initial, gross_exposure=gross)
     halt = first_permanent_halt(result.log.risk_events)
-    return metrics, result.trades, halt.ts.isoformat() if halt else ""
+    return metrics, result, halt.ts.isoformat() if halt else ""
 
 
 def _qualifies(m: Metrics, min_trades: int) -> bool:
@@ -113,11 +114,11 @@ def walk_forward(
             best_m, _, best_halt = run_metrics(
                 cfg, candles, funding, train_start, train_end, strategies
             )
-        tm, trades, test_halt = run_metrics(
+        tm, test_run, test_halt = run_metrics(
             test_cfg, candles, funding, train_end, test_end, strategies
         )
         log.info("walk_forward_test", window=i, n_trades=tm.n_trades, net_pnl=tm.net_pnl)
-        oos.extend(trades)
+        oos.extend(test_run.trades)
         rows.append(
             {
                 "window": i,

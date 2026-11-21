@@ -7,7 +7,7 @@
 import hashlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -171,13 +171,22 @@ class RiskConfig(_Model):
     risk_per_trade: Fraction
     max_gross_leverage: float = Field(gt=0, le=MAX_GROSS_LEVERAGE)
     max_asset_exposure: Fraction
-    max_group_exposure: Fraction
+    max_group_exposure: float = Field(gt=0, le=MAX_GROSS_LEVERAGE)  # may exceed 1x, like gross
     groups: dict[str, list[str]]
     daily_loss: Fraction
     weekly_loss: Fraction
     max_drawdown: Fraction
     streak_half: PositiveInt
     streak_stop: PositiveInt
+
+
+def effective_gross_cap(risk: RiskConfig, symbols: Sequence[str]) -> float:
+    """The gross exposure (multiple of equity) the caps let a run reach: the lower of
+    ``max_gross_leverage`` and, when one group holds every configured symbol (its exposure is
+    then the gross exposure), ``max_group_exposure``; otherwise the gross cap."""
+    one_group = any(set(symbols) <= set(members) for members in risk.groups.values())
+    gross = risk.max_gross_leverage
+    return min(gross, risk.max_group_exposure) if one_group else gross
 
 
 class BacktestConfig(_Model):

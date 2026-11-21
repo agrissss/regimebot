@@ -46,6 +46,23 @@ class BacktestResult:
     start: datetime
     end: datetime
 
+    @property
+    def gross_exposure(self) -> pd.Series:
+        """Gross exposure (quote units) at each equity snapshot in ``log.equity``."""
+        return _snapshot_series(self.log.equity, 2, "gross_exposure")
+
+
+def _snapshot_series(
+    snapshots: Sequence[tuple[datetime, float, float, float]], column: int, name: str
+) -> pd.Series:
+    """One column of ``RunLog.equity`` rows (ts, equity, gross exposure, drawdown) as a Series."""
+    return pd.Series(
+        [row[column] for row in snapshots],
+        index=pd.DatetimeIndex([row[0] for row in snapshots], tz=UTC, name="ts"),
+        name=name,
+        dtype="float64",
+    )
+
 
 @dataclass(frozen=True)
 class _Feed:
@@ -202,12 +219,7 @@ def run_backtest(
         # are not replayed, so a stop or target there is missed; replay them first if it matters.
         engine.flatten_all(decision_times[-1], dict(portfolio.last_prices), ExitReason.END_OF_DATA)
 
-    equity = pd.Series(
-        [e[1] for e in log.equity],
-        index=pd.DatetimeIndex([e[0] for e in log.equity], tz=UTC, name="ts"),
-        name="equity",
-        dtype="float64",
-    )
+    equity = _snapshot_series(log.equity, 1, "equity")
     return BacktestResult(log, log.trades, equity, cfg, start, end)
 
 

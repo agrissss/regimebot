@@ -352,7 +352,8 @@ def backtest_robustness(
     end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
     set_: _SetOption = None,
 ) -> None:
-    """Parameter sensitivity, doubled costs, and max gross leverage 1.0 vs 1.5."""
+    """Parameter sensitivity, doubled costs, and effective leverage (gross and group caps) 1.0
+    vs 1.5."""
     out = Path("reports")
     out.mkdir(parents=True, exist_ok=True)  # before the long computation, so it fails fast
     cfg, candles, funding = _research_inputs(start, end, set_)
@@ -405,6 +406,7 @@ def report(
             trades=trades,
             fills=repo.load_fills(session, run_id),
             risk_events=repo.load_risk_events(session, run_id),
+            equity=repo.load_equity_snapshots(session, run_id),
         )
         result = BacktestResult(
             log, trades, repo.load_equity(session, run_id), cfg, bt.start, bt.end

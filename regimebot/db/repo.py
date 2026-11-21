@@ -470,6 +470,24 @@ def save_equity(
     _insert_chunks(session, EquitySnapshot, rows)
 
 
+def load_equity_snapshots(
+    session: Session, run_id: int
+) -> list[tuple[datetime, float, float, float]]:
+    """A run's equity snapshots ``(ts, equity, gross_exposure, drawdown)`` in time order, as
+    ``RunLog.equity`` holds them."""
+    stmt = (
+        select(
+            EquitySnapshot.ts,
+            EquitySnapshot.equity,
+            EquitySnapshot.gross_exposure,
+            EquitySnapshot.drawdown,
+        )
+        .where(EquitySnapshot.run_id == run_id)
+        .order_by(EquitySnapshot.ts)
+    )
+    return [(ts, eq, gross, dd) for ts, eq, gross, dd in session.execute(stmt)]
+
+
 def load_equity(session: Session, run_id: int) -> pd.Series:
     """A run's equity curve as a float64 Series named ``equity`` on a UTC ``ts`` index."""
     stmt = (

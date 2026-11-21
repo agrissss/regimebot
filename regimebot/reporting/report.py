@@ -20,7 +20,7 @@ from matplotlib.figure import Figure  # Figure renders with Agg and needs no GUI
 
 from regimebot.backtest.baselines import Baselines
 from regimebot.backtest.runner import BacktestResult
-from regimebot.config import config_hash
+from regimebot.config import config_hash, effective_gross_cap
 from regimebot.reporting.metrics import (
     Metrics,
     active_period,
@@ -183,6 +183,7 @@ def _metric_column(m: Metrics) -> dict[str, str]:
         "Target hit rate": _pct(m.target_hit_rate),
         "Stop-out rate": _pct(m.stop_out_rate),
         "Net P&L without the best 5% of trades": _money(m.net_pnl_without_best_5pct),
+        "Max gross leverage seen (gross exposure / equity)": _ratio(m.max_gross_leverage_seen),
     }
 
 
@@ -190,7 +191,8 @@ def _active_metrics(result: BacktestResult) -> tuple[Metrics, RiskEvent | None]:
     """Metrics over the active period (up to a permanent halt) and that halt event, if any."""
     trades, equity, halt = active_period(result.trades, result.equity, result.log.risk_events)
     initial = result.cfg.backtest.initial_equity
-    return compute_metrics(trades, equity, initial, result.log.fills), halt
+    gross = result.gross_exposure
+    return compute_metrics(trades, equity, initial, result.log.fills, gross), halt
 
 
 def _period(result: BacktestResult) -> tuple[str, str]:
@@ -399,11 +401,16 @@ def write_report(
             "random-looking outcomes looks good by luck.</p>",
         )
     symbols = ", ".join(cfg.exchange.symbols)
+    gross_cap = cfg.risk.max_gross_leverage
+    effective_cap = effective_gross_cap(cfg.risk, cfg.exchange.symbols)
+    why = " (one group holds every symbol: its cap binds)" if effective_cap < gross_cap else ""
     info = (
         f"<p>Config hash: <code>{html.escape(config_hash(cfg))}</code><br>"
         f"Backtest period: {result.start.isoformat()} to {result.end.isoformat()} (UTC)<br>"
         f"Symbols: {html.escape(symbols)}<br>"
-        f"Initial equity: {_money(cfg.backtest.initial_equity)}</p>"
+        f"Initial equity: {_money(cfg.backtest.initial_equity)}<br>"
+        f"Leverage: configured gross cap {_num(gross_cap)}x, effective cap "
+        f"{_num(effective_cap)}x{why}</p>"
         f"{_halt_sentence(result, halt)}"
         "<p>This is one in-sample backtest on past data. Every number is net of all modelled "
         "fees (taker and maker), spread, slippage and funding. Buy and hold ignores funding and "

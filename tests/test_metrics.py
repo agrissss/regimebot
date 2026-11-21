@@ -84,6 +84,16 @@ def test_headline_numbers_each_checked() -> None:
     assert m.avg_exit_slippage_bps == 7  # (4 + 10) / 2
 
 
+def test_max_gross_leverage_seen_divides_gross_by_equity_at_each_snapshot() -> None:
+    # 1200 / 950 at the 04:00 dip beats 1300 / 1100 on day 2; the stamp not in EQUITY is ignored
+    gross = pd.Series(0.0, index=EQUITY.index)
+    gross[hm(4)], gross[hm(36)] = 1200.0, 1300.0
+    extra = pd.Series([5000.0], index=pd.DatetimeIndex([hm(100)]))
+    m = compute_metrics(TRADES, EQUITY, INITIAL, gross_exposure=pd.concat([gross, extra]))
+    assert m.max_gross_leverage_seen == pytest.approx(1200 / 950)
+    assert math.isnan(compute_metrics(TRADES, EQUITY, INITIAL).max_gross_leverage_seen)
+
+
 def test_exposure_counts_decision_times_inside_trades_half_open() -> None:
     # 11 equity timestamps. In a position (entry <= ts < exit): 01:00 (T1, T2), 03:00, 04:00 (T3),
     # 06:00 (T4). Not: 02:00 (T2 exits), 05:00, 07:00 (exit times) and the three later days.

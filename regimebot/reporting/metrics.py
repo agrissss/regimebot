@@ -27,8 +27,9 @@ class Metrics:
     ``funding`` and ``net_pnl_without_best_5pct`` are currency; ``return_pct``, ``max_drawdown``,
     ``win_rate``, ``exposure_pct``, ``target_hit_rate`` and ``stop_out_rate`` are fractions
     (0.1 = 10%); ``avg_*_slippage_bps`` are basis points; ``expectancy_r`` is in R multiples;
-    ``turnover`` is a multiple of initial equity; ``sharpe``, ``sortino`` and ``profit_factor``
-    are plain ratios. NaN means "not computable from this data"."""
+    ``turnover`` and ``max_gross_leverage_seen`` (largest gross exposure / equity at a
+    snapshot) are multiples of equity; ``sharpe``, ``sortino`` and ``profit_factor`` are plain
+    ratios. NaN means "not computable from this data"."""
 
     net_pnl: float
     return_pct: float  # fraction of initial equity
@@ -51,6 +52,7 @@ class Metrics:
     net_pnl_without_best_5pct: float
     avg_entry_slippage_bps: float
     avg_exit_slippage_bps: float
+    max_gross_leverage_seen: float
 
 
 def daily_equity(equity: pd.Series) -> pd.Series:
@@ -140,13 +142,23 @@ def _slippage(trades: Sequence[Trade], fills: Sequence[Fill]) -> tuple[float, fl
     return _mean(entries), _mean(exits)
 
 
+def _max_leverage(equity: pd.Series, gross_exposure: pd.Series | None) -> float:
+    if gross_exposure is None or equity.empty:
+        return math.nan
+    leverage = gross_exposure.reindex(equity.index) / equity
+    return float(leverage.max()) if leverage.notna().any() else math.nan
+
+
 def compute_metrics(
     trades: Sequence[Trade],
     equity: pd.Series,
     initial_equity: float,
     fills: Sequence[Fill] = (),
+    gross_exposure: pd.Series | None = None,
 ) -> Metrics:
-    """All headline metrics. ``equity`` is the decision-time equity curve on a UTC index."""
+    """All headline metrics. ``equity`` is the decision-time equity curve on a UTC index;
+    ``gross_exposure`` is the gross exposure at each equity snapshot (only the stamps in
+    ``equity`` count; without it ``max_gross_leverage_seen`` is NaN)."""
     pnls = [t.net_pnl for t in trades]
     n = len(trades)
     winners = [p for p in pnls if p > 0]
@@ -184,6 +196,7 @@ def compute_metrics(
         net_pnl_without_best_5pct=float(sum(kept)),
         avg_entry_slippage_bps=entry_slip,
         avg_exit_slippage_bps=exit_slip,
+        max_gross_leverage_seen=_max_leverage(equity, gross_exposure),
     )
 
 

@@ -94,6 +94,8 @@ def test_html_has_warning_first_every_heading_and_honest_notes(
     assert len(RISK_WARNING) == 6
     assert config_hash(result.cfg) in text
     assert "12 parameter variants" in text and "likely overstated" in text
+    # BTC alone, in the default group capped at 1.0: the 1.5 gross cap cannot be reached
+    assert "Leverage: configured gross cap 1.50x, effective cap 1.00x (one group" in text
     assert "Buy and hold" in text and "Random entry" in text
     assert "Parameter variants tried" in text
     assert "all modelled fees (taker and maker)" in text
@@ -121,8 +123,12 @@ def test_halted_run_reports_the_active_period_and_truncated_baselines(
     assert equity.index[-1] > halt.ts  # the realising snapshot is the bar after the halt
     # metrics are those of the truncated trades and equity
     assert len(equity) < len(result.equity)
-    m = compute_metrics(trades, equity, result.cfg.backtest.initial_equity, result.log.fills)
+    initial = result.cfg.backtest.initial_equity
+    m = compute_metrics(trades, equity, initial, result.log.fills, result.gross_exposure)
     assert f"<td>{m.net_pnl:,.2f}</td>" in text
+    assert m.max_gross_leverage_seen > 0
+    label = "Max gross leverage seen (gross exposure / equity)"
+    assert f"<td>{label}</td><td>{m.max_gross_leverage_seen:.2f}</td>" in text
     assert (
         f"<td>{'n/a' if math.isnan(m.sharpe) else f'{m.sharpe:.2f}'}</td>" in text
         and f"<td>{m.exposure_pct * 100:.2f}%</td>" in text
@@ -226,6 +232,9 @@ def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
     assert done.exit_code == 0, done.output
     html_text = (tmp_path / "reports" / f"run_{run.id}" / "report.html").read_text("utf-8")
     assert "3 parameter variants" in html_text and run.config_hash in html_text
+    # gross exposure comes back from the stored equity snapshots
+    leverage = "<td>Max gross leverage seen (gross exposure / equity)</td><td>"
+    assert leverage in html_text and leverage + "n/a" not in html_text
     assert runner.invoke(app, ["report", "999"]).exit_code != 0
     with session_scope(engine) as session:
         paper_id = repo.create_run(session, Mode.PAPER, load_config())

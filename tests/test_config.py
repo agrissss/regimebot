@@ -8,6 +8,7 @@ from regimebot.config import (
     DEFAULT_CONFIG_PATH,
     config_hash,
     config_json,
+    effective_gross_cap,
     load_config,
     timeframe_minutes,
     with_overrides,
@@ -72,6 +73,19 @@ def test_paper_warmup_must_cover_the_feature_warm_up() -> None:
         load_config(overrides={"paper.warmup_bars": 2975})
     with pytest.raises(ValidationError, match="below the 3096"):  # 96 + 3000
         load_config(overrides={"features.pctile_window": 3000})
+
+
+def test_effective_gross_cap() -> None:
+    cfg = load_config()  # every symbol in "majors": its 1.0 cap binds before the 1.5 gross cap
+    assert effective_gross_cap(cfg.risk, cfg.exchange.symbols) == 1.0
+    both = with_overrides(cfg, {"risk.max_group_exposure": 1.5})  # group caps may exceed 1x now
+    assert effective_gross_cap(both.risk, both.exchange.symbols) == 1.5
+    split = with_overrides(cfg, {"risk.groups": {"a": ["BTC/USDT:USDT"], "b": ["SOL/USDT:USDT"]}})
+    assert effective_gross_cap(split.risk, split.exchange.symbols) == 1.5  # no group holds all
+    low_gross = with_overrides(cfg, {"risk.max_gross_leverage": 0.8})
+    assert effective_gross_cap(low_gross.risk, low_gross.exchange.symbols) == 0.8
+    with pytest.raises(ValueError):
+        with_overrides(cfg, {"risk.max_group_exposure": 1.6})  # same hard cap as gross
 
 
 def test_fraction_and_timeframe_rejected() -> None:

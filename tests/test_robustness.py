@@ -2,12 +2,12 @@
 
 import math
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pytest
-from synth import BTC, T0, Scripted, candles_from_closes, regime_walk
+from synth import BTC, ETH, SOL, T0, Scripted, candles_from_closes, regime_walk
 
 from regimebot.backtest import robustness
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
@@ -116,8 +116,55 @@ def test_cost_stress_never_increases_net_pnl_for_the_same_trades() -> None:
 def test_leverage_compare_returns_both_rows() -> None:
     df = leverage_compare(open_cfg(), CANDLES, {}, T0, END, strategies=stub())
     assert df.max_gross_leverage.tolist() == [1.0, 1.5]
-    assert {"net_pnl", "max_drawdown", "n_trades"} <= set(df.columns)
+    assert list(df.columns) == [
+        "max_gross_leverage",
+        "max_group_exposure",
+        "net_pnl",
+        "max_drawdown",
+        "n_trades",
+        "max_gross_seen",
+        "n_cap_asset",
+        "n_cap_group",
+        "n_cap_gross",
+        "halted_at",
+    ]
     assert df.n_trades.gt(0).all() and df.max_drawdown.ge(0).all()
+
+
+def three_symbols(**overrides: object) -> AppConfig:
+    entry = {"strategies": ["breakout"], "size_mult": 1.0, "allow_entries": True}
+    playbook = {f"playbook.{r.value}": {**entry, "force_close": False} for r in Regime}
+    return load_config(overrides={"exchange.symbols": [BTC, ETH, SOL], **playbook, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("groups", "caps_10", "caps_15"),
+    [
+        # one group of all three (the default): BTC fills its asset room (0.75), ETH the group
+        # room left (0.25 at 1.0x, 0.75 at 1.5x, where its asset cap ties and wins), SOL has none
+        (None, (1, 1, 0), (2, 0, 0)),
+        # a group per symbol: at 1.0x the gross room limits ETH instead
+        ({"a": [BTC], "b": [ETH], "c": [SOL]}, (1, 0, 1), (2, 0, 0)),
+    ],
+    ids=["one_group", "group_per_symbol"],
+)
+def test_leverage_compare_raises_both_caps_and_counts_the_cap_that_limited_each_entry(
+    groups: dict[str, list[str]] | None,
+    caps_10: tuple[int, int, int],
+    caps_15: tuple[int, int, int],
+) -> None:
+    cfg = three_symbols(**({} if groups is None else {"risk.groups": groups}))
+    candles = {s: candles_from_closes([100.0] * 120) for s in (BTC, ETH, SOL)}
+    # all three signal at one decision; a 0.1 stop asks for far more than any cap allows
+    stub = [Scripted("breakout", stop_dist=0.1, target_dist=50.0, at={T0 + timedelta(minutes=30)})]
+    df = leverage_compare(cfg, candles, {}, T0, T0 + timedelta(hours=2), strategies=stub)
+    assert df.max_gross_leverage.tolist() == df.max_group_exposure.tolist() == [1.0, 1.5]
+    counts = df[["n_cap_asset", "n_cap_group", "n_cap_gross"]].to_numpy().tolist()
+    assert counts == [list(caps_10), list(caps_15)]
+    assert df.n_trades.tolist() == [2, 2]  # BTC and ETH; SOL was rejected for lack of room
+    low, high = df.max_gross_seen.tolist()
+    assert low == pytest.approx(1.0, rel=2e-3) and high == pytest.approx(1.5, rel=2e-3)
+    assert high > 1.0
 
 
 def test_cost_stress_multiplies_all_five_cost_fields(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,10 +1,11 @@
-"""Robustness checks: parameter sensitivity, doubled costs, lower leverage.
+"""Robustness checks: parameter sensitivity, doubled costs, effective leverage 1.0 vs 1.5.
 
 Each function re-runs the backtest on ``[start, end)`` with a modified config; all other
 settings stay at ``cfg``. ``strategies`` is an optional pass-through to ``run_backtest``.
 """
 
 import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 
 from regimebot.backtest.walk_forward import run_metrics
 from regimebot.config import AppConfig, with_overrides
+from regimebot.engine.loop import RunLog
 from regimebot.reporting.metrics import Metrics
 from regimebot.strategy import Strategy
 
@@ -146,25 +148,40 @@ def leverage_compare(
     end: datetime,
     strategies: Sequence[Strategy] | None = None,
 ) -> pd.DataFrame:
-    """Two rows for ``risk.max_gross_leverage`` 1.0 and 1.5."""
+    """Effective leverage 1.0 vs 1.5: each level L sets both ``risk.max_gross_leverage`` and
+    ``risk.max_group_exposure`` to L (the asset cap is unchanged).
+
+    Both, because with the default single group holding every symbol the group's exposure is
+    the gross exposure: the configured 1.5x gross cap is unreachable unless the group cap is
+    raised too, and raising the gross cap alone changes nothing. Columns: max_gross_leverage,
+    max_group_exposure, net_pnl, max_drawdown, n_trades, max_gross_seen (largest gross exposure
+    / equity at a snapshot), n_cap_asset / n_cap_group / n_cap_gross (approvals whose size that
+    cap limited), halted_at.
+    """
     rows = []
     for lev in (1.0, 1.5):
-        m, _, halted = run_metrics(
-            with_overrides(cfg, {"risk.max_gross_leverage": lev}),
-            candles,
-            funding,
-            start,
-            end,
-            strategies,
+        variant = with_overrides(
+            cfg, {"risk.max_gross_leverage": lev, "risk.max_group_exposure": lev}
         )
-        log.info("leverage_compare", max_gross_leverage=lev)
+        m, result, halted = run_metrics(variant, candles, funding, start, end, strategies)
+        log.info("leverage_compare", max_gross_leverage=lev, max_group_exposure=lev)
         rows.append(
             {
                 "max_gross_leverage": lev,
+                "max_group_exposure": lev,
                 "net_pnl": m.net_pnl,
                 "max_drawdown": m.max_drawdown,
                 "n_trades": m.n_trades,
+                "max_gross_seen": m.max_gross_leverage_seen,
+                **cap_counts(result.log),
                 "halted_at": halted,
             }
         )
     return pd.DataFrame(rows)
+
+
+def cap_counts(log: RunLog) -> dict[str, int]:
+    """Approved decisions whose size a cap limited, as ``n_cap_asset``, ``n_cap_group`` and
+    ``n_cap_gross`` (a cap with no room left rejects instead, and is not counted)."""
+    rules = Counter(d.rule for _, _, d in log.decisions if d.approved)
+    return {f"n_{rule}": rules[rule] for rule in ("cap_asset", "cap_group", "cap_gross")}
