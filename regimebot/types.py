@@ -132,5 +132,8 @@ class RiskEvent:
 
 
 def side_sign(side: Side) -> int:
-    """Return +1 for LONG and -1 for SHORT (multiplier for price moves)."""
-    return 1 if side is Side.LONG else -1
+    """Return +1 for LONG and -1 for SHORT (multiplier for price moves).
+
+    Accepts the plain strings too (DB/pandas values); anything else raises ValueError.
+    """
+    return {Side.LONG: 1, Side.SHORT: -1}[Side(side)]

@@ -3,7 +3,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: regimebot
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-regimebot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: regimebot
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -19,7 +19,7 @@ services:
       args:
         EXTRAS: postgres
     environment:
-      DATABASE_URL: postgresql+psycopg://regimebot:${POSTGRES_PASSWORD:-regimebot}@db/regimebot
+      DATABASE_URL: postgresql+psycopg://regimebot:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db/regimebot
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     depends_on:
       db:

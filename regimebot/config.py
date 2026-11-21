@@ -4,11 +4,11 @@
 ``DATABASE_URL`` env var and dotted-path overrides, then validates.
 """
 
-import copy
 import hashlib
 import json
 import os
 from collections.abc import Mapping
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -24,6 +24,7 @@ Timeframe = Literal["1m", "5m", "15m", "1h", "4h"]
 StrategyName = Literal["breakout", "trend", "mean_reversion"]
 Fraction = Annotated[float, Field(gt=0, le=1)]
 NonNegative = Annotated[float, Field(ge=0)]
+UnitFraction = Annotated[float, Field(ge=0, le=1)]  # 0 allowed, e.g. size_mult 0.0
 
 _TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
@@ -79,6 +80,14 @@ class EventWindow(_Model):
     end: AwareDatetime
     label: str
 
+    @model_validator(mode="after")
+    def _utc_and_ordered(self) -> "EventWindow":
+        object.__setattr__(self, "start", self.start.astimezone(UTC))
+        object.__setattr__(self, "end", self.end.astimezone(UTC))
+        if self.start >= self.end:
+            raise ValueError("event window start must be before end")
+        return self
+
 
 class RegimeConfig(_Model):
     expansion_pctile: Fraction
@@ -93,14 +102,14 @@ class RegimeConfig(_Model):
 
 class PlaybookEntry(_Model):
     strategies: list[StrategyName]
-    size_mult: NonNegative
+    size_mult: UnitFraction
     allow_entries: bool
     force_close: bool
 
 
 class BreakoutConfig(_Model):
     enabled: bool
-    min_target_pct: NonNegative
+    min_target_pct: UnitFraction
     min_rr: float = Field(gt=0)
     stop_atr_mult: float = Field(gt=0)
     max_stop_pct: Fraction
@@ -113,7 +122,7 @@ class BreakoutConfig(_Model):
 
 class TrendConfig(_Model):
     enabled: bool
-    min_target_pct: NonNegative
+    min_target_pct: UnitFraction
     min_rr: float = Field(gt=0)
     stop_atr_mult: float = Field(gt=0)
     max_stop_pct: Fraction
@@ -127,7 +136,7 @@ class TrendConfig(_Model):
 
 class MeanReversionConfig(_Model):
     enabled: bool
-    min_target_pct: NonNegative
+    min_target_pct: UnitFraction
     min_rr: float = Field(gt=0)
     entry_z: float = Field(gt=0)
     stop_atr_mult: float = Field(gt=0)
@@ -163,6 +172,8 @@ class BacktestConfig(_Model):
 
     @model_validator(mode="after")
     def _start_before_end(self) -> "BacktestConfig":
+        object.__setattr__(self, "start", self.start.astimezone(UTC))
+        object.__setattr__(self, "end", self.end.astimezone(UTC))
         if self.start >= self.end:
             raise ValueError("backtest start must be before end")
         return self
@@ -224,8 +235,11 @@ def load_config(
     ``DATABASE_URL`` env var replaces ``database_url``; ``overrides`` (dotted path
     to value) are applied last, before validation, so an explicit override wins.
     """
-    with (path or DEFAULT_CONFIG_PATH).open(encoding="utf-8") as f:
-        raw = copy.deepcopy(yaml.safe_load(f))
+    path = path or DEFAULT_CONFIG_PATH
+    with path.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"config file {path} must contain a YAML mapping")
     if env_url := os.environ.get("DATABASE_URL"):
         raw["database_url"] = env_url
     for dotted, value in (overrides or {}).items():
@@ -233,7 +247,14 @@ def load_config(
     return AppConfig.model_validate(raw)
 
 
+def config_json(cfg: AppConfig) -> str:
+    """Canonical JSON of the strategy config, without ``database_url`` (it may hold a password
+    and must not change the identity of a run between SQLite and Postgres)."""
+    return json.dumps(
+        cfg.model_dump(mode="json", exclude={"database_url"}), sort_keys=True, separators=(",", ":")
+    )
+
+
 def config_hash(cfg: AppConfig) -> str:
-    """First 16 hex chars of the sha256 of the canonical JSON dump (identifies a run's config)."""
-    canonical = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    """First 16 hex chars of the sha256 of ``config_json`` (identifies a run's config)."""
+    return hashlib.sha256(config_json(cfg).encode()).hexdigest()[:16]

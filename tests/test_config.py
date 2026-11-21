@@ -4,7 +4,13 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from regimebot.config import DEFAULT_CONFIG_PATH, config_hash, load_config, timeframe_minutes
+from regimebot.config import (
+    DEFAULT_CONFIG_PATH,
+    config_hash,
+    config_json,
+    load_config,
+    timeframe_minutes,
+)
 from regimebot.types import Regime, Side, side_sign
 
 
@@ -80,6 +86,67 @@ def test_timeframe_minutes() -> None:
         timeframe_minutes("2h")
 
 
+def _write(tmp_path: Path, mutate) -> Path:  # type: ignore[no-untyped-def]  # test helper
+    raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
+    mutate(raw)
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def test_unknown_playbook_key_and_strategy_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, lambda r: r["playbook"].update(bogus=r["playbook"]["range"])))
+    with pytest.raises(ValidationError):
+        load_config(_write(tmp_path, lambda r: r["playbook"]["range"].update(strategies=["x"])))
+
+
+def test_non_positive_window_rejected() -> None:
+    with pytest.raises(ValidationError):
+        load_config(overrides={"features.atr_window": 0})
+
+
+def test_percent_style_fractions_rejected() -> None:
+    with pytest.raises(ValidationError):
+        load_config(overrides={"strategies.breakout.min_target_pct": 5})
+    with pytest.raises(ValidationError):
+        load_config(overrides={"playbook.range.size_mult": 2.0})
+
+
+def test_datetimes_normalised_to_utc_and_hash_equal() -> None:
+    plus2 = load_config(overrides={"backtest.start": "2024-01-01T02:00:00+02:00"})
+    zulu = load_config(overrides={"backtest.start": "2024-01-01T00:00:00Z"})
+    assert plus2.backtest.start.utcoffset().total_seconds() == 0  # type: ignore[union-attr]  # aware
+    assert config_hash(plus2) == config_hash(zulu)
+
+
+def test_event_window_ordered_and_utc() -> None:
+    ok = {"start": "2024-05-01T10:00:00+02:00", "end": "2024-05-01T12:00:00Z", "label": "fomc"}
+    cfg = load_config(overrides={"regime.event_windows": [ok]})
+    assert cfg.regime.event_windows[0].start.isoformat() == "2024-05-01T08:00:00+00:00"
+    with pytest.raises(ValidationError, match="before end"):
+        load_config(overrides={"regime.event_windows": [{**ok, "end": ok["start"]}]})
+
+
+def test_config_json_and_hash_exclude_database_url() -> None:
+    a = load_config(overrides={"database_url": "postgresql+psycopg://u:secret@db/x"})
+    b = load_config()
+    assert "database_url" not in config_json(a) and "secret" not in config_json(a)
+    assert config_hash(a) == config_hash(b)
+
+
+def test_empty_or_non_mapping_yaml_rejected(tmp_path: Path) -> None:
+    for text in ("", "- a\n- b\n"):
+        path = tmp_path / "bad.yaml"
+        path.write_text(text)
+        with pytest.raises(ValueError, match="bad.yaml"):
+            load_config(path)
+
+
 def test_side_sign() -> None:
     assert side_sign(Side.LONG) == 1
     assert side_sign(Side.SHORT) == -1
+    assert side_sign("long") == 1  # type: ignore[arg-type]  # untyped DB/pandas value
+    assert side_sign("short") == -1  # type: ignore[arg-type]  # untyped DB/pandas value
+    with pytest.raises(ValueError):
+        side_sign("sideways")  # type: ignore[arg-type]  # invalid on purpose

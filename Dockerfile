@@ -7,7 +7,8 @@ COPY pyproject.toml ./
 COPY regimebot ./regimebot
 COPY config ./config
 ARG EXTRAS=postgres
-RUN pip install ".[${EXTRAS}]"
+# editable: the default config is located relative to the package source
+RUN pip install -e ".[${EXTRAS}]"
 
 RUN useradd --create-home app && mkdir -p data && chown app data
 USER app
