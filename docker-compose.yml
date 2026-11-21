@@ -21,9 +21,14 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://regimebot:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db/regimebot
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    volumes:
+      - appdata:/app/data  # kill file, lock files, SQLite; shared by every app container
+      - reports:/app/reports
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   pgdata:
+  appdata:
+  reports:
