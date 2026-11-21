@@ -1,5 +1,6 @@
 """Command-line entry point."""
 
+import json
 import tempfile
 from datetime import UTC, datetime
 from importlib.metadata import version as package_version
@@ -8,18 +9,23 @@ from typing import Annotated
 
 import pandas as pd
 import typer
+import yaml
 
-from regimebot.backtest.runner import persist_result, run_backtest
-from regimebot.config import load_config, timeframe_minutes
+from regimebot.backtest.baselines import compute_baselines
+from regimebot.backtest.runner import BacktestResult, persist_result, run_backtest
+from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
 from regimebot.data.validate import ValidationReport, validate_candles
+from regimebot.db import repo
 from regimebot.db.repo import load_candles, load_funding
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
+from regimebot.engine.loop import RunLog
 from regimebot.market_state.features import compute_features
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
+from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
 
 app = typer.Typer(help="Regime-aware crypto trading research system.", no_args_is_help=True)
@@ -182,6 +188,12 @@ def backtest_run(
     start: Annotated[str | None, typer.Option(help="ISO start (default: backtest start).")] = None,
     end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
     note: Annotated[str, typer.Option(help="Free-text note stored with the run.")] = "",
+    set_: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set", help="Config override key=value (dotted path, YAML value); repeatable."
+        ),
+    ] = None,
 ) -> None:
     """Backtest the configured symbols on stored candles, store the run, print headline numbers.
 
@@ -189,11 +201,19 @@ def backtest_run(
     `regimebot kill` (meant for paper sessions) neither halts it nor changes its result.
     """
     overrides: dict[str, object] = {}
+    for item in set_ or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise typer.BadParameter(f"--set needs key=value, got {item!r}")
+        overrides[key] = yaml.safe_load(value)
     if start:
         overrides["backtest.start"] = _parse_utc(start)
     if end:
         overrides["backtest.end"] = _parse_utc(end)
-    cfg = load_config(overrides=overrides)  # the stored config shows the range actually run
+    try:
+        cfg = load_config(overrides=overrides)  # the stored config shows the range actually run
+    except ValueError as exc:  # unknown --set path, or a value the config model rejects
+        raise typer.BadParameter(str(exc)) from None
     symbols, base, bt = cfg.exchange.symbols, cfg.exchange.base_timeframe, cfg.backtest
     engine = make_engine(cfg.database_url)
     with session_scope(engine) as session:  # history before start is feature warm-up
@@ -216,3 +236,42 @@ def backtest_run(
         f"max_drawdown={max_dd:.2%}"
     )
     typer.echo(f"run {run_id}")
+
+
+@app.command()
+def report(
+    run_id: Annotated[int, typer.Argument(help="Run id printed by `backtest run`.")],
+    variants_tried: Annotated[
+        int | None, typer.Option(help="Parameter variants tried before this one (shown).")
+    ] = None,
+) -> None:
+    """Rebuild the HTML report for a stored backtest into reports/run_<id>/.
+
+    Trades, fills, risk events and equity come from the database; the baselines are recomputed
+    from stored candles with the run's stored config (the random-entry rerun takes a minute or two).
+    """
+    engine = make_engine(load_config().database_url)
+    with session_scope(engine) as session:
+        try:
+            run = repo.load_run(session, run_id)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        stored = json.loads(run.config_json) | {"database_url": load_config().database_url}
+        cfg = AppConfig.model_validate(stored)
+        bt, base = cfg.backtest, cfg.exchange.base_timeframe
+        trades = repo.load_trades(session, run_id)
+        log = RunLog(
+            trades=trades,
+            fills=repo.load_fills(session, run_id),
+            risk_events=repo.load_risk_events(session, run_id),
+        )
+        result = BacktestResult(
+            log, trades, repo.load_equity(session, run_id), cfg, bt.start, bt.end
+        )
+        n_signals = repo.count_signals(session, run_id)
+        candles = {s: load_candles(session, s, base, None, bt.end) for s in cfg.exchange.symbols}
+        funding = {s: load_funding(session, s, None, bt.end) for s in cfg.exchange.symbols}
+    typer.echo("recomputing baselines (buy and hold, random entry) ...")
+    baselines = compute_baselines(result, candles, funding, n_signals)
+    path = write_report(result, baselines, Path("reports") / f"run_{run_id}", variants_tried)
+    typer.echo(f"wrote {path}")

@@ -178,6 +178,16 @@ def test_create_and_end_run(session: Session, cfg: AppConfig) -> None:
         repo.end_run(session, 999)
 
 
+def test_load_run_and_count_signals(session: Session, cfg: AppConfig) -> None:
+    run_id = repo.create_run(session, Mode.BACKTEST, cfg, note="n")
+    info = repo.load_run(session, run_id)
+    assert (info.id, info.mode, info.note) == (run_id, "backtest", "n")
+    assert info.config_json == config_json(cfg) and info.started_at.tzinfo is not None
+    assert repo.count_signals(session, run_id) == 0
+    with pytest.raises(ValueError, match="unknown run_id"):
+        repo.load_run(session, 999)
+
+
 def test_git_sha_unknown_when_git_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", "")
     assert repo._git_sha() == "unknown"
@@ -266,6 +276,10 @@ def test_fills_events_regimes_equity_round_trip(session: Session, cfg: AppConfig
         run_id,
         [(ts[2], 102.0, 0.0, 0.0), (ts[0], 100.0, 0.5, 0.0), (ts[1], 99.0, 0.5, 0.01)],
     )
+    fill = Fill("BTC", T0, OrderSide.BUY, 1.0, 100.1, 100.0, 0.05, 10.0, "taker")
+    assert repo.load_fills(session, run_id) == [fill]
+    assert repo.load_risk_events(session, run_id) == [RiskEvent(T0, "daily_loss", "d", "halt")]
+    assert repo.load_fills(session, 999) == [] and repo.load_risk_events(session, 999) == []
     eq = repo.load_equity(session, run_id)
     assert eq.tolist() == [100.0, 99.0, 102.0] and eq.name == "equity"
     assert str(eq.index.tz) == "UTC" and eq.index[0] == ts[0]

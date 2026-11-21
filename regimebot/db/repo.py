@@ -40,6 +40,7 @@ from regimebot.types import (
     ExitReason,
     Fill,
     Mode,
+    OrderSide,
     Regime,
     RiskDecision,
     RiskEvent,
@@ -272,6 +273,35 @@ def end_run(session: Session, run_id: int) -> None:
     run.ended_at = datetime.now(UTC)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class RunInfo:
+    """A stored run's identity: what ran (config snapshot) and when."""
+
+    id: int
+    mode: str
+    config_hash: str
+    config_json: str
+    git_sha: str
+    started_at: datetime
+    note: str
+
+
+def load_run(session: Session, run_id: int) -> RunInfo:
+    """A run's stored identity; raises ValueError for an unknown id."""
+    run = session.get(Run, run_id)
+    if run is None:
+        raise ValueError(f"unknown run_id {run_id}")
+    return RunInfo(
+        run.id, run.mode, run.config_hash, run.config_json, run.git_sha, run.started_at, run.note
+    )
+
+
+def count_signals(session: Session, run_id: int) -> int:
+    """Number of signals a run generated."""
+    stmt = select(func.count()).select_from(SignalRow).where(SignalRow.run_id == run_id)
+    return int(session.scalar(stmt) or 0)
+
+
 # --- trading records ---------------------------------------------------------------------
 
 
@@ -324,6 +354,25 @@ def save_fills(session: Session, run_id: int, fills: Sequence[Fill]) -> None:
         for f in fills
     ]
     _insert_chunks(session, FillRow, rows)
+
+
+def load_fills(session: Session, run_id: int) -> list[Fill]:
+    """A run's fills in time order (then insertion order)."""
+    stmt = select(FillRow).where(FillRow.run_id == run_id).order_by(FillRow.ts, FillRow.id)
+    return [
+        Fill(
+            r.symbol,
+            r.ts,
+            OrderSide(r.side),
+            r.qty,
+            r.price,
+            r.ref_price,
+            r.fee,
+            r.slippage_bps,
+            r.liquidity,
+        )
+        for r in session.scalars(stmt)
+    ]
 
 
 def save_signals(session: Session, run_id: int, signals: Sequence[Signal]) -> list[int]:
@@ -379,6 +428,16 @@ def save_risk_events(session: Session, run_id: int, events: Sequence[RiskEvent])
         for e in events
     ]
     _insert_chunks(session, RiskEventRow, rows)
+
+
+def load_risk_events(session: Session, run_id: int) -> list[RiskEvent]:
+    """A run's risk events in time order (then insertion order)."""
+    stmt = (
+        select(RiskEventRow)
+        .where(RiskEventRow.run_id == run_id)
+        .order_by(RiskEventRow.ts, RiskEventRow.id)
+    )
+    return [RiskEvent(r.ts, r.kind, r.detail, r.action) for r in session.scalars(stmt)]
 
 
 def save_regimes(
