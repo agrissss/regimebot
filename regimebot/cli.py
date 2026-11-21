@@ -6,6 +6,7 @@ import tempfile
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as package_version
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated
 
@@ -22,7 +23,12 @@ from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
-from regimebot.data.validate import ValidationReport, validate_candles
+from regimebot.data.validate import (
+    FUNDING_GAP_TOLERANCE,
+    ValidationReport,
+    funding_gaps,
+    validate_candles,
+)
 from regimebot.db import repo
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.logging import configure_logging
@@ -145,34 +151,69 @@ def _report_lines(report: ValidationReport, df: pd.DataFrame, short: bool) -> li
     return lines
 
 
+def _hours(span: timedelta) -> str:
+    return f"{span / timedelta(hours=1):.1f} h"
+
+
+def _funding_lines(
+    stamps: list[datetime], gaps: list[tuple[datetime, datetime]], start: datetime, end: datetime
+) -> list[str]:
+    """Row count, first and last stamp, the largest stretch without a stamp (range edges
+    included), and every stretch over the tolerance (at most ``MAX_GAPS_SHOWN``)."""
+    largest = max(b - a for a, b in pairwise([start, *stamps, end]))
+    head = f"funding rows={len(stamps)}"
+    if stamps:
+        head += f" first={stamps[0].isoformat()} last={stamps[-1].isoformat()}"
+    lines = [f"{head} largest_gap={_hours(largest)}"]
+    lines += [
+        f"funding gap {a.isoformat()} .. {b.isoformat()} ({_hours(b - a)})"
+        for a, b in gaps[:MAX_GAPS_SHOWN]
+    ]
+    if len(gaps) > MAX_GAPS_SHOWN:
+        lines.append(f"... and {len(gaps) - MAX_GAPS_SHOWN} more funding gaps")
+    return lines
+
+
 @data_app.command("check")
 def data_check() -> None:
-    """Validate stored candles per symbol over the backtest range and the feature warm-up before
-    it (``history_start`` to the backtest end); exit 1 if any symbol is not ok."""
+    """Validate stored candles and funding per symbol over the backtest range and the feature
+    warm-up before it (``history_start`` to the backtest end); exit 1 if any symbol is not ok.
+    Funding fails on any stretch without a stamp longer than ``FUNDING_GAP_TOLERANCE``."""
     cfg = load_config()
     tf = cfg.exchange.base_timeframe
     width = pd.Timedelta(minutes=timeframe_minutes(tf))
-    start = history_start(cfg)
+    start, end = history_start(cfg), cfg.backtest.end
     engine = make_engine(cfg.database_url)
-    all_ok = True
+    candles_ok = funding_ok = True
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            df = repo.load_candles(session, symbol, tf, start, cfg.backtest.end)
+            df = repo.load_candles(session, symbol, tf, start, end)
             report = validate_candles(df, tf)
             # exact: first bar closes at the first grid point >= start, last at the one before end
             short = report.bars == 0 or (
                 df.index[0] > pd.Timestamp(start).ceil(width)
-                or df.index[-1] < pd.Timestamp(cfg.backtest.end).ceil(width) - width
+                or df.index[-1] < pd.Timestamp(end).ceil(width) - width
             )
-            all_ok &= report.ok and not short
-            typer.echo(f"{symbol}: {'OK' if report.ok and not short else 'FAIL'}")
-            for line in _report_lines(report, df, short):
+            stamps = list(repo.funding_timestamps(session, symbol, start, end).to_pydatetime())
+            gaps = funding_gaps(stamps, start, end)
+            ok = report.ok and not short
+            candles_ok &= ok
+            funding_ok &= not gaps
+            typer.echo(f"{symbol}: {'OK' if ok and not gaps else 'FAIL'}")
+            for line in _report_lines(report, df, short) + _funding_lines(stamps, gaps, start, end):
                 typer.echo(f"  {line}")
-    if not all_ok:
+    if not candles_ok:
         typer.echo(
             f"the backtest needs {tf} history from {start.isoformat()} (feature warm-up) to "
-            f"{cfg.backtest.end.isoformat()}: run `regimebot data download` to fetch it"
+            f"{end.isoformat()}: run `regimebot data download` to fetch it"
         )
+    if not funding_ok:
+        typer.echo(
+            f"funding has stretches over {FUNDING_GAP_TOLERANCE / timedelta(hours=1):.0f} h "
+            f"without a stamp between {start.isoformat()} and {end.isoformat()}: "
+            "run `regimebot data download` to fetch them"
+        )
+    if not (candles_ok and funding_ok):
         raise typer.Exit(1)
 
 
@@ -288,6 +329,11 @@ def backtest_run(
         typer.echo(
             f"warning: under-warmed start, no trades until warm ({'; '.join(cold)}): "
             "run `regimebot data download` for the warm-up history"
+        )
+    if holes := [e.detail for e in events if e.kind == "funding_missing"]:
+        typer.echo(
+            f"warning: funding missing, not charged there ({'; '.join(holes)}): "
+            "run `regimebot data download` for the funding history"
         )
     typer.echo(f"run {run_id}")
 

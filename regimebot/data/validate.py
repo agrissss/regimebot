@@ -1,7 +1,9 @@
-"""Candle data-quality checks."""
+"""Candle and funding data-quality checks."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from itertools import pairwise
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,10 @@ import pandas as pd
 from regimebot.config import timeframe_minutes
 
 MAX_GAP_FRACTION = 0.001  # gaps tolerated when under 0.1% of expected bars
+FUNDING_INTERVAL = timedelta(hours=8)  # Binance perpetual funding cadence
+# Funding stamps carry millisecond jitter, so stretches are compared, not grid points. One missed
+# event leaves 16 h between stamps; more than this means a hole worth fetching or flagging.
+FUNDING_GAP_TOLERANCE = 2 * FUNDING_INTERVAL + timedelta(hours=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +49,15 @@ def gap_ranges(missing: pd.DatetimeIndex, step: pd.Timedelta) -> list[tuple[date
     firsts = missing[np.concatenate(([0], breaks + 1))].to_pydatetime()
     lasts = missing[np.concatenate((breaks, [len(missing) - 1]))].to_pydatetime()
     return list(zip(firsts, lasts, strict=True))
+
+
+def funding_gaps(
+    stamps: Sequence[datetime], start: datetime, end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Stretches of ``[start, end]`` without a funding stamp that are longer than
+    ``FUNDING_GAP_TOLERANCE``, as ``(from, to)``: each bound is a range edge or the stamp next to
+    the stretch. ``stamps`` are the sorted stamps inside the range."""
+    return [(a, b) for a, b in pairwise([start, *stamps, end]) if b - a > FUNDING_GAP_TOLERANCE]
 
 
 def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:

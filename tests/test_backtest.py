@@ -31,6 +31,7 @@ from regimebot.config import AppConfig, load_config
 from regimebot.db import repo
 from regimebot.db.models import Base, RiskDecisionRow, RiskEventRow, Run, SignalRow
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
+from regimebot.reporting.metrics import first_permanent_halt
 from regimebot.types import ExitReason, OrderSide, Regime
 
 HOUR = timedelta(hours=1)
@@ -208,6 +209,35 @@ def test_funding_is_charged_for_a_position_held_across_a_funding_time(tmp_path: 
     assert trade.funding == approx(25 * 100.5 * 0.0001)  # qty * 08:00 close * rate
     assert trade.net_pnl == approx(trade.gross_pnl - trade.fees - trade.funding)
     assert result.equity.iloc[-1] == approx(10_000 + trade.net_pnl)
+
+
+@pytest.mark.parametrize(
+    ("hours", "gaps"),
+    [
+        ((0, 8, 32, 40), [(8, 32)]),  # 16:00 and 24:00 missing: 24 h without a stamp
+        ((0, 8, 24, 40), []),  # one missed event (16 h) is within the tolerance
+        ((), [(0, 48)]),  # no funding at all: the whole range
+    ],
+    ids=["interior_gap", "one_missed_event", "no_funding"],
+)
+def test_a_funding_gap_in_the_range_is_recorded_once_and_is_not_a_halt(
+    tmp_path: Path, hours: tuple[int, ...], gaps: list[tuple[int, int]]
+) -> None:
+    candles = flat(48 * 60 - 1)  # decisions in [T0, T0 + 48 h)
+    rates = funding_at(*((T0 + h * HOUR, 1e-4) for h in hours)) if hours else None
+    result = stub_run(tmp_path, candles, T0 + HOUR, funding=rates)
+    events = [e for e in result.log.risk_events if e.kind == "funding_missing"]
+    assert [(e.ts, e.action, e.detail) for e in events] == [
+        (
+            T0,
+            "funding_not_charged",
+            f"{BTC}: no funding stamp from {(T0 + a * HOUR).isoformat()} to "
+            f"{(T0 + b * HOUR).isoformat()}",
+        )
+        for a, b in gaps
+    ]
+    assert first_permanent_halt(result.log.risk_events) is None
+    assert len(result.trades) == 1  # recorded, nothing else changes
 
 
 def test_a_position_stopped_in_the_bar_closing_at_a_funding_time_pays_none(

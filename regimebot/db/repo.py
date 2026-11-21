@@ -182,6 +182,22 @@ def candle_timestamps(
     return _utc_index(session.scalars(stmt))
 
 
+def funding_timestamps(
+    session: Session, symbol: str, start: datetime, end: datetime
+) -> pd.DatetimeIndex:
+    """Sorted stored funding ``ts`` values with ``start <= ts <= end`` (both inclusive)."""
+    stmt = (
+        select(FundingRate.ts)
+        .where(
+            FundingRate.symbol == symbol,
+            *_time_range(FundingRate, start, None),
+            FundingRate.ts <= end,
+        )
+        .order_by(FundingRate.ts)
+    )
+    return _utc_index(session.scalars(stmt))
+
+
 def funding_ts_bounds(session: Session, symbol: str) -> tuple[datetime, datetime] | None:
     """Earliest and latest stored funding ``ts`` for a symbol, or ``None`` when empty."""
     row = session.execute(

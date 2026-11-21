@@ -311,7 +311,9 @@ class PaperSession:
             ok = False
         try:
             with session_scope(self._db) as session:
-                download_funding(self.exchange, session, symbol, now - self._history, now)
+                download_funding(
+                    self.exchange, session, symbol, now - self._history, now, live=True
+                )
         except Exception as exc:  # retried next poll
             log.warning("paper_download_failed", symbol=symbol, data="funding", error=repr(exc))
         return ok

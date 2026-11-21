@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import timeframe_minutes
 from regimebot.data.exchange import Exchange
-from regimebot.data.validate import gap_ranges
+from regimebot.data.validate import funding_gaps, gap_ranges
 from regimebot.db import repo
 
 log = structlog.get_logger(__name__)
@@ -18,7 +18,6 @@ log = structlog.get_logger(__name__)
 CANDLE_PAGE = 1000
 FUNDING_PAGE = 1000  # Binance funding-rate history maximum
 FUNDING_STEP = timedelta(milliseconds=1)  # ccxt timestamps are ms; `since` is inclusive
-FUNDING_INTERVAL = timedelta(hours=8)  # Binance perpetual funding cadence
 
 
 def download_candles(
@@ -89,34 +88,55 @@ def _fill_candles(
 
 
 def download_funding(
-    exchange: Exchange, session: Session, symbol: str, start: datetime, end: datetime
+    exchange: Exchange,
+    session: Session,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    *,
+    live: bool = False,
 ) -> int:
     """Store funding events with ``start <= ts <= end``; returns the number of rows written.
 
-    Stamps are irregular, so there is no grid: if the earliest stored stamp is later than
-    ``start`` + 8h, the range before it is backfilled; then everything after the latest stamp is
-    fetched. The backfill is all-or-nothing (one commit at its end, rollback on error), so an
-    interrupted backfill leaves no half range that bounds-based resuming would never repair; the
-    forward segment commits per page. With no data before listing, the backfill costs one empty
-    request per run.
+    Fetches only the holes: every stretch of the range without a stored stamp that is longer than
+    ``FUNDING_GAP_TOLERANCE`` (before the first stamp, between two, after the last), so an
+    interrupted run, an interior hole or the gap behind a paper session's recent window is
+    repaired by re-running with the same arguments. A range with no stored stamp is fetched
+    whole; a covered range makes no request. The stretch after the last stamp commits per page
+    (an interruption leaves it a shorter stretch at the end); every other hole is all-or-nothing
+    (one commit, rollback on error), so an interrupted fill never leaves a new interior hole. A
+    hole the exchange has no data for costs one request per run and never loops.
+
+    ``live`` (a paper poll): the stretch after the last stamp is always fetched, so a new event is
+    stored as soon as the exchange has it, not once the stretch passes the tolerance.
     """
-    bounds = repo.funding_ts_bounds(session, symbol)
-    if bounds is None:
+    stamps = list(repo.funding_timestamps(session, symbol, start, end).to_pydatetime())
+    if not stamps:
         return _fill_funding(exchange, session, symbol, start, end, commit_pages=True)
-    first, last = bounds
+    # Bounds one step outside the range: each gap's fetch is then (after + step, before - step).
+    gaps = funding_gaps(stamps, start - FUNDING_STEP, end + FUNDING_STEP)
     total = 0
-    if first > start + FUNDING_INTERVAL:
+    for after, before in gaps:
+        if before > end:  # the stretch after the last stamp: below
+            continue
         try:
             total += _fill_funding(
-                exchange, session, symbol, start, min(end, first - FUNDING_STEP), commit_pages=False
+                exchange,
+                session,
+                symbol,
+                after + FUNDING_STEP,
+                before - FUNDING_STEP,
+                commit_pages=False,
             )
             session.commit()
         except BaseException:
             session.rollback()
             raise
-    return total + _fill_funding(
-        exchange, session, symbol, max(start, last + FUNDING_STEP), end, commit_pages=True
-    )
+    if live or (gaps and gaps[-1][1] > end):
+        total += _fill_funding(
+            exchange, session, symbol, stamps[-1] + FUNDING_STEP, end, commit_pages=True
+        )
+    return total
 
 
 def _fill_funding(

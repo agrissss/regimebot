@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from regimebot.config import AppConfig, timeframe_minutes
 from regimebot.data.resample import resample
+from regimebot.data.validate import funding_gaps
 from regimebot.db import repo
 from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
@@ -142,6 +143,20 @@ def _warmup_events(
     return events
 
 
+def _funding_events(feeds: Mapping[str, _Feed], start: datetime, end: datetime) -> list[RiskEvent]:
+    """One ``funding_missing`` event at ``start`` per stretch of ``[start, end)`` longer than
+    ``FUNDING_GAP_TOLERANCE`` without a funding stamp for a symbol: positions held there pay or
+    receive no funding, so the result is not silently charged zero."""
+    lo, hi = _ns(pd.to_datetime([start, end], utc=True))
+    events = []
+    for symbol, feed in feeds.items():
+        ns = feed.funding_ts[(feed.funding_ts >= lo) & (feed.funding_ts < hi)]
+        for a, b in funding_gaps([_dt(int(t)) for t in ns], start, end):
+            detail = f"{symbol}: no funding stamp from {a.isoformat()} to {b.isoformat()}"
+            events.append(RiskEvent(start, "funding_missing", detail, "funding_not_charged"))
+    return events
+
+
 def _replay_interval(
     engine: Engine, feeds: Mapping[str, _Feed], k: int, base_width_ns: int
 ) -> None:
@@ -188,7 +203,8 @@ def run_backtest(
     ``strategies`` defaults to ``build_strategies(cfg)``. ``candles`` must hold exactly the
     configured symbols; ``funding`` may lack symbols (no funding charged). History before
     ``start`` warms the features up; a symbol still under-warmed at ``start`` gets a
-    ``warmup_incomplete`` risk event there (``_warmup_events``).
+    ``warmup_incomplete`` risk event there (``_warmup_events``), and every stretch of the range
+    without funding longer than the tolerance a ``funding_missing`` one (``_funding_events``).
     """
     for bound in (start, end):
         if bound.utcoffset() is None:
@@ -202,7 +218,9 @@ def run_backtest(
     base_width_ns = timeframe_minutes(cfg.exchange.base_timeframe) * 60 * 10**9
 
     portfolio = Portfolio(cfg.backtest.initial_equity)
-    log = RunLog(risk_events=_warmup_events(features, start, end))
+    log = RunLog(
+        risk_events=_warmup_events(features, start, end) + _funding_events(feeds, start, end)
+    )
     risk = RiskManager(cfg, kill_file)
     strategies = build_strategies(cfg) if strategies is None else strategies
     engine = Engine(cfg, strategies, risk, portfolio, log)

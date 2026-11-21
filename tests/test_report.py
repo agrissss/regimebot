@@ -153,10 +153,13 @@ def test_events_always_list_halts_summarise_counts_and_cap_the_rest(
     assert "<td>stale_data</td><td>skip_symbol</td><td>60</td>" in text  # count summary
     # three days of history cannot warm the default windows: one warmup_incomplete event first
     assert "<td>warmup_incomplete</td><td>no_trade_until_warm</td><td>1</td>" in text
-    assert "plus the first 50 of 62 other events" in text
+    # no funding was given: one funding_missing event, shown, and not a halt
+    assert "<td>funding_missing</td><td>funding_not_charged</td><td>1</td>" in text
+    assert "<td>funding_missing</td><td>halt</td>" not in text
+    assert "All 1 halt events are listed, plus the first 50 of 63 other events" in text
     assert (
-        text.count("<td>stale_data</td><td>skip_symbol</td><td>d</td>") == 48
-    )  # 50 others: the warm-up event, the escaped event and 48 of these
+        text.count("<td>stale_data</td><td>skip_symbol</td><td>d</td>") == 47
+    )  # 50 others: the warm-up and funding events, the escaped event and 47 of these
 
 
 def test_slippage_table_shows_floor_and_realised_values(
@@ -223,6 +226,11 @@ def test_cli_set_override_is_stored_and_report_rebuilds_from_the_database(
         app, [*args, "--set", "costs.taker_fee_bps=7", "--set", "risk.risk_per_trade=0.005"]
     )
     assert ok.exit_code == 0, ok.output
+    # no funding is stored: the run says it charged none, in one line
+    (warning,) = [line for line in ok.output.splitlines() if line.startswith("warning: funding")]
+    gap = "no funding stamp from 2024-01-02T00:00:00+00:00 to 2024-01-04T00:00:00+00:00"
+    assert all(f"{s}: {gap}" in warning for s in (BTC, "ETH/USDT:USDT", "SOL/USDT:USDT"))
+    assert warning.endswith("run `regimebot data download` for the funding history")
     with session_scope(engine) as session:
         (run_id,) = session.scalars(select(Run.id)).all()
         run = repo.load_run(session, run_id)
