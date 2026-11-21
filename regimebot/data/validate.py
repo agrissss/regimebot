@@ -34,6 +34,17 @@ class ValidationReport:
         )
 
 
+def gap_ranges(missing: pd.DatetimeIndex, step: pd.Timedelta) -> list[tuple[datetime, datetime]]:
+    """Group sorted missing grid timestamps into ``(first, last)`` runs of consecutive bars."""
+    gaps: list[tuple[datetime, datetime]] = []
+    for ts in missing:
+        if gaps and ts - step == gaps[-1][1]:
+            gaps[-1] = (gaps[-1][0], ts.to_pydatetime())
+        else:
+            gaps.append((ts.to_pydatetime(), ts.to_pydatetime()))
+    return gaps
+
+
 def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:
     """Check a candle frame indexed by close time ``ts``."""
     if df.empty:
@@ -43,12 +54,7 @@ def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:
     unique = index.unique().sort_values()
     grid = pd.date_range(unique[0], unique[-1], freq=step)
     missing = grid.difference(unique)
-    gaps: list[tuple[datetime, datetime]] = []
-    for ts in missing:
-        if gaps and ts - step == gaps[-1][1]:
-            gaps[-1] = (gaps[-1][0], ts.to_pydatetime())
-        else:
-            gaps.append((ts.to_pydatetime(), ts.to_pydatetime()))
+    gaps = gap_ranges(missing, step)
     body_lo = df[["open", "close"]].min(axis=1)
     body_hi = df[["open", "close"]].max(axis=1)
     ok_ohlc = (df["low"] <= body_lo) & (body_hi <= df["high"])  # NaN compares False: counted bad

@@ -7,7 +7,7 @@ import ccxt
 import pandas as pd
 import pytest
 from fakes import T0, FakeExchange
-from sqlalchemy import Engine
+from sqlalchemy import Engine, delete
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
@@ -17,7 +17,7 @@ from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
 from regimebot.data.validate import validate_candles
-from regimebot.db.models import Base
+from regimebot.db.models import Base, Candle
 from regimebot.db.repo import load_candles, load_funding, upsert_candles
 from regimebot.db.session import make_engine, session_scope
 
@@ -72,18 +72,64 @@ def test_resume_after_interruption_downloads_only_remainder(session: Session) ->
     assert len(load_candles(session, SYM, "1m")) == 100  # page 1 survived
 
     second = FakeExchange(n_bars=250, page_size=100)
-    n = download_candles(second, session, SYM, "1m", T0 + MIN, T0 + 1000 * MIN)
+    n = download_candles(second, session, SYM, "1m", T0, T0 + 1000 * MIN)
     assert n == 150
-    assert second.candle_calls[0] == T0 + 101 * MIN  # first bar not yet stored
+    # the unfillable T0 hole (no bar closes at T0), then 101..250 and one empty page
+    assert second.candle_calls == [T0, T0 + 101 * MIN, T0 + 201 * MIN, T0 + 251 * MIN]
     assert len(load_candles(session, SYM, "1m")) == 250
 
 
 def test_rerun_is_idempotent_and_refetches_nothing_stored(session: Session) -> None:
     download_candles(FakeExchange(n_bars=50), session, SYM, "1m", T0, T0 + 50 * MIN)
     again = FakeExchange(n_bars=50)
-    n = download_candles(again, session, SYM, "1m", T0 + MIN, T0 + 50 * MIN)
-    assert n == 0 and again.candle_calls == []
+    n = download_candles(again, session, SYM, "1m", T0, T0 + 50 * MIN)
+    assert n == 0 and again.candle_calls == [T0]  # only the unfillable T0 hole is retried
     assert len(load_candles(session, SYM, "1m")) == 50
+
+
+def _delete_candles(session: Session, lo: datetime, hi: datetime) -> None:
+    session.execute(delete(Candle).where(Candle.ts >= lo, Candle.ts <= hi))
+    session.commit()
+
+
+def test_interrupted_backfill_is_repaired_by_same_arguments(session: Session) -> None:
+    end = T0 + 500 * MIN
+    download_candles(FakeExchange(n_bars=500), session, SYM, "1m", T0 + 300 * MIN, end)
+    interrupted = FakeExchange(n_bars=500, page_size=100, fail_on_call=3)
+    with pytest.raises(ccxt.NetworkError):
+        download_candles(interrupted, session, SYM, "1m", T0 + MIN, end)
+    assert len(load_candles(session, SYM, "1m")) < 500
+    n = download_candles(FakeExchange(n_bars=500, page_size=100), session, SYM, "1m", T0 + MIN, end)
+    df = load_candles(session, SYM, "1m")
+    assert len(df) == 500 and validate_candles(df, "1m").missing_bars == 0
+    assert n > 0
+
+
+def test_interior_hole_is_filled_and_only_the_hole_is_fetched(session: Session) -> None:
+    end = T0 + 100 * MIN
+    download_candles(FakeExchange(n_bars=100), session, SYM, "1m", T0 + MIN, end)
+    _delete_candles(session, T0 + 40 * MIN, T0 + 44 * MIN)
+    ex = FakeExchange(n_bars=100)
+    assert download_candles(ex, session, SYM, "1m", T0 + MIN, end) == 5
+    assert ex.candle_calls[0] == T0 + 40 * MIN
+    assert len(load_candles(session, SYM, "1m")) == 100
+
+
+def test_unfillable_hole_costs_one_request_per_run_and_terminates(session: Session) -> None:
+    end = T0 + 100 * MIN
+    download_candles(FakeExchange(n_bars=100), session, SYM, "1m", T0 + MIN, end)
+    _delete_candles(session, T0 + 40 * MIN, T0 + 44 * MIN)
+    for _ in range(2):
+        ex = FakeExchange(n_bars=39)  # the exchange has nothing for the hole or after it
+        assert download_candles(ex, session, SYM, "1m", T0 + MIN, end) == 0
+        assert len(ex.candle_calls) == 1
+
+
+def test_fully_stored_range_makes_no_request(session: Session) -> None:
+    download_candles(FakeExchange(n_bars=50), session, SYM, "1m", T0 + MIN, T0 + 50 * MIN)
+    ex = FakeExchange(n_bars=50)
+    assert download_candles(ex, session, SYM, "1m", T0 + MIN, T0 + 50 * MIN) == 0
+    assert ex.candle_calls == []
 
 
 def test_repeating_exchange_does_not_loop_forever(session: Session) -> None:
@@ -119,6 +165,38 @@ def test_earlier_start_backfills_range_before_stored_bars(session: Session) -> N
     df = load_candles(session, SYM, "1m")
     assert n == 299 and len(df) == 500  # bars 1..299 added, 300..500 not refetched
     assert validate_candles(df, "1m").missing_bars == 0
+
+
+def test_interrupted_funding_backfill_rolls_back_and_reruns_cleanly(session: Session) -> None:
+    end = T0 + timedelta(days=30)
+    download_funding(
+        FakeExchange(n_bars=1, page_size=4, n_funding=20),
+        session,
+        SYM,
+        T0 + timedelta(hours=80),
+        end,
+    )
+    assert len(load_funding(session, SYM)) == 10
+    broken = FakeExchange(n_bars=1, page_size=4, n_funding=20, fail_on_call=2)
+    with pytest.raises(ccxt.NetworkError):
+        download_funding(broken, session, SYM, T0, end)
+    assert len(load_funding(session, SYM)) == 10  # backfill all-or-nothing: nothing kept
+    n = download_funding(FakeExchange(n_bars=1, page_size=4, n_funding=20), session, SYM, T0, end)
+    assert n == 10 and len(load_funding(session, SYM)) == 20
+
+
+def test_funding_hole_before_listing_costs_one_request_and_full_range_none(
+    session: Session,
+) -> None:
+    end = T0 + timedelta(days=30)
+    download_funding(FakeExchange(n_bars=1, n_funding=10), session, SYM, T0, end)
+    full = FakeExchange(n_bars=1, n_funding=10)
+    assert download_funding(full, session, SYM, T0, end) == 0
+    assert len(full.funding_calls) == 1  # the forward resume probe only
+    late = FakeExchange(n_bars=1, n_funding=10)  # nothing exists before the first stored stamp
+    late_start = T0 - timedelta(days=5)
+    assert download_funding(late, session, SYM, late_start, end) == 0
+    assert len(late.funding_calls) == 2  # one backfill probe + one forward probe, both terminate
 
 
 def test_earlier_start_backfills_funding(session: Session) -> None:
@@ -172,7 +250,7 @@ def test_ccxt_open_time_becomes_close_time_and_forming_bar_dropped() -> None:
     assert ex._client.calls[0][2] == _ms(T0)
 
 
-def test_ccxt_bar_closing_exactly_now_is_kept() -> None:
+def test_ccxt_bar_closing_exactly_at_the_cutoff_is_kept() -> None:
     rows = [[_ms(T0), 1, 2, 0.5, 1.5, 7]]
     ex = CcxtExchange("binanceusdm", client=StubClient(rows), now=lambda: T0 + MIN + CLOSE_GRACE)
     assert len(ex.fetch_candles(SYM, "1m", T0 + MIN, 10)) == 1
@@ -186,12 +264,12 @@ def test_bar_inside_grace_margin_is_not_closed() -> None:
 
 
 def test_cutoff_is_read_before_the_request() -> None:
-    """Response built at 00:00:59.950 arrives at local 00:01:00.080: bar is still forming."""
+    """The clock passes close + grace during the request; only a pre-request read drops the bar."""
     clock = [T0 + timedelta(seconds=59, milliseconds=950)]
 
     class SlowClient(StubClient):
         def fetch_ohlcv(self, *a: Any) -> list[list[float]]:
-            clock[0] = T0 + timedelta(seconds=60, milliseconds=80)  # time passes in flight
+            clock[0] = T0 + timedelta(seconds=62, milliseconds=100)  # beyond CLOSE_GRACE
             return self.ohlcv
 
     rows = [[_ms(T0), 1, 2, 0.5, 1.5, 7]]  # open 00:00 -> ts 00:01
@@ -411,4 +489,28 @@ def test_data_check_fails_on_short_history_and_prints_details(
     res = CliRunner().invoke(app, ["data", "check"])
     assert res.exit_code == 1
     assert "bars=100 first=" in res.output and "shorter" in res.output
+    eng.dispose()
+
+
+@pytest.mark.parametrize(
+    ("first_min", "n", "expected_exit"),
+    [(0, 100, 0), (1, 99, 1), (0, 99, 1)],  # complete, first bar missing, last bar missing
+)
+def test_data_check_edge_bars_are_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_min: int,
+    n: int,
+    expected_exit: int,
+) -> None:
+    url = f"sqlite:///{tmp_path / 'edge.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    eng = make_engine(url)
+    Base.metadata.create_all(eng)
+    cfg = _narrow_cfg(monkeypatch, "2024-01-01T00:00:00Z", "2024-01-01T01:40:00Z")
+    df = _frame(n, start=cfg.backtest.start + first_min * MIN)
+    with session_scope(eng) as s:
+        for sym in cfg.exchange.symbols:
+            upsert_candles(s, sym, "1m", df)
+    assert CliRunner().invoke(app, ["data", "check"]).exit_code == expected_exit
     eng.dispose()

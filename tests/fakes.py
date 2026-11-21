@@ -15,8 +15,9 @@ class FakeExchange:
 
     ``n_bars`` bars exist in total; pages hold at most ``page_size`` bars. Bar ``i`` (1-based)
     closes at ``T0 + i*step`` with ``close = 100 + i``. Funding events occur every 8h from
-    ``T0`` (``n_funding`` of them, rate ``0.0001 * k``). The ``fetch_candles`` call numbered
-    ``fail_on_call`` (1-based) raises ``ccxt.NetworkError`` (simulated interruption).
+    ``T0`` (``n_funding`` of them, rate ``0.0001 * k``). The ``fetch_candles`` (and, separately,
+    ``fetch_funding``) call numbered ``fail_on_call`` (1-based) raises ``ccxt.NetworkError``
+    (simulated interruption).
     ``repeat_page`` makes the exchange ignore ``since`` and always return its first page.
     """
 
@@ -54,6 +55,8 @@ class FakeExchange:
         self, symbol: str, since: datetime, limit: int
     ) -> list[tuple[datetime, float]]:
         self.funding_calls.append(since)
+        if len(self.funding_calls) == self.fail_on_call:
+            raise ccxt.NetworkError("injected network error")
         events = [(T0 + timedelta(hours=8 * k), 0.0001 * k) for k in range(self.n_funding)]
         return [e for e in events if e[0] >= since][: min(limit, self.page_size)]
 

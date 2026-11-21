@@ -163,16 +163,21 @@ def load_candles(
     return df
 
 
-def candle_ts_bounds(
-    session: Session, symbol: str, timeframe: str
-) -> tuple[datetime, datetime] | None:
-    """Earliest and latest stored candle ``ts`` for a series, or ``None`` when empty."""
-    row = session.execute(
-        select(func.min(Candle.ts), func.max(Candle.ts)).where(
-            Candle.symbol == symbol, Candle.timeframe == timeframe
+def candle_timestamps(
+    session: Session, symbol: str, timeframe: str, start: datetime, end: datetime
+) -> pd.DatetimeIndex:
+    """Sorted stored candle ``ts`` values with ``start <= ts <= end`` (both inclusive)."""
+    stmt = (
+        select(Candle.ts)
+        .where(
+            Candle.symbol == symbol,
+            Candle.timeframe == timeframe,
+            *_time_range(Candle, start, None),
+            Candle.ts <= end,
         )
-    ).one()
-    return None if row[0] is None else (row[0], row[1])
+        .order_by(Candle.ts)
+    )
+    return _utc_index(session.scalars(stmt))
 
 
 def funding_ts_bounds(session: Session, symbol: str) -> tuple[datetime, datetime] | None:

@@ -1,6 +1,6 @@
 """Command-line entry point."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Annotated
@@ -102,15 +102,17 @@ def data_check() -> None:
     """Validate stored candles per symbol; exit 1 if any symbol is not ok."""
     cfg = load_config()
     tf = cfg.exchange.base_timeframe
-    width = timedelta(minutes=timeframe_minutes(tf))
+    width = pd.Timedelta(minutes=timeframe_minutes(tf))
     engine = make_engine(cfg.database_url)
     all_ok = True
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
             df = load_candles(session, symbol, tf, cfg.backtest.start, cfg.backtest.end)
             report = validate_candles(df, tf)
+            # exact: first bar closes at the first grid point >= start, last at the one before end
             short = report.bars == 0 or (
-                df.index[0] > cfg.backtest.start + width or df.index[-1] < cfg.backtest.end - width
+                df.index[0] > pd.Timestamp(cfg.backtest.start).ceil(width)
+                or df.index[-1] < pd.Timestamp(cfg.backtest.end).ceil(width) - width
             )
             all_ok &= report.ok and not short
             typer.echo(f"{symbol}: {'OK' if report.ok and not short else 'FAIL'}")
