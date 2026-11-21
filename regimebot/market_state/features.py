@@ -54,6 +54,8 @@ def _pctile_rank(x: pd.Series, window: int, min_obs: int) -> pd.Series:
 
 def _asof_funding(index: pd.DatetimeIndex, funding: pd.Series) -> pd.Series:
     """Last funding value stamped at or before each candle time (NaN before the first)."""
+    if funding.empty:  # no stored funding yet: same as None, whatever the index type
+        return pd.Series(np.nan, index=index, dtype=float)
     fidx = funding.index
     if not isinstance(fidx, pd.DatetimeIndex) or fidx.tz is None or str(fidx.tz) != "UTC":
         raise ValueError("funding must have a UTC DatetimeIndex")

@@ -222,6 +222,20 @@ def test_non_utc_funding_rejected(tz: str | None) -> None:
         compute_features(random_walk(50), make_cfg(), COMPRESSION, f)
 
 
+@pytest.mark.parametrize(
+    "empty",
+    [
+        pd.Series(dtype=float),
+        pd.Series(dtype=float, index=pd.DatetimeIndex([], tz="UTC")),
+    ],
+)
+def test_empty_funding_behaves_like_none(empty: pd.Series) -> None:
+    c = random_walk(50)
+    out = compute_features(c, make_cfg(), COMPRESSION, empty)
+    assert out["funding"].isna().all()
+    assert out["funding"].index.equals(c.index)
+
+
 def test_duplicate_funding_stamps_rejected() -> None:
     c = random_walk(50)
     f = pd.Series([0.1, 0.2], index=[c.index[3], c.index[3]])
