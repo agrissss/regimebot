@@ -262,6 +262,15 @@ def load_config(
     return AppConfig.model_validate(raw)
 
 
+def with_overrides(cfg: AppConfig, overrides: Mapping[str, object]) -> AppConfig:
+    """A copy of ``cfg`` with dotted-path ``overrides`` applied and the result re-validated
+    (unknown path or invalid value raises ``ValueError``; ``cfg`` is not modified)."""
+    raw = cfg.model_dump(mode="json")
+    for dotted, value in overrides.items():
+        _apply_override(raw, dotted, value)
+    return AppConfig.model_validate(raw)
+
+
 def config_json(cfg: AppConfig) -> str:
     """Canonical JSON of the strategy config, without ``database_url`` (it may hold a password
     and must not change the identity of a run between SQLite and Postgres)."""

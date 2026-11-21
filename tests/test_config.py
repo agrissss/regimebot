@@ -10,6 +10,7 @@ from regimebot.config import (
     config_json,
     load_config,
     timeframe_minutes,
+    with_overrides,
 )
 from regimebot.types import Regime, Side, side_sign
 
@@ -163,3 +164,15 @@ def test_cost_bounds() -> None:
         load_config(overrides={"costs.impact_bps_per_pct": 10.0})  # 1000 + 3 bps
     with pytest.raises(ValidationError):
         load_config(overrides={"costs.slippage_bps": 1001.0})
+
+
+def test_with_overrides_copies_validates_and_keeps_original() -> None:
+    cfg = load_config()
+    new = with_overrides(cfg, {"risk.risk_per_trade": 0.01, "strategies.breakout.min_rr": 3.0})
+    assert (new.risk.risk_per_trade, new.strategies.breakout.min_rr) == (0.01, 3.0)
+    assert cfg.risk.risk_per_trade != 0.01
+    assert config_json(with_overrides(cfg, {})) == config_json(cfg)
+    with pytest.raises(ValueError, match="unknown config path"):
+        with_overrides(cfg, {"risk.nope": 1})
+    with pytest.raises(ValueError):
+        with_overrides(cfg, {"risk.max_gross_leverage": 1.6})

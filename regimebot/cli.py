@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from dataclasses import asdict
 from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -12,7 +13,9 @@ import typer
 import yaml
 
 from regimebot.backtest.baselines import compute_baselines
+from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
 from regimebot.backtest.runner import BacktestResult, persist_result, run_backtest
+from regimebot.backtest.walk_forward import walk_forward
 from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
 from regimebot.data.history import download_candles, download_funding
@@ -179,6 +182,12 @@ def regimes_study() -> None:
             table.to_csv(out_dir / f"regime_study_{safe}.csv")
 
 
+DEFAULT_ROBUSTNESS_PARAMS = [
+    "strategies.breakout.stop_atr_mult",
+    "strategies.breakout.volume_z_min",
+    "strategies.trend.stop_atr_mult",
+    "risk.risk_per_trade",
+]
 backtest_app = typer.Typer(help="Backtest commands.", no_args_is_help=True)
 app.add_typer(backtest_app, name="backtest")
 
@@ -236,6 +245,100 @@ def backtest_run(
         f"max_drawdown={max_dd:.2%}"
     )
     typer.echo(f"run {run_id}")
+
+
+_NOT_EVIDENCE = "These are historical simulations, not evidence of future performance."
+_SetOption = Annotated[
+    list[str] | None,
+    typer.Option("--set", help="Config override key=value (dotted path, YAML value); repeatable."),
+]
+
+
+def _research_inputs(
+    start: str | None, end: str | None, set_: list[str] | None
+) -> tuple[AppConfig, dict[str, pd.DataFrame], dict[str, pd.Series]]:
+    """Config (with --set overrides, start/end applied to ``backtest``) and the stored history up
+    to its end; history before start is feature warm-up."""
+    overrides: dict[str, object] = {}
+    for item in set_ or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise typer.BadParameter(f"--set needs key=value, got {item!r}")
+        overrides[key] = yaml.safe_load(value)
+    if start:
+        overrides["backtest.start"] = _parse_utc(start)
+    if end:
+        overrides["backtest.end"] = _parse_utc(end)
+    try:
+        cfg = load_config(overrides=overrides)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    symbols, base = cfg.exchange.symbols, cfg.exchange.base_timeframe
+    with session_scope(make_engine(cfg.database_url)) as session:
+        candles = {s: load_candles(session, s, base, None, cfg.backtest.end) for s in symbols}
+        funding = {s: load_funding(session, s, None, cfg.backtest.end) for s in symbols}
+    if missing := [s for s, df in candles.items() if df.empty]:
+        typer.echo(f"no candles for {', '.join(missing)}: run `data download` first")
+        raise typer.Exit(1)
+    return cfg, candles, funding
+
+
+def _show(df: pd.DataFrame, csv: Path) -> None:
+    csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv, index=False)
+    typer.echo(df.to_string(index=False))
+    typer.echo(_NOT_EVIDENCE)
+    typer.echo(f"wrote {csv}")
+
+
+@backtest_app.command("walk-forward")
+def backtest_walk_forward(
+    start: Annotated[str | None, typer.Option(help="ISO start (default: backtest start).")] = None,
+    end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
+    set_: _SetOption = None,
+) -> None:
+    """Walk-forward: fit the config's grid on each train span, test on the span after it.
+
+    Slow: every window runs one backtest per grid combination plus one test run.
+    """
+    cfg, candles, funding = _research_inputs(start, end, set_)
+    try:
+        res = walk_forward(cfg, candles, funding, cfg.backtest.start, cfg.backtest.end)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    out = Path("reports")
+    _show(res.windows, out / "walk_forward_windows.csv")
+    pd.DataFrame([asdict(t) for t in res.oos_trades]).to_csv(
+        out / "walk_forward_oos_trades.csv", index=False
+    )
+    typer.echo(
+        f"out-of-sample: windows={len(res.windows)} trades={len(res.oos_trades)} "
+        f"net_pnl={res.oos_net_pnl:.2f} n_variants_tried={res.n_variants_tried}"
+    )
+    typer.echo(f"wrote {out / 'walk_forward_oos_trades.csv'}")
+
+
+@backtest_app.command("robustness")
+def backtest_robustness(
+    param: Annotated[
+        list[str] | None,
+        typer.Option(help="Numeric dotted config path to perturb by +/-20%; repeatable."),
+    ] = None,
+    start: Annotated[str | None, typer.Option(help="ISO start (default: backtest start).")] = None,
+    end: Annotated[str | None, typer.Option(help="ISO end (default: backtest end).")] = None,
+    set_: _SetOption = None,
+) -> None:
+    """Parameter sensitivity, doubled costs, and max gross leverage 1.0 vs 1.5."""
+    cfg, candles, funding = _research_inputs(start, end, set_)
+    a, b = cfg.backtest.start, cfg.backtest.end
+    out = Path("reports")
+    try:
+        sens = sensitivity(cfg, candles, funding, a, b, param or DEFAULT_ROBUSTNESS_PARAMS)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    _show(sens, out / "sensitivity.csv")
+    _show(cost_stress(cfg, candles, funding, a, b), out / "cost_stress.csv")
+    _show(leverage_compare(cfg, candles, funding, a, b), out / "leverage_compare.csv")
 
 
 @app.command()
