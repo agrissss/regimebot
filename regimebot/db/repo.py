@@ -293,6 +293,7 @@ class RunInfo:
     git_sha: str
     started_at: datetime
     note: str
+    ended_at: datetime | None  # None while a paper run is open
 
 
 def load_run(session: Session, run_id: int) -> RunInfo:
@@ -301,7 +302,14 @@ def load_run(session: Session, run_id: int) -> RunInfo:
     if run is None:
         raise ValueError(f"unknown run_id {run_id}")
     return RunInfo(
-        run.id, run.mode, run.config_hash, run.config_json, run.git_sha, run.started_at, run.note
+        run.id,
+        run.mode,
+        run.config_hash,
+        run.config_json,
+        run.git_sha,
+        run.started_at,
+        run.note,
+        run.ended_at,
     )
 
 

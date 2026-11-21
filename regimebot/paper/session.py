@@ -43,6 +43,11 @@ from regimebot.types import Bar, Mode, Quote
 
 log = structlog.get_logger(__name__)
 
+# The live exchange client `paper run` builds: one retry and a 5 s timeout bound a market-data
+# call to about 11 s (5 + 1 s backoff + 5), so one hanging symbol cannot stall a poll for minutes.
+EXCHANGE_MAX_RETRIES = 1
+EXCHANGE_TIMEOUT_MS = 5_000
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _TICK = timedelta(microseconds=1)  # stored timestamps have microsecond resolution
 _BAR, _FUNDING = 0, 1  # event order at equal timestamps, as in the backtest
@@ -76,7 +81,7 @@ class PaperSession:
     Fills: spreads come from quotes fetched just before ``on_decision``; after it, each symbol
     with a queued order fills at a fresh quote, stamped with the session clock, with the last
     closed bar's volume for participation. A fill can lag the decision by those quote fetches
-    (each up to about 91 s while the exchange retries); the engine's entry expiry at T + one
+    (each up to about 11 s with the ``EXCHANGE_*`` client settings); the entry expiry at T + one
     decision width bounds the lag of an entry. A failed quote means no spread and no fill for that
     symbol at this decision: a queued entry then expires at the next decision (the engine's
     rule), a queued exit is retried on every poll until it fills. The kill file is checked on
@@ -442,7 +447,7 @@ class PaperSession:
         with_bar = [s for s in self._symbols if s in latest and latest[s] >= ts]
         windows = self._windows(ts, with_bar)
         quotes = {s: q for s in self._symbols if (q := self._quote(s)) is not None}
-        if self._missed(ts):  # a quote can take about 91 s: 5 retries (31 s backoff) + timeouts
+        if self._missed(ts):  # each quote can take about 11 s (EXCHANGE_* settings)
             return None
         spreads = {s: (q.ask - q.bid) / (q.ask + q.bid) * 2e4 for s, q in quotes.items()}  # bps
         self._last_decision = ts  # set before the engine runs: never processed twice

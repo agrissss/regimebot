@@ -299,6 +299,9 @@ def test_second_position_on_a_symbol_is_rejected() -> None:
         (make_signal(Side.SHORT, stop=105.0), make_fill(BUY, 1.0, 100.0, 0.05)),  # short by BUY
         (make_signal(Side.LONG), make_fill(BUY, 1.0, 100.0, 0.05, symbol=ETH)),  # other symbol
         (make_signal(Side.LONG, stop=100.0), make_fill(BUY, 1.0, 100.0, 0.05)),  # zero risk (1R)
+        (make_signal(Side.LONG), make_fill(BUY, 1.0, 94.0, 0.05)),  # long filled under its stop
+        (make_signal(Side.SHORT, stop=105.0), make_fill(SELL, 1.0, 105.0, 0.05)),  # at the stop
+        (make_signal(Side.SHORT, stop=105.0), make_fill(SELL, 1.0, 106.0, 0.05)),  # above it
         (  # entry fill 2 minutes before the signal it executes (signal ts = T_OPEN - 1 minute)
             make_signal(Side.LONG),
             make_fill(BUY, 1.0, 100.0, 0.05, ts=T_OPEN - timedelta(minutes=2)),

@@ -33,13 +33,13 @@ from regimebot.types import (
     Bar,
     ExitReason,
     Fill,
-    OrderSide,
     Regime,
     RiskDecision,
     RiskEvent,
-    Side,
     Signal,
     Trade,
+    entry_order_side,
+    exit_order_side,
     side_sign,
 )
 
@@ -74,11 +74,6 @@ class _QueuedEntry:
     signal_index: int
     signal: Signal
     qty: float  # approved qty; the fill may cut it
-
-
-def _order_side(side: Side, entering: bool) -> OrderSide:
-    """BUY to open a long or close a short, SELL otherwise."""
-    return OrderSide.BUY if (side == Side.LONG) == entering else OrderSide.SELL
 
 
 def _last_row(window: pd.DataFrame | None, ts: datetime) -> tuple[dict[str, float] | None, str]:
@@ -215,8 +210,12 @@ class Engine:
         """Execute ``symbol``'s queued order at the quote (taker, ``market_fill``).
 
         An exit closes the whole position (``ref_price`` = last decision close). An entry is
-        capped at ``max_participation`` of ``bar_volume`` (``ref_price`` = signal entry); no fill,
-        or a fill under ``MIN_NOTIONAL``, cancels it with a ``no_liquidity`` decision.
+        capped at ``max_participation`` of ``bar_volume`` (``ref_price`` = signal entry). An entry
+        is cancelled, with a second decision for its signal, when it is first offered at or after
+        ``signal.ts`` + one decision width (``expired``: the next decision has passed), when there
+        is no fill or one under ``MIN_NOTIONAL`` (``no_liquidity``), or when the fill price is at
+        or beyond the stop (``gapped_through_stop``: the price gapped past it, 1R would not be
+        positive).
 
         The order is priced before it is removed: when pricing raises (a crossed quote, a
         non-finite volume), the order stays queued and the exception propagates."""
@@ -236,7 +235,7 @@ class Engine:
         position = self.portfolio.positions.get(bar.symbol)
         if position is None:
             return
-        exit_side = _order_side(position.side, entering=False)
+        exit_side = exit_order_side(position.side)
         fill = stop_fill(bar.symbol, bar, exit_side, position.qty, position.stop, self.cfg.costs)
         if fill is not None:
             self._close(fill, stop_reason(position))
@@ -384,7 +383,7 @@ class Engine:
         fill = market_fill(
             signal.symbol,
             ts,
-            _order_side(signal.side, entering=True),
+            entry_order_side(signal.side),
             entry.qty,
             bid,
             ask,
@@ -397,6 +396,10 @@ class Engine:
             why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
             detail = f"{why} at bar volume {bar_volume}, min notional {MIN_NOTIONAL}"
             self._cancel_entry(signal.symbol, ts, "no_liquidity", detail)
+            return
+        if side_sign(signal.side) * (fill.price - signal.stop) <= 0:  # 1R zero or negative
+            detail = f"{signal.side} fill at {fill.price} is at or beyond the stop {signal.stop}"
+            self._cancel_entry(signal.symbol, ts, "gapped_through_stop", detail)
             return
         self.portfolio.open(signal, fill)
         del self._entries[signal.symbol]
@@ -421,7 +424,7 @@ class Engine:
         fill = market_fill(
             position.symbol,
             ts,
-            _order_side(position.side, entering=False),
+            exit_order_side(position.side),
             position.qty,
             bid,
             ask,

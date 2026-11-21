@@ -16,7 +16,7 @@ from regimebot.config import AppConfig, load_config
 from regimebot.data.exchange import CLOSE_GRACE, CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
-from regimebot.data.validate import validate_candles
+from regimebot.data.validate import gap_ranges, validate_candles
 from regimebot.db.models import Base, Candle
 from regimebot.db.repo import load_candles, load_funding, upsert_candles
 from regimebot.db.session import make_engine, session_scope
@@ -317,6 +317,20 @@ def test_retry_exhaustion_raises() -> None:
     with pytest.raises(ccxt.NetworkError):
         ex.fetch_candles(SYM, "1m", T0, 10)
     assert len(client.calls) == 6 and len(sleeps) == 5
+    assert client.timeout == 10_000  # the defaults: 5 retries, ccxt's 10 s timeout
+
+
+def test_retry_budget_and_timeout_are_configurable() -> None:
+    sleeps: list[float] = []
+    client = StubClient(fail=99)
+    ex = CcxtExchange(
+        "binanceusdm", client=client, sleep=sleeps.append, max_retries=1, timeout_ms=5000
+    )
+    with pytest.raises(ccxt.NetworkError):
+        ex.fetch_candles(SYM, "1m", T0, 10)
+    assert len(client.calls) == 2 and sleeps == [1.0]  # one retry after 1 s
+    assert client.timeout == 5000
+    assert CcxtExchange("binanceusdm", timeout_ms=5000)._client.timeout == 5000  # a real client
 
 
 # --- validation -----------------------------------------------------------------------------
@@ -336,6 +350,14 @@ def test_gaps_listed_as_ranges() -> None:
     )
     assert r.missing_bars == 4 and r.expected_bars == 20
     assert not r.ok  # 20% missing
+
+
+def test_gap_ranges_groups_consecutive_missing_bars() -> None:
+    ts = _frame(10).index
+    assert gap_ranges(ts[:0], MIN) == []
+    got = gap_ranges(ts[[0, 1, 2, 4, 7, 8, 9]], pd.Timedelta(MIN))
+    py = ts.to_pydatetime()
+    assert got == [(py[0], py[2]), (py[4], py[4]), (py[7], py[9])]
 
 
 def test_tiny_gap_share_is_still_ok() -> None:

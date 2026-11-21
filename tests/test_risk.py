@@ -450,7 +450,6 @@ def test_day_stopped_uses_the_exit_utc_date(tmp_path: Path) -> None:
     for _ in range(5):  # 2024-01-02 01:30 +02:00 is 2024-01-01 23:30 UTC
         rm.on_trade_closed(make_trade(-10.0, datetime(2024, 1, 2, 1, 30, tzinfo=plus2)))
     assert rm.day_stopped == date(2024, 1, 1)
-    assert rm.pnl_by_day == {date(2024, 1, 1): approx(-50.0)}
     # now in +02:00 is converted too: 01:59 +02:00 is still Jan 1 UTC, 02:00 +02:00 is Jan 2
     still = datetime(2024, 1, 2, 1, 59, tzinfo=plus2)
     assert rejected(rm.evaluate(make_signal(), book(), PLAY, still)) == "day_stopped"
@@ -468,18 +467,17 @@ def test_loss_on_the_day_after_a_streak_stop_starts_a_new_streak(tmp_path: Path)
     assert (rm.loss_streak, rm.day_stopped) == (1, None)
 
 
-def test_realised_pnl_is_booked_by_utc_day_and_iso_week(tmp_path: Path) -> None:
+def test_a_state_saved_with_the_old_pnl_books_still_loads(tmp_path: Path) -> None:
+    # paper runs saved before pnl_by_day / pnl_by_week were dropped (never read) keep them
     rm = manager(tmp_path)
-    sunday, monday = datetime(2023, 12, 31, 23, tzinfo=UTC), datetime(2024, 1, 1, 1, tzinfo=UTC)
-    for pnl, ts in [(10.0, sunday), (-4.0, monday), (1.5, monday + DAY)]:
-        rm.on_trade_closed(make_trade(pnl, ts))
-    assert rm.pnl_by_day == {
-        date(2023, 12, 31): approx(10.0),
-        date(2024, 1, 1): approx(-4.0),
-        date(2024, 1, 2): approx(1.5),
-    }
-    # ISO weeks keyed by their Monday: Sunday belongs to the week of 2023-12-25
-    assert rm.pnl_by_week == {date(2023, 12, 25): approx(10.0), date(2024, 1, 1): approx(-2.5)}
+    for _ in range(3):
+        rm.on_trade_closed(make_trade(-10.0))
+    state = rm.to_state()
+    assert "pnl_by_day" not in state and "pnl_by_week" not in state
+    old = {**state, "pnl_by_day": {"2024-01-01": -30.0}, "pnl_by_week": {"2024-01-01": -30.0}}
+    restored = manager(tmp_path)
+    restored.load_state(old)
+    assert restored.to_state() == state and restored.loss_streak == 3
 
 
 def test_non_finite_trade_pnl_is_rejected(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from regimebot.backtest.baselines import compute_baselines
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
-from regimebot.backtest.runner import BacktestResult, persist_result, run_backtest
+from regimebot.backtest.runner import load_result, persist_result, run_backtest
 from regimebot.backtest.walk_forward import walk_forward
 from regimebot.config import AppConfig, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
@@ -24,15 +24,14 @@ from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
 from regimebot.data.validate import ValidationReport, validate_candles
 from regimebot.db import repo
-from regimebot.db.repo import load_candles, load_funding
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
-from regimebot.engine.loop import RunLog
 from regimebot.logging import configure_logging
 from regimebot.market_state.features import compute_features, warmup_bars
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
-from regimebot.paper.session import PaperSession
-from regimebot.paper.state import clear_halts, latest_status, lock_run
+from regimebot.paper.session import EXCHANGE_MAX_RETRIES, EXCHANGE_TIMEOUT_MS, PaperSession
+from regimebot.paper.state import clear_halts, end_paper_run, latest_status, lock_run
+from regimebot.reporting.metrics import compute_metrics, first_permanent_halt
 from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
 
@@ -158,7 +157,7 @@ def data_check() -> None:
     all_ok = True
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            df = load_candles(session, symbol, tf, start, cfg.backtest.end)
+            df = repo.load_candles(session, symbol, tf, start, cfg.backtest.end)
             report = validate_candles(df, tf)
             # exact: first bar closes at the first grid point >= start, last at the one before end
             short = report.bars == 0 or (
@@ -193,12 +192,12 @@ def regimes_study() -> None:
     engine = make_engine(cfg.database_url)
     with session_scope(engine) as session:
         for symbol in cfg.exchange.symbols:
-            candles = load_candles(session, symbol, base, first, end)
+            candles = repo.load_candles(session, symbol, base, first, end)
             if candles.empty:
                 typer.echo(f"{symbol}: no candles in the database, run `data download` first")
                 continue
             candles = resample(candles, base, decision)
-            funding = load_funding(session, symbol, first, end)
+            funding = repo.load_funding(session, symbol, first, end)
             features = compute_features(
                 candles, cfg.features, cfg.regime.compression_pctile, funding
             )
@@ -248,8 +247,8 @@ def _research_inputs(
     symbols, base = cfg.exchange.symbols, cfg.exchange.base_timeframe
     first, last = history_start(cfg), cfg.backtest.end
     with session_scope(make_engine(cfg.database_url)) as session:
-        candles = {s: load_candles(session, s, base, first, last) for s in symbols}
-        funding = {s: load_funding(session, s, first, last) for s in symbols}
+        candles = {s: repo.load_candles(session, s, base, first, last) for s in symbols}
+        funding = {s: repo.load_funding(session, s, first, last) for s in symbols}
     if missing := [s for s, df in candles.items() if df.empty]:
         typer.echo(f"no candles for {', '.join(missing)}: run `data download` first")
         raise typer.Exit(1)
@@ -274,19 +273,14 @@ def backtest_run(
         result = run_backtest(cfg, candles, funding, bt.start, bt.end, Path(tmp) / "KILL")
     with session_scope(make_engine(cfg.database_url)) as session:
         run_id = persist_result(session, result, note)
-    trades = result.trades
+    m = compute_metrics(result.trades, result.equity, bt.initial_equity)  # the whole run
     final = float(result.equity.iloc[-1]) if len(result.equity) else bt.initial_equity
-    max_dd = max((e[3] for e in result.log.equity), default=0.0)
     typer.echo(
-        f"trades={len(trades)} net_pnl={sum(t.net_pnl for t in trades):.2f} "
-        f"fees={sum(t.fees for t in trades):.2f} funding={sum(t.funding for t in trades):.2f} "
-        f"final_equity={final:.2f} return={final / bt.initial_equity - 1:+.2%} "
-        f"max_drawdown={max_dd:.2%}"
+        f"trades={m.n_trades} net_pnl={m.net_pnl:.2f} fees={m.fees:.2f} funding={m.funding:.2f} "
+        f"final_equity={final:.2f} return={m.return_pct:+.2%} max_drawdown={m.max_drawdown:.2%}"
     )
-    # these halts clear only by hand, so the run opened nothing after them
-    sticky = ("max_drawdown", "manual_kill")
     events = result.log.risk_events
-    if halt := next((e for e in events if e.action == "halt" and e.kind in sticky), None):
+    if halt := first_permanent_halt(events):  # it clears only by hand: no entries after it
         typer.echo(
             f"halted at {halt.ts.isoformat()}: {halt.kind} ({halt.detail}), no entries after"
         )
@@ -400,21 +394,11 @@ def report(
         except ValidationError as exc:
             typer.echo(f"run {run_id}: stored config no longer validates:\n{exc}", err=True)
             raise typer.Exit(1) from None
-        bt, base = cfg.backtest, cfg.exchange.base_timeframe
-        trades = repo.load_trades(session, run_id)
-        log = RunLog(
-            trades=trades,
-            fills=repo.load_fills(session, run_id),
-            risk_events=repo.load_risk_events(session, run_id),
-            equity=repo.load_equity_snapshots(session, run_id),
-        )
-        result = BacktestResult(
-            log, trades, repo.load_equity(session, run_id), cfg, bt.start, bt.end
-        )
+        result = load_result(session, run_id, cfg)
         n_signals = repo.count_signals(session, run_id)
-        first = history_start(cfg)
-        candles = {s: load_candles(session, s, base, first, bt.end) for s in cfg.exchange.symbols}
-        funding = {s: load_funding(session, s, first, bt.end) for s in cfg.exchange.symbols}
+        base, first, end = cfg.exchange.base_timeframe, history_start(cfg), cfg.backtest.end
+        candles = {s: repo.load_candles(session, s, base, first, end) for s in cfg.exchange.symbols}
+        funding = {s: repo.load_funding(session, s, first, end) for s in cfg.exchange.symbols}
     typer.echo("recomputing baselines (buy and hold, random entry) ...")
     baselines = compute_baselines(
         result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
@@ -441,7 +425,8 @@ def paper_run(
     ] = None,
 ) -> None:
     """Paper-trade the configured symbols until Ctrl-C or SIGTERM. Simulated fills only: no
-    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it.
+    order is ever sent. A stopped run stays open; `--resume RUN_ID` continues it and
+    `paper end RUN_ID` ends it for good.
 
     Logs are JSON lines on stdout; the banner goes to stderr.
     """
@@ -451,9 +436,11 @@ def paper_run(
     _say(
         f"warming up {cfg.paper.warmup_bars} {cfg.exchange.decision_timeframe} bars of history ..."
     )
-    session = PaperSession(
-        cfg, CcxtExchange(cfg.exchange.id), make_engine(cfg.database_url), DEFAULT_KILL_FILE
+    # few retries, short timeouts: one hanging symbol must not stall a poll (or the kill switch)
+    exchange = CcxtExchange(
+        cfg.exchange.id, max_retries=EXCHANGE_MAX_RETRIES, timeout_ms=EXCHANGE_TIMEOUT_MS
     )
+    session = PaperSession(cfg, exchange, make_engine(cfg.database_url), DEFAULT_KILL_FILE)
     try:
         run_id = session.start(resume)
     except ValueError as exc:  # not a resumable paper run
@@ -481,7 +468,10 @@ def paper_run(
         )
     )
     session.run_forever()
-    _say(f"stopped; run {run_id} is open. Resume with: regimebot paper run --resume {run_id}")
+    _say(
+        f"stopped; run {run_id} is open. Resume with: regimebot paper run --resume {run_id} "
+        f"(or end it: regimebot paper end {run_id})"
+    )
 
 
 @paper_app.command("clear-halt")
@@ -509,6 +499,36 @@ def paper_clear_halt(
     finally:
         os.close(lock)  # held until the cleared state is committed
     typer.echo(f"run {run_id}: cleared {', '.join(cleared) if cleared else 'nothing (no halt)'}")
+
+
+@paper_app.command("end")
+def paper_end(
+    run_id: Annotated[int, typer.Argument(help="The stopped paper run to end.")],
+    force: Annotated[
+        bool, typer.Option(help="End it even though it holds open (simulated) positions.")
+    ] = False,
+) -> None:
+    """End a stopped paper run for good: it records its end time and can no longer be resumed.
+
+    Refuses while the run is running, and while it holds open positions unless --force (they
+    are simulated: nothing is closed, they stay in its last saved state).
+    """
+    cfg = load_config()
+    try:
+        lock = lock_run(DEFAULT_KILL_FILE.parent, run_id)
+    except ValueError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+    try:
+        with session_scope(make_engine(cfg.database_url)) as session:
+            left_open = end_paper_run(session, run_id, force)
+    except ValueError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(1) from None
+    finally:
+        os.close(lock)  # held until the end is committed
+    kept = f"; open positions left as saved: {', '.join(left_open)}" if left_open else ""
+    typer.echo(f"run {run_id}: ended{kept}")
 
 
 @paper_app.command("status")

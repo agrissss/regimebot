@@ -128,6 +128,28 @@ def test_entry_without_liquidity_is_cancelled_and_the_symbol_is_free_again(
     assert rules(engine)[-1] == (1, "ok")
 
 
+@pytest.mark.parametrize(
+    ("side", "bid", "ask", "fills"),
+    [  # FREE_FILLS: a buy fills at the ask, a sell at the bid; stops 98 (long) and 102 (short)
+        (Side.LONG, 97.4, 97.5, False),  # the next open gapped below the stop
+        (Side.LONG, 97.9, 98.0, False),  # exactly at it: 1R would be zero
+        (Side.LONG, 98.0, 98.01, True),
+        (Side.SHORT, 102.5, 102.6, False),
+        (Side.SHORT, 102.0, 102.1, False),
+        (Side.SHORT, 101.99, 102.0, True),
+    ],
+)
+def test_an_entry_filling_at_or_beyond_its_stop_is_cancelled(
+    tmp_path: Path, side: Side, bid: float, ask: float, fills: bool
+) -> None:
+    engine = make(tmp_path, Scripted("trend", side=side), overrides=FREE_FILLS)
+    decide(engine, T1, {BTC: 100.0})
+    engine.fill_queued(BTC, T1, bid, ask, bar_volume=1e6)
+    assert (BTC in engine.portfolio.positions) == fills == bool(engine.log.fills)
+    assert rules(engine) == ([(0, "ok")] if fills else [(0, "ok"), (0, "gapped_through_stop")])
+    assert engine.is_active(BTC) == fills  # a cancelled entry frees the symbol
+
+
 def test_an_entry_not_filled_before_the_next_decision_expires(tmp_path: Path) -> None:
     engine = make(tmp_path, Scripted("trend"))
     decide(engine, T1, {BTC: 100.0})  # queued, but no bar arrives (feed gap)

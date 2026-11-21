@@ -13,18 +13,16 @@ Bookkeeping that keeps the result honest:
 import itertools
 import json
 import math
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import pandas as pd
 import structlog
 
-from regimebot.backtest.runner import BacktestResult, run_backtest
+from regimebot.backtest.runner import run_metrics
 from regimebot.config import AppConfig, with_overrides
-from regimebot.reporting.metrics import Metrics, compute_metrics, first_permanent_halt
+from regimebot.reporting.metrics import Metrics
 from regimebot.strategy import Strategy
 from regimebot.types import Trade
 
@@ -45,25 +43,6 @@ class WalkForwardResult:
     n_variants_tried: int
     oos_net_pnl: float
     n_test_windows_halted: int  # test windows that stopped early on a permanent risk halt
-
-
-def run_metrics(
-    cfg: AppConfig,
-    candles: Mapping[str, pd.DataFrame],
-    funding: Mapping[str, pd.Series],
-    start: datetime,
-    end: datetime,
-    strategies: Sequence[Strategy] | None = None,
-) -> tuple[Metrics, BacktestResult, str]:
-    """One backtest on a fresh kill file path (it does not exist, so nothing is halted): its
-    metrics over the whole run, the result, and the ISO time of its first permanent halt (max
-    drawdown) or ""."""
-    with tempfile.TemporaryDirectory() as tmp:
-        result = run_backtest(cfg, candles, funding, start, end, Path(tmp) / "KILL", strategies)
-    initial, gross = cfg.backtest.initial_equity, result.gross_exposure
-    metrics = compute_metrics(result.trades, result.equity, initial, gross_exposure=gross)
-    halt = first_permanent_halt(result.log.risk_events)
-    return metrics, result, halt.ts.isoformat() if halt else ""
 
 
 def _qualifies(m: Metrics, min_trades: int) -> bool:

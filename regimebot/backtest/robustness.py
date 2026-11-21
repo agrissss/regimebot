@@ -14,7 +14,7 @@ import pandas as pd
 import structlog
 from pydantic import BaseModel
 
-from regimebot.backtest.walk_forward import run_metrics
+from regimebot.backtest.runner import run_metrics
 from regimebot.config import AppConfig, with_overrides
 from regimebot.engine.loop import RunLog
 from regimebot.reporting.metrics import Metrics

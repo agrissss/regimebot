@@ -15,12 +15,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 from regimebot.execution.fill_model import funding_payment
-from regimebot.types import ExitReason, Fill, OrderSide, Regime, Side, Signal, Trade, side_sign
+from regimebot.types import (
+    ExitReason,
+    Fill,
+    Regime,
+    Side,
+    Signal,
+    Trade,
+    entry_order_side,
+    exit_order_side,
+    side_sign,
+)
 
 QTY_REL_TOL = 1e-9  # an exit fill's qty must match the position's qty this closely
-
-_ENTRY_ORDER = {Side.LONG: OrderSide.BUY, Side.SHORT: OrderSide.SELL}
-_EXIT_ORDER = {Side.LONG: OrderSide.SELL, Side.SHORT: OrderSide.BUY}
 
 
 @dataclass(kw_only=True, slots=True)
@@ -120,17 +127,23 @@ class Portfolio:
         return 0.0 if position is None else abs(position.qty * self.last_prices[symbol])
 
     def open(self, signal: Signal, fill: Fill) -> Position:
-        """Open ``signal`` at ``fill`` (whose qty may be below the requested qty); pays its fee."""
+        """Open ``signal`` at ``fill`` (whose qty may be below the requested qty); pays its fee.
+
+        Raises ValueError for a fill that does not match the signal, or one at or beyond the stop
+        (1R would be zero or negative: the engine cancels such an entry before it gets here)."""
         if signal.symbol in self.positions:
             raise ValueError(f"{signal.symbol} already has an open position")
-        if fill.symbol != signal.symbol or fill.side != _ENTRY_ORDER[signal.side]:
+        if fill.symbol != signal.symbol or fill.side != entry_order_side(signal.side):
             raise ValueError(
                 f"{fill.side} fill for {fill.symbol} cannot open {signal.side} {signal.symbol}"
             )
         if fill.ts < signal.ts:
             raise ValueError(f"entry fill at {fill.ts} is before its signal at {signal.ts}")
-        if fill.price == signal.stop:
-            raise ValueError("entry price equals the stop: 1R would be zero")
+        if side_sign(signal.side) * (fill.price - signal.stop) <= 0:
+            raise ValueError(
+                f"{signal.side} entry at {fill.price} is at or beyond the stop {signal.stop}: "
+                "1R would not be positive"
+            )
         position = Position(
             symbol=signal.symbol,
             strategy=signal.strategy,
@@ -159,7 +172,7 @@ class Portfolio:
         position = self.positions.get(symbol)
         if position is None:
             raise ValueError(f"no open position in {symbol}")
-        if fill.symbol != symbol or fill.side != _EXIT_ORDER[position.side]:
+        if fill.symbol != symbol or fill.side != exit_order_side(position.side):
             raise ValueError(
                 f"{fill.side} fill for {fill.symbol} cannot close {position.side} {symbol}"
             )

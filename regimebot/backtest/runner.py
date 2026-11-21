@@ -9,6 +9,7 @@ fills queued orders at its open, every one is checked for stops and targets, and
 in the interval are settled at their timestamps. Events of all symbols run in time order.
 """
 
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from regimebot.engine.loop import Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
 from regimebot.execution.fill_model import quote_from_bar_open
 from regimebot.market_state.features import compute_features, warm_rows
+from regimebot.reporting.metrics import Metrics, compute_metrics, first_permanent_halt
 from regimebot.risk.manager import RiskManager
 from regimebot.strategy import Strategy, build_strategies
 from regimebot.types import Bar, ExitReason, Mode, RiskEvent, Trade
@@ -223,6 +225,25 @@ def run_backtest(
     return BacktestResult(log, log.trades, equity, cfg, start, end)
 
 
+def run_metrics(
+    cfg: AppConfig,
+    candles: Mapping[str, pd.DataFrame],
+    funding: Mapping[str, pd.Series],
+    start: datetime,
+    end: datetime,
+    strategies: Sequence[Strategy] | None = None,
+) -> tuple[Metrics, BacktestResult, str]:
+    """One backtest on a fresh kill file path (it does not exist, so nothing is halted): its
+    metrics over the whole run, the result, and the ISO time of its first permanent halt (max
+    drawdown) or "". Walk-forward and the robustness checks run every variant through it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_backtest(cfg, candles, funding, start, end, Path(tmp) / "KILL", strategies)
+    initial, gross = cfg.backtest.initial_equity, result.gross_exposure
+    metrics = compute_metrics(result.trades, result.equity, initial, gross_exposure=gross)
+    halt = first_permanent_halt(result.log.risk_events)
+    return metrics, result, halt.ts.isoformat() if halt else ""
+
+
 def persist_result(session: Session, result: BacktestResult, note: str = "") -> int:
     """Store a backtest as a new run with all its log rows; returns the run id."""
     log = result.log
@@ -238,3 +259,18 @@ def persist_result(session: Session, result: BacktestResult, note: str = "") -> 
     repo.save_equity(session, run_id, log.equity)
     repo.end_run(session, run_id)
     return run_id
+
+
+def load_result(session: Session, run_id: int, cfg: AppConfig) -> BacktestResult:
+    """Rebuild stored backtest ``run_id`` (its run config ``cfg``) from what ``persist_result``
+    wrote: trades, fills, risk events and equity snapshots (not signals or decisions)."""
+    trades = repo.load_trades(session, run_id)
+    snapshots = repo.load_equity_snapshots(session, run_id)
+    log = RunLog(
+        trades=trades,
+        fills=repo.load_fills(session, run_id),
+        risk_events=repo.load_risk_events(session, run_id),
+        equity=snapshots,
+    )
+    equity = _snapshot_series(snapshots, 1, "equity")
+    return BacktestResult(log, trades, equity, cfg, cfg.backtest.start, cfg.backtest.end)

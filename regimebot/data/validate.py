@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from regimebot.config import timeframe_minutes
@@ -36,13 +37,12 @@ class ValidationReport:
 
 def gap_ranges(missing: pd.DatetimeIndex, step: pd.Timedelta) -> list[tuple[datetime, datetime]]:
     """Group sorted missing grid timestamps into ``(first, last)`` runs of consecutive bars."""
-    gaps: list[tuple[datetime, datetime]] = []
-    for ts in missing:
-        if gaps and ts - step == gaps[-1][1]:
-            gaps[-1] = (gaps[-1][0], ts.to_pydatetime())
-        else:
-            gaps.append((ts.to_pydatetime(), ts.to_pydatetime()))
-    return gaps
+    if missing.empty:
+        return []
+    breaks = np.flatnonzero((missing[1:] - missing[:-1]) != step)  # last index of each run
+    firsts = missing[np.concatenate(([0], breaks + 1))].to_pydatetime()
+    lasts = missing[np.concatenate((breaks, [len(missing) - 1]))].to_pydatetime()
+    return list(zip(firsts, lasts, strict=True))
 
 
 def validate_candles(df: pd.DataFrame, timeframe: str) -> ValidationReport:

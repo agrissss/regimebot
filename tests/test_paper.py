@@ -11,6 +11,8 @@ stop) trade whatever regime the features give: ``open_cfg`` lets every regime ru
 
 import os
 import signal
+import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -608,7 +610,7 @@ def test_resume_mid_position_three_times_matches_an_uninterrupted_run(
         saved.append(before)
     rig.poll(session, END, every=EVERY_5M)
 
-    assert saved[1]["risk"]["loss_streak"] == 1 and saved[1]["risk"]["pnl_by_day"]  # ETH lost
+    assert saved[1]["risk"]["loss_streak"] == 1  # ETH lost
     assert sorted(saved[1]["positions"]) == [BTC]
     trailed = saved[2]["positions"][ETH]
     assert trailed["stop"] > trailed["initial_stop"]
@@ -685,6 +687,17 @@ def test_resume_refuses_an_unknown_run_a_backtest_run_and_a_changed_config(
             rig.session().start(resume_run_id=run_id)
 
 
+def test_without_fcntl_everything_imports_and_only_the_run_lock_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # as on Windows: backtests and reports work, paper trading says why it cannot
+    code = "import sys; sys.modules['fcntl'] = None; import regimebot.cli"
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    with pytest.raises(RuntimeError, match="paper run locks need fcntl"):
+        state.lock_run(tmp_path, 1)
+
+
 def test_a_run_cannot_be_run_by_two_sessions_at_once(tmp_path: Path) -> None:
     rig = make_rig(tmp_path)
     first = rig.session()
@@ -705,10 +718,10 @@ def test_a_run_cannot_be_run_by_two_sessions_at_once(tmp_path: Path) -> None:
         (state.RISK_KEY, {"halts": ["bogus"]}, "unknown halt kinds"),
         (state.PORTFOLIO_KEY, {"last_prices": None}, "malformed '__portfolio__' state row"),
         (state.PORTFOLIO_KEY, {"cash": None}, "malformed '__portfolio__' state row"),
-        (state.RISK_KEY, {"pnl_by_day": None}, "malformed '__risk__' state row"),
+        (state.RISK_KEY, {"loss_streak": None}, "malformed '__risk__' state row"),
         (state.RISK_KEY, None, "malformed '__risk__' state row"),  # the row emptied: KeyError
     ],
-    ids=["bad_exit_reason", "bad_halt", "null_marks", "null_cash", "null_pnl", "empty_risk"],
+    ids=["bad_exit_reason", "bad_halt", "null_marks", "null_cash", "null_streak", "empty_risk"],
 )
 def test_a_failed_restore_changes_nothing_and_keeps_no_lock(
     tmp_path: Path, row: str, corruption: dict[str, Any] | None, error: str
@@ -1002,12 +1015,17 @@ def test_cli_paper_run_prints_the_banner_and_leaves_the_run_open(
     cfg = load_config()
     clock = Clock(datetime.now(UTC))  # the CLI session reads the real clock; no data is that new
     candles = {s: candles_from_closes([100.0] * 10) for s in cfg.exchange.symbols}
-    monkeypatch.setattr(
-        "regimebot.cli.CcxtExchange", lambda _id: ReplayExchange(candles, {}, cfg.costs, clock)
-    )
+    built: list[dict[str, object]] = []
+
+    def exchange(_id: str, **kwargs: object) -> ReplayExchange:
+        built.append(kwargs)
+        return ReplayExchange(candles, {}, cfg.costs, clock)
+
+    monkeypatch.setattr("regimebot.cli.CcxtExchange", exchange)
     monkeypatch.setattr(PaperSession, "run_forever", lambda self: None)
     result = CliRunner().invoke(app, ["paper", "run"])
     assert result.exit_code == 0, result.output
+    assert built == [{"max_retries": 1, "timeout_ms": 5000}]  # a hung symbol costs ~11 s, not 91
     out = result.output
     assert "PAPER TRADING - simulated fills only, no orders are sent to any exchange" in out
     assert "run id:    1 (new)" in out and "KILL" in out and "Ctrl-C or SIGTERM" in out
@@ -1051,6 +1069,49 @@ def test_cli_paper_clear_halt_clears_a_manual_kill_only_when_safe(
     with session_scope(cli_db) as s:
         backtest_id = repo.create_run(s, Mode.BACKTEST, rig.cfg)
     assert "not a paper run" in clear(backtest_id).output
+
+
+def test_cli_paper_end_ends_a_stopped_run_for_good(
+    tmp_path: Path, cli_db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = cli_rig(tmp_path, cli_db)
+    monkeypatch.setattr("regimebot.cli.CcxtExchange", lambda _id, **kwargs: rig.exchange)
+    session = rig.session()
+    run_id = session.start()
+    rig.poll(session, T1 + 5 * MINUTE)  # BTC and ETH are open
+    assert sorted(session.portfolio.positions) == [BTC, ETH]
+
+    def end(*args: str) -> Any:
+        return CliRunner().invoke(app, ["paper", "end", str(run_id), *args])
+
+    running = end()
+    assert running.exit_code == 1 and f"paper run {run_id} is already running" in running.output
+    session.close()  # the process stops; the run stays open
+    held = end()
+    assert held.exit_code == 1 and f"open positions in {BTC}, {ETH}: use --force" in held.output
+    with Session(cli_db) as s:
+        assert repo.load_run(s, run_id).ended_at is None
+    forced = end("--force")
+    assert forced.exit_code == 0, forced.output
+    assert f"run {run_id}: ended; open positions left as saved: {BTC}, {ETH}" in forced.output
+    with Session(cli_db) as s:
+        assert repo.load_run(s, run_id).ended_at is not None
+        assert sorted(repo.load_open_positions(s, run_id)) == sorted(
+            [BTC, ETH, state.PORTFOLIO_KEY, state.RISK_KEY]
+        )  # the saved state is kept as it was
+    again = end("--force")
+    assert again.exit_code == 1 and "already ended" in again.output
+
+    status = CliRunner().invoke(app, ["paper", "status"])
+    assert status.exit_code == 0 and f"paper run {run_id}: ended" in status.output  # not "hung"
+    with pytest.raises(ValueError, match="ended at"):
+        rig.session().start(resume_run_id=run_id)
+    resume = CliRunner().invoke(app, ["paper", "run", "--resume", str(run_id)])
+    assert resume.exit_code == 2 and "start a new one" in resume.output
+    with session_scope(cli_db) as s:
+        backtest_id = repo.create_run(s, Mode.BACKTEST, rig.cfg)
+    refused = CliRunner().invoke(app, ["paper", "end", str(backtest_id)])
+    assert refused.exit_code == 1 and "not a paper run" in refused.output
 
 
 def test_cli_paper_status_tells_a_clean_stop_from_a_hung_session(

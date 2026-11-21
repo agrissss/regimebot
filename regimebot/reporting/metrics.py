@@ -13,12 +13,12 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from regimebot.types import ExitReason, Fill, OrderSide, RiskEvent, Side, Trade
+from regimebot.risk.manager import PERMANENT_HALTS
+from regimebot.types import ExitReason, Fill, RiskEvent, Trade, entry_order_side, exit_order_side
 
 DAYS_PER_YEAR = 365  # crypto trades every day
 BEST_TRADES_DROPPED = 0.05
 _FLAT_STD = 1e-12  # a deviation below this is rounding noise, not risk
-PERMANENT_HALTS = ("max_drawdown", "manual_kill")  # stay until cleared by hand: trading ends
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,14 +128,8 @@ def _exposure(trades: Sequence[Trade], equity: pd.Series) -> float:
 def _slippage(trades: Sequence[Trade], fills: Sequence[Fill]) -> tuple[float, float]:
     """Mean taker-fill slippage (bps) of entry fills and of exit fills, matched to the trades by
     (symbol, ts, side)."""
-    entry_keys = {
-        (t.symbol, t.entry_ts, OrderSide.BUY if t.side == Side.LONG else OrderSide.SELL)
-        for t in trades
-    }
-    exit_keys = {
-        (t.symbol, t.exit_ts, OrderSide.SELL if t.side == Side.LONG else OrderSide.BUY)
-        for t in trades
-    }
+    entry_keys = {(t.symbol, t.entry_ts, entry_order_side(t.side)) for t in trades}
+    exit_keys = {(t.symbol, t.exit_ts, exit_order_side(t.side)) for t in trades}
     taker = [f for f in fills if f.liquidity == "taker"]
     entries = [f.slippage_bps for f in taker if (f.symbol, f.ts, f.side) in entry_keys]
     exits = [f.slippage_bps for f in taker if (f.symbol, f.ts, f.side) in exit_keys]

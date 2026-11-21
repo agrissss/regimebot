@@ -15,6 +15,7 @@ import pytest
 from synth import BTC, T0, Scripted, candles_from_closes, regime_walk
 from typer.testing import CliRunner
 
+from regimebot.backtest import runner
 from regimebot.backtest import walk_forward as wf
 from regimebot.backtest.runner import BacktestResult
 from regimebot.cli import app
@@ -77,7 +78,7 @@ def test_windows_have_exact_boundaries_and_tests_never_touch_train(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeRun(lambda p, s: [1.0, 1.0])
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     cfg = cfg_with({GRID_KEY: [0.004, 0.005]})
     res = wf.walk_forward(cfg, {}, {}, T0, T0 + 6 * DAY)
     w = res.windows
@@ -96,7 +97,7 @@ def test_windows_have_exact_boundaries_and_tests_never_touch_train(
 def test_last_window_may_end_exactly_at_end_and_none_fitting_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(wf, "run_backtest", FakeRun(lambda p, s: [1.0, 1.0]))
+    monkeypatch.setattr(runner, "run_backtest", FakeRun(lambda p, s: [1.0, 1.0]))
     cfg = cfg_with({GRID_KEY: [0.005]})
     assert len(wf.walk_forward(cfg, {}, {}, T0, T0 + 3 * DAY).windows) == 1
     with pytest.raises(ValueError, match="no walk-forward window"):
@@ -114,7 +115,7 @@ def test_params_are_argmax_on_train_not_on_test(monkeypatch: pytest.MonkeyPatch)
         return [-1.0, 1.0] if p == 0.004 else [5.0, 5.0]
 
     fake = FakeRun(script)
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.005, 0.004]}), {}, {}, T0, T0 + 3 * DAY)
     (row,) = res.windows.to_dict("records")
     assert json.loads(row["params"]) == {GRID_KEY: 0.004}
@@ -127,7 +128,7 @@ def test_params_are_argmax_on_train_not_on_test(monkeypatch: pytest.MonkeyPatch)
 def test_selection_metric_is_profit_factor_not_net_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
     # 0.005: PF 4, net 15; 0.004: PF inf, net 6. A net-pnl selector would pick 0.005.
     fake = FakeRun(lambda p, s: [10.0, 10.0, -5.0] if p == 0.005 else [3.0, 3.0])
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.005, 0.004]}), {}, {}, T0, T0 + 3 * DAY)
     assert json.loads(res.windows.params[0]) == {GRID_KEY: 0.004}
     assert res.windows.train_net_pnl[0] == 6.0
@@ -136,7 +137,7 @@ def test_selection_metric_is_profit_factor_not_net_pnl(monkeypatch: pytest.Monke
 def test_nan_profit_factor_does_not_qualify_even_with_enough_trades(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(wf, "run_backtest", FakeRun(lambda p, s: [0.0, 0.0, 0.0]))  # PF is NaN
+    monkeypatch.setattr(runner, "run_backtest", FakeRun(lambda p, s: [0.0, 0.0, 0.0]))  # PF is NaN
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.004]}), {}, {}, T0, T0 + 3 * DAY)
     assert res.windows.no_qualifying_params[0] and res.windows.train_n_trades[0] == 3
 
@@ -145,7 +146,7 @@ def test_invalid_grid_combination_fails_before_any_backtest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeRun(lambda p, s: [1.0, 1.0])
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     grid = {GRID_KEY: [0.004], "risk.max_gross_leverage": [1.0, 2.0]}  # 2.0 exceeds the hard cap
     with pytest.raises(ValueError):
         wf.walk_forward(cfg_with(grid), {}, {}, T0, T0 + 3 * DAY)
@@ -155,11 +156,11 @@ def test_invalid_grid_combination_fails_before_any_backtest(
 def test_ties_go_to_first_in_grid_order_and_inf_beats_finite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(wf, "run_backtest", FakeRun(lambda p, s: [1.0, -1.0]))
+    monkeypatch.setattr(runner, "run_backtest", FakeRun(lambda p, s: [1.0, -1.0]))
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.006, 0.004, 0.005]}), {}, {}, T0, T0 + 3 * DAY)
     assert json.loads(res.windows.params[0]) == {GRID_KEY: 0.006}
     monkeypatch.setattr(
-        wf, "run_backtest", FakeRun(lambda p, s: [3.0, 3.0] if p == 0.005 else [3.0, -1.0])
+        runner, "run_backtest", FakeRun(lambda p, s: [3.0, 3.0] if p == 0.005 else [3.0, -1.0])
     )
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.006, 0.004, 0.005]}), {}, {}, T0, T0 + 3 * DAY)
     assert json.loads(res.windows.params[0]) == {GRID_KEY: 0.005}
@@ -170,7 +171,7 @@ def test_no_qualifying_params_runs_test_on_unmodified_config(
 ) -> None:
     # every combination has too few trades (1 < min_trades 2); one has NaN profit factor (no trades)
     fake = FakeRun(lambda p, s: [] if p == 0.004 else [5.0])
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     cfg = cfg_with({GRID_KEY: [0.004, 0.006]})
     res = wf.walk_forward(cfg, {}, {}, T0, T0 + 3 * DAY)
     (row,) = res.windows.to_dict("records")
@@ -183,7 +184,7 @@ def test_no_qualifying_params_runs_test_on_unmodified_config(
 
 def test_n_variants_tried_is_combinations_times_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRun(lambda p, s: [1.0, 1.0])
-    monkeypatch.setattr(wf, "run_backtest", fake)
+    monkeypatch.setattr(runner, "run_backtest", fake)
     grid = {GRID_KEY: [0.004, 0.005], "risk.max_gross_leverage": [1.0, 1.5]}
     res = wf.walk_forward(cfg_with(grid), {}, {}, T0, T0 + 5 * DAY)
     assert len(res.windows) == 3 and res.n_variants_tried == 12
@@ -193,7 +194,7 @@ def test_n_variants_tried_is_combinations_times_windows(monkeypatch: pytest.Monk
 def test_oos_trades_are_the_test_trades_in_order_and_pnl_sums(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(wf, "run_backtest", FakeRun(lambda p, s: [2.0, 3.0]))
+    monkeypatch.setattr(runner, "run_backtest", FakeRun(lambda p, s: [2.0, 3.0]))
     res = wf.walk_forward(cfg_with({GRID_KEY: [0.005]}), {}, {}, T0, T0 + 5 * DAY)
     starts = [t.entry_ts for t in res.oos_trades]
     assert starts == sorted(starts) and len(starts) == 6

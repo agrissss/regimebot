@@ -8,7 +8,6 @@ is rewritten on every poll, so its ``updated_at`` is the session's heartbeat. A 
 holds an exclusive lock on ``paper_run_<id>.lock`` next to the kill file (``lock_run``).
 """
 
-import fcntl
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -89,7 +88,15 @@ def append_log(session: Session, run_id: int, log: RunLog, marks: FlushMarks) ->
 def lock_run(lock_dir: Path, run_id: int) -> int:
     """Take run ``run_id``'s exclusive lock and return its file descriptor; the lock holds until
     the descriptor is closed or the process exits. Raises ValueError when it is already held
-    (another session runs this run), so two processes never book the same run."""
+    (another session runs this run), so two processes never book the same run, and
+    RuntimeError on a platform without ``fcntl`` (paper trading is POSIX-only; importing this
+    module, and so backtests, is not)."""
+    try:
+        import fcntl
+    except ImportError:
+        raise RuntimeError(
+            "paper run locks need fcntl (Linux or macOS); run paper trading there or in Docker"
+        ) from None
     lock_dir.mkdir(parents=True, exist_ok=True)
     path = lock_dir / f"paper_run_{run_id}.lock"
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -133,10 +140,13 @@ def save_state(
 
 
 def check_resumable(session: Session, run_id: int, cfg: AppConfig) -> None:
-    """Raise ValueError unless ``run_id`` is a paper run started with this config."""
+    """Raise ValueError unless ``run_id`` is an open (not ended) paper run started with this
+    config."""
     run = repo.load_run(session, run_id)  # ValueError for an unknown id
     if run.mode != Mode.PAPER:
         raise ValueError(f"run {run_id} is a {run.mode} run, not a paper run")
+    if run.ended_at is not None:
+        raise ValueError(f"paper run {run_id} ended at {run.ended_at.isoformat()}: start a new one")
     if run.config_hash != config_hash(cfg):
         raise ValueError(
             f"run {run_id} ran config {run.config_hash}, the current config is "
@@ -197,6 +207,30 @@ def clear_halts(session: Session, run_id: int, cfg: AppConfig, kill_file: Path) 
     risk.clear_halt()
     repo.save_open_position(session, run_id, RISK_KEY, risk.to_state())
     return list(saved["halts"])
+
+
+def end_paper_run(session: Session, run_id: int, force: bool = False) -> list[str]:
+    """End paper run ``run_id`` for good (``ended_at``: it can no longer be resumed); returns
+    the symbols of the open positions it still held. The caller holds the run's lock
+    (``lock_run``) until this commits.
+
+    Raises ValueError for a run that is not a paper run or has already ended, and for one with
+    open positions unless ``force`` (they are simulated: nothing is closed, the saved state is
+    kept as it was).
+    """
+    run = repo.load_run(session, run_id)  # ValueError for an unknown id
+    if run.mode != Mode.PAPER:
+        raise ValueError(f"run {run_id} is a {run.mode} run, not a paper run")
+    if run.ended_at is not None:
+        raise ValueError(f"paper run {run_id} already ended at {run.ended_at.isoformat()}")
+    held = sorted(set(repo.load_open_positions(session, run_id)) - {PORTFOLIO_KEY, RISK_KEY})
+    if held and not force:
+        raise ValueError(
+            f"paper run {run_id} has open positions in {', '.join(held)}: "
+            "use --force to end it anyway"
+        )
+    repo.end_run(session, run_id)
+    return held
 
 
 @contextmanager

@@ -131,6 +131,16 @@ class RiskEvent:
     action: str  # what the system did, e.g. "halt", "flatten", "skip_symbol"
 
 
+def entry_order_side(side: Side) -> OrderSide:
+    """The order that opens a ``side`` position: BUY for LONG, SELL for SHORT."""
+    return OrderSide.BUY if side == Side.LONG else OrderSide.SELL
+
+
+def exit_order_side(side: Side) -> OrderSide:
+    """The order that closes a ``side`` position: SELL for LONG, BUY for SHORT."""
+    return OrderSide.SELL if side == Side.LONG else OrderSide.BUY
+
+
 def side_sign(side: Side | str) -> int:
     """Return +1 for LONG and -1 for SHORT (multiplier for price moves).
 

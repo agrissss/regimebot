@@ -13,7 +13,14 @@ from regimebot.config import (
     timeframe_minutes,
     with_overrides,
 )
-from regimebot.types import Regime, Side, side_sign
+from regimebot.types import (
+    OrderSide,
+    Regime,
+    Side,
+    entry_order_side,
+    exit_order_side,
+    side_sign,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -170,6 +177,17 @@ def test_empty_or_non_mapping_yaml_rejected(tmp_path: Path) -> None:
         path.write_text(text)
         with pytest.raises(ValueError, match="bad.yaml"):
             load_config(path)
+
+
+def test_order_sides_open_and_close_each_position_side() -> None:
+    assert (entry_order_side(Side.LONG), exit_order_side(Side.LONG)) == (
+        OrderSide.BUY,
+        OrderSide.SELL,
+    )
+    assert (entry_order_side(Side.SHORT), exit_order_side(Side.SHORT)) == (
+        OrderSide.SELL,
+        OrderSide.BUY,
+    )
 
 
 def test_side_sign() -> None:

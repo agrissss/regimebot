@@ -17,7 +17,8 @@ from regimebot.types import Bar, Quote
 
 log = structlog.get_logger(__name__)
 
-MAX_RETRIES = 5  # retries after the first attempt, so up to 6 calls in total
+MAX_RETRIES = 5  # default retries after the first attempt, so up to 6 calls in total
+TIMEOUT_MS = 10_000  # default per-request timeout (ccxt's own default)
 BACKOFF_SECONDS = 1.0  # first wait; doubles each retry
 # A bar counts as closed only CLOSE_GRACE after its close time: covers local clock skew and
 # the exchange building a response just before the boundary (partial bar).
@@ -53,7 +54,10 @@ def _from_ms(ms: float) -> datetime:
 class CcxtExchange:
     """``Exchange`` over the synchronous ccxt client; public endpoints only, no API keys.
 
-    ``client``, ``sleep`` and ``now`` are injectable for tests.
+    Each call is retried up to ``max_retries`` times on ``ccxt.NetworkError`` (1, 2, 4, ... s
+    apart); ``timeout_ms`` is ccxt's per-request timeout. The defaults (5 retries, 10 s: about
+    91 s worst case) suit a history download; a paper session uses far fewer. ``client``,
+    ``sleep`` and ``now`` are injectable for tests.
     """
 
     def __init__(
@@ -62,18 +66,22 @@ class CcxtExchange:
         client: Any = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        max_retries: int = MAX_RETRIES,
+        timeout_ms: int = TIMEOUT_MS,
     ) -> None:
         self._client = client or getattr(ccxt, exchange_id)({"enableRateLimit": True})
+        self._client.timeout = timeout_ms  # ccxt reads it on every request
         self._sleep = sleep
         self._now = now
+        self._max_retries = max_retries
 
     def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         """Call ``fn``, retrying ``ccxt.NetworkError`` with exponential backoff."""
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(self._max_retries + 1):
             try:
                 return fn(*args)
             except ccxt.NetworkError as exc:
-                if attempt == MAX_RETRIES:
+                if attempt == self._max_retries:
                     raise
                 wait = BACKOFF_SECONDS * 2**attempt
                 log.warning("exchange_retry", attempt=attempt + 1, wait_s=wait, error=str(exc))

@@ -41,6 +41,8 @@ def download_candles(
     width = pd.Timedelta(minutes=timeframe_minutes(timeframe))
     first, last = pd.Timestamp(start).ceil(width), pd.Timestamp(end).floor(width)
     grid = pd.date_range(first, last, freq=width) if first <= last else pd.DatetimeIndex([])
+    # ponytail: loads every stored timestamp in the range (about 1M per symbol for two years of
+    # 1m bars, ~8 MB); a SQL gap query (LAG over ts) would return only the holes if that grows.
     stored = repo.candle_timestamps(session, symbol, timeframe, start, end)
     total = 0
     for hole_start, hole_end in gap_ranges(grid.difference(stored), width):

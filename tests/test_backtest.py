@@ -25,7 +25,7 @@ from synth import (
 )
 from typer.testing import CliRunner
 
-from regimebot.backtest.runner import BacktestResult, persist_result, run_backtest
+from regimebot.backtest.runner import BacktestResult, load_result, persist_result, run_backtest
 from regimebot.cli import app
 from regimebot.config import AppConfig, load_config
 from regimebot.db import repo
@@ -405,6 +405,15 @@ def test_persist_result_round_trips_trades_equity_and_links(
             repo.load_equity(session, run_id), walk.equity, check_index_type=False, check_freq=False
         )
         assert repo.load_equity_snapshots(session, run_id) == walk.log.equity  # with gross
+        loaded = load_result(session, run_id, walk.cfg)  # what `report` rebuilds
+        assert loaded.trades == sorted(walk.trades, key=lambda t: t.entry_ts)
+        assert (loaded.log.fills, loaded.log.risk_events) == (walk.log.fills, walk.log.risk_events)
+        assert loaded.log.equity == walk.log.equity
+        assert (loaded.start, loaded.end) == (walk.cfg.backtest.start, walk.cfg.backtest.end)
+        pd.testing.assert_series_equal(loaded.equity, walk.equity, check_index_type=False)
+        pd.testing.assert_series_equal(
+            loaded.gross_exposure, walk.gross_exposure, check_index_type=False
+        )
         links = session.execute(
             select(SignalRow.symbol, SignalRow.ts, RiskDecisionRow.rule)
             .join(RiskDecisionRow, RiskDecisionRow.signal_id == SignalRow.id)

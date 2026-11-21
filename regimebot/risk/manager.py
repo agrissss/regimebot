@@ -25,7 +25,9 @@ log = structlog.get_logger(__name__)
 DEFAULT_KILL_FILE = Path(__file__).resolve().parents[2] / "data" / "KILL"  # <repo>/data/KILL
 MIN_NOTIONAL = 10.0  # quote units; smaller orders are rejected as "too_small"
 STREAK_SIZE_MULT = 0.5  # size multiplier once the loss streak reaches streak_half
-HALT_SEVERITY = ("manual_kill", "max_drawdown", "weekly_loss", "daily_loss")  # most severe first
+# Halts that stay until cleared by hand (``clear_halt``): a run that hits one has ended trading.
+PERMANENT_HALTS = ("manual_kill", "max_drawdown")
+HALT_SEVERITY = (*PERMANENT_HALTS, "weekly_loss", "daily_loss")  # most severe first
 
 
 def _utc(ts: datetime, name: str) -> datetime:
@@ -66,17 +68,14 @@ def _stop_problem(signal: Signal) -> str | None:
 class RiskManager:
     """Approves and sizes signals, enforces loss limits and owns the kill switch.
 
-    State (saved by ``to_state``): ``pnl_by_day`` / ``pnl_by_week`` (realised net pnl keyed by
-    UTC exit date / ISO-week Monday), ``loss_streak`` (consecutive losing trades),
-    ``day_stopped`` (UTC date on which the streak stop was hit: no entries that day), the
-    active halts (see ``halted_reason``) and the equity at the start of the current day/week.
+    State (saved by ``to_state``): ``loss_streak`` (consecutive losing trades), ``day_stopped``
+    (UTC date on which the streak stop was hit: no entries that day), the active halts (see
+    ``halted_reason``) and the equity at the start of the current day/week.
     """
 
     def __init__(self, cfg: AppConfig, kill_file: Path) -> None:
         self.risk = cfg.risk
         self.kill_file = kill_file
-        self.pnl_by_day: dict[date, float] = {}
-        self.pnl_by_week: dict[date, float] = {}
         self.loss_streak = 0
         self.day_stopped: date | None = None
         self._halts: set[str] = set()
@@ -185,7 +184,7 @@ class RiskManager:
         return rooms
 
     def on_trade_closed(self, trade: Trade) -> None:
-        """Book the trade's net pnl by exit day and week and update the loss streak.
+        """Update the loss streak with the trade's net pnl.
 
         ``net_pnl < 0`` extends the streak, anything else resets it. Reaching ``streak_stop``
         stops entries for the rest of the exit's UTC day. A trade exiting after the stopped day
@@ -195,9 +194,6 @@ class RiskManager:
             raise ValueError(f"trade net_pnl must be finite, got {trade.net_pnl!r}")
         day = _utc(trade.exit_ts, "trade.exit_ts").date()
         self._clear_day_stop(day)
-        self.pnl_by_day[day] = self.pnl_by_day.get(day, 0.0) + trade.net_pnl
-        week = _week_start(day)
-        self.pnl_by_week[week] = self.pnl_by_week.get(week, 0.0) + trade.net_pnl
         self.loss_streak = self.loss_streak + 1 if trade.net_pnl < 0 else 0
         if self.loss_streak >= self.risk.streak_stop and self.day_stopped != day:
             self.day_stopped = day
@@ -270,8 +266,6 @@ class RiskManager:
     def to_state(self) -> dict[str, Any]:
         """JSON-safe snapshot (dates as ISO strings) for paper-session restarts."""
         return {
-            "pnl_by_day": {d.isoformat(): v for d, v in self.pnl_by_day.items()},
-            "pnl_by_week": {d.isoformat(): v for d, v in self.pnl_by_week.items()},
             "loss_streak": self.loss_streak,
             "day_stopped": _iso(self.day_stopped),
             "halts": sorted(self._halts),
@@ -283,14 +277,13 @@ class RiskManager:
 
     def load_state(self, state: Mapping[str, Any]) -> None:
         """Restore a ``to_state`` snapshot. Raises ValueError on an unknown halt kind (dropping
-        it would silently resume trading); nothing changes when it raises."""
+        it would silently resume trading); nothing changes when it raises. Keys it does not read
+        are ignored, so states saved with the old ``pnl_by_day`` / ``pnl_by_week`` still load."""
         unknown = set(state["halts"]) - set(HALT_SEVERITY)
         if unknown:
             raise ValueError(f"unknown halt kinds in state: {sorted(unknown)}")
         day_start, week_start = state["day_start_equity"], state["week_start_equity"]
         parsed = (  # parse everything before assigning anything
-            {date.fromisoformat(d): float(v) for d, v in state["pnl_by_day"].items()},
-            {date.fromisoformat(d): float(v) for d, v in state["pnl_by_week"].items()},
             int(state["loss_streak"]),
             _from_iso(state["day_stopped"]),
             set(state["halts"]),
@@ -300,8 +293,6 @@ class RiskManager:
             None if week_start is None else float(week_start),
         )
         (
-            self.pnl_by_day,
-            self.pnl_by_week,
             self.loss_streak,
             self.day_stopped,
             self._halts,
