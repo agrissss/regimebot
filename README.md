@@ -31,7 +31,7 @@ edge on the data tested (see [First results](#first-results)).
 
 - Python 3.11 or newer (developed on 3.12).
 - Network access to Binance USDT-margined perpetuals public endpoints for `data download` and paper trading. No account or API key.
-- About 500 MB of disk for the default database (two years of 1-minute candles for three symbols).
+- About 500 MB of disk for the default database (two years of 1-minute candles for three symbols). Each stored two-year backtest adds roughly 80 MB (the regimes table); the database was about 780 MB after three stored runs.
 
 ## Quick start
 
@@ -70,9 +70,9 @@ Optionally activate the venv (`source .venv/bin/activate`) and drop the `.venv/b
 | `regimebot db upgrade` | Apply all migrations to the configured database. |
 | `regimebot data download [--start ISO] [--end ISO]` | Download 1-minute candles and funding rates for all configured symbols (default range: the config's `backtest.start` to `backtest.end`). Re-running resumes. |
 | `regimebot data check` | Validate stored candles per symbol (duplicates, bad OHLC, gaps, short history). Exit code 1 if any symbol fails. |
-| `regimebot regimes study` | Print and save how regimes relate to forward returns, per symbol, to `reports/regime_study_<symbol>.csv`. |
+| `regimebot regimes study` | Print and save how regimes relate to forward returns, per symbol, to files like `reports/regime_study_BTC_USDT_USDT.csv`. |
 | `regimebot backtest run [--start ISO] [--end ISO] [--note TEXT] [--set key=value ...]` | Backtest on stored candles, store the run, print headline numbers and the run id. |
-| `regimebot backtest walk-forward [--start] [--end] [--set ...]` | Fit the config's grid on each 365-day train span, test on the next 90 days. Slow (about 40 backtests). Writes `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv`. |
+| `regimebot backtest walk-forward [--start] [--end] [--set ...]` | Fit the config's grid on each 365-day train span, test on the next 90 days. Slow (about 40 backtests). Uses the config's risk limits (use `--set risk.max_drawdown=1.0` for full windows) and prints how many test windows halted. Writes `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv`. |
 | `regimebot backtest robustness [--param PATH ...] [--start] [--end] [--set ...]` | Perturb parameters by +/-20% (default: four parameters), double all costs, compare max gross leverage 1.0 vs 1.5. Writes `reports/sensitivity.csv`, `cost_stress.csv`, `leverage_compare.csv`. |
 | `regimebot report RUN_ID [--variants-tried N] [--random-seeds N]` | Rebuild the HTML report for a stored backtest into `reports/run_<id>/`. Recomputes baselines (random entry takes a minute or two; `--random-seeds 0` skips it, default 3). |
 | `regimebot paper run [--resume RUN_ID]` | Paper trade until Ctrl-C or SIGTERM. See [docs/operations.md](docs/operations.md). |
@@ -134,12 +134,13 @@ Candles go through causal features to a rule-based regime label (trend up/down, 
 | Run | Result |
 |---|---|
 | Default limits | 60 trades, net -971.71 USDT (-9.72%). Halted by the 10% drawdown limit on 2024-02-05; no entries after that. Over the same five weeks buy and hold lost 51.49; random entries (3 seeds, same trade frequency) had a median of -359.25, range -982.29 to +103.33. |
-| Drawdown halt off (`--set risk.max_drawdown=1.0`) | 1,300 trades, net -4,726.92 USDT (-47.27%), of which fees 3,835.64 (roughly -840 before fees). Max drawdown 48.62%, profit factor 0.82. Buy and hold over the two years: +5,213.78. Random entries with the same exits: median -6,107.72, range -6,471.48 to -4,814.97 (profit factor 0.69). The entry rules do slightly better than random entries, but nowhere near enough to cover costs. |
+| Drawdown halt off (`--set risk.max_drawdown=1.0`) | 1,300 trades, net -4,726.92 USDT (-47.27%), of which fees 3,835.64 (about -891 before fees, about -838 before fees and funding). Max drawdown 48.62%, profit factor 0.82. Buy and hold over the two years: +5,213.78. Random entries with the same exits: median -6,107.72, range -6,471.48 to -4,814.97 (profit factor 0.69). The entry rules do slightly better than random entries, but nowhere near enough to cover costs. |
 | Robustness (two years, drawdown halt off) | Moving each of four parameters by +/-20% keeps the net result between -4,279.65 and -5,302.76. Doubling all costs gives -6,932.21. A 1.0x versus 1.5x gross leverage cap gives identical results (the cap never binds at 0.5% risk per trade). |
-| Walk-forward (9-combination grid, 4 windows, 36 variants tried) | Best in-training profit factor was below 1 in every window (0.95, 0.93, 0.54, 0.80). Out-of-sample total -554.29 over 465 trades; one winning quarter, three losing. |
+| Walk-forward, default limits (drawdown halt on; 9-combination grid, 4 windows, 36 variants tried) | Every training run hit the 10% halt before the end of its year (first halts 2024-04-07, 2024-07-02, 2024-08-12, 2024-12-03), so training saw only part of each year. Best in-training profit factors 0.95, 0.93, 0.54, 0.80 (on 174, 184, 82, 106 trades up to the halt). Out-of-sample 465 trades, net -554.29; window nets +1,654.36, -418.84, -858.99, -930.82; test windows 1, 2 and 3 halted on 2025-04-28, 2025-09-08 and 2025-12-10. |
+| Walk-forward, drawdown halt off (`--set risk.max_drawdown=1.0`, full windows; same grid, 36 variants) | Best in-training profit factors 0.85, 0.96, 0.87, 0.91 on 659, 647, 627, 623 trades; training nets -2,143.72, -513.23, -1,827.04, -1,289.81. Out-of-sample 630 trades, net -1,976.62; test profit factors 1.43, 0.65, 0.86, 0.59; window nets +1,586.71, -1,557.25, -508.65, -1,497.43 (one winning quarter, three losing). On full windows the best parameter set in the grid lost money in training in every window; the one winning quarter came from parameters that had lost in training, so it is not evidence of an edge. |
 | Regime study | Regimes separate the size of the next move, not its direction. A 5% move within 24 hours followed 23% / 37% / 59% of high-volatility-expansion bars on BTC / ETH / SOL, versus 6% / 16% / 29% after compression. |
 
-Artefacts (the `reports/` directory is git-ignored; the commands regenerate them): `reports/run_2/report.html`, `reports/run_3/report.html`, `reports/walk_forward_windows.csv`, `reports/walk_forward_oos_trades.csv`, `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`.
+Artefacts (the `reports/` directory is git-ignored; the commands regenerate them): `reports/run_2/report.html`, `reports/run_3/report.html`, `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv` (halt off, the last run), `reports/walk_forward_windows_default_limits.csv` and `reports/walk_forward_oos_trades_default_limits.csv` (copies of the default-limits run), `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`.
 
 Conclusion: as specified, these strategies show no edge on this data. The regimes carry information about how much price will move, but not which way, and the strategies depend on direction. See [docs/research-protocol.md](docs/research-protocol.md) for how to read these numbers.
 

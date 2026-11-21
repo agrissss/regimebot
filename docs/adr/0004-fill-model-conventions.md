@@ -4,7 +4,7 @@ Status: accepted
 
 ## Context
 
-A backtest flatters a strategy whenever its fills are better than reality. The fill model (`regimebot/execution/fill_model.py`, used by `regimebot/engine/loop.py`) must be pessimistic where information is missing, so a surviving result is not an artefact of generous fills. Rules below apply to backtest and paper alike.
+A backtest flatters a strategy whenever its fills are better than reality. The fill model (`regimebot/execution/fill_model.py`, used by `regimebot/engine/loop.py`) must be pessimistic where information is missing, so a surviving result is not an artefact of generous fills. Rules below apply to backtest and paper alike. In paper trading, queued orders fill at a fresh live quote (live spread, session clock), and participation uses the last closed base bar's volume.
 
 ## Decision
 

@@ -9,7 +9,7 @@ Paper trading polls live public market data, runs the same engine as the backtes
 .venv/bin/regimebot data check
 ```
 
-`data check` confirms the stored history is complete. A paper session fetches its own warm-up history (3000 decision bars, about 31 days) on start.
+`data check` validates the stored history for the configured backtest range, so it is only needed for backtests. A paper session fetches its own warm-up history (3000 decision bars, about 31 days) on start.
 
 ## Start a session
 
@@ -31,11 +31,11 @@ The session polls every 10 seconds (`paper.poll_seconds`) and decides once per c
 .venv/bin/regimebot paper status
 ```
 
-Shows the latest paper run: open or ended, the age of its last poll, equity and its timestamp, cash, the active halt (or `no`), open positions with stop and target, the last regime per symbol and the last 10 risk events. It reads the database and works while a session runs. With an open run it exits 1 when the last poll is older than `--max-age` seconds (default 3 x `poll_seconds` + `stale_after_seconds`, 210 s), which flags a hung process. See Monitoring.
+Shows the latest paper run: `open` (running), or `stopped at <time>` after a clean stop (Ctrl-C or SIGTERM), with the resume command; the age of its last poll; equity and its timestamp, cash, the active halt (or `no`), open positions with stop and target, the last regime per symbol and the last 10 risk events. It reads the database and works while a session runs. It exits 0 for a running run and for a cleanly stopped run. It exits 1 (printing `NOT POLLING`) for an open run with no clean-stop marker whose last poll is older than `--max-age` seconds (default 3 x `poll_seconds` + `stale_after_seconds`, 210 s): the process crashed or hung. See Monitoring.
 
 ## Stop and resume
 
-Stop with Ctrl-C or SIGTERM. The session finishes the current poll, saves its state and exits. Positions stay open and the run stays open; nothing is flattened.
+Stop with Ctrl-C or SIGTERM. The session finishes the current poll, saves its state, records a clean-stop marker (`stopped_at`) and exits. Positions stay open and the run stays resumable; nothing is flattened.
 
 ```bash
 .venv/bin/regimebot paper run --resume 4
@@ -46,7 +46,7 @@ Use the run id from the banner or from `paper status`. Rules on resume:
 - The run must be a paper run started with the same config (the config hash is checked; a changed config is refused). Change parameters by starting a new run.
 - Positions, cash, peak equity, risk state and queued exits are restored.
 - Base bars that closed while the process was down are replayed, so a stop or target hit during downtime is honoured at the bar where it happened.
-- A decision whose wait (180 s after its bar close) has ended is skipped and alerted as `decision_missed`; it is never run late. This also applies to a fresh start more than 180 s into a bar. The session resumes at the next live decision.
+- A decision whose wait (180 s after its bar close) has ended is skipped and never run late. If it was missed while the process was running, it is alerted as `decision_missed`. If it closed before this process started (a routine start or resume, including a fresh start more than 180 s into a bar), it is logged at info without an alert. The session continues at the next live decision.
 - Queued entries are cancelled, with a recorded decision, on a clean shutdown. After a hard kill (SIGKILL) a leftover entry is dropped on resume.
 - Each run has a lock file, `data/paper_run_<id>.lock`. A second session cannot resume a run that is already running.
 
@@ -57,7 +57,7 @@ Use the run id from the banner or from `paper status`. Rules on resume:
 .venv/bin/regimebot unkill    # remove it
 ```
 
-While the file exists, a running session acts on it at every poll (about every 10 seconds, `paper.poll_seconds`), not only at decisions: it halts, flattens open positions from fresh quotes immediately, cancels queued entries and opens nothing. The halt is recorded as `manual_kill` and alerted.
+While the file exists, a running session acts on it at every poll (about every 10 seconds, `paper.poll_seconds`), not only at decisions, even when nothing is open: the halt is recorded, alerted and shown by `paper status` within about one poll. Open positions are flattened from fresh quotes immediately, queued entries are cancelled and nothing new opens. The halt is recorded as `manual_kill`.
 
 The halt is sticky. `unkill` removes the file but the run stays halted and flat, and the halt is saved with the run, so `paper run --resume` restores it. To let a run trade again, stop the session, remove the kill file, then clear the halt:
 
@@ -73,7 +73,12 @@ The kill file path is `<repo>/data/KILL`. A backtest ignores it: backtests use a
 
 ## Stale data
 
-A symbol is stale when its last candle download failed or its newest bar is older than 180 seconds (`paper.stale_after_seconds`). For a stale symbol the engine records a `stale_data` risk event, trades nothing in it and opens no new entries; an open position keeps only its stop. Each incident raises one alert, and another when it recovers. A missing bar therefore delays a decision by at most 180 seconds.
+A symbol is stale when its last candle download failed or its newest bar is older than 180 seconds (`paper.stale_after_seconds`). For a stale symbol the engine records a `stale_data` risk event, trades nothing in it and opens no new entries; an open position keeps its stop and target, which are still checked on base bars. Each incident raises one alert, and another when it recovers. A missing bar therefore delays a decision by at most 180 seconds.
+
+Timing limits:
+
+- A fill after a decision can lag it by the quote fetches (each up to about 91 s while the exchange retries). An entry not filled within one decision bar expires.
+- Exchange requests are retried per symbol in sequence (up to about 91 s per call). One symbol with hanging requests can therefore make decisions miss for all symbols while it lasts; each miss is alerted as `decision_missed`. This is a known limit.
 
 ## Alerts
 
@@ -101,31 +106,31 @@ Every halt (`daily_loss`, `weekly_loss`, `max_drawdown`, `manual_kill`) sends an
 
 `data/` and `reports/` are not in git. Back up the database file while no session is running (or use `sqlite3 data/regimebot.db ".backup copy.db"`).
 
-A long job (walk-forward, a download) and a paper session can contend for the SQLite file. Run them one at a time, or use Postgres.
+The long SQLite writers are `data download`, the final save of `backtest run`, and a paper session (which writes every poll). A second writer waits only about 5 seconds (SQLite's default busy timeout) and then fails with "database is locked". Walk-forward reads candles once and writes CSVs, so it is not a long writer. Run writers one at a time, or use Postgres.
 
 ## Monitoring
 
-`paper status` exits 1 when an open run has not polled recently, so a cron job can watch for a hung or dead session. A generic example that runs every five minutes and sends mail on failure (use whatever notifier you have in place of `mail`):
+`paper status` exits 1 when a run that was not stopped cleanly has not polled recently, so a cron job can watch for a hung or dead session. A generic example that runs every five minutes and sends mail on failure (use whatever notifier you have in place of `mail`):
 
 ```bash
 */5 * * * * cd /path/to/regimebot && .venv/bin/regimebot paper status >/dev/null || echo "regimebot paper run is stale or hung" | mail -s "regimebot" you@example.com
 ```
 
-Exit code 0 means the latest run is healthy or has ended; non-zero means stale. Pair it with `ALERT_WEBHOOK_URL` for in-session alerts. Note: a run that has no open session but was never ended also counts as stale after `--max-age`.
+Exit code 0 means the latest run is polling or was stopped cleanly with Ctrl-C or SIGTERM. Exit code 1 means an open run with no clean-stop marker has not polled within `--max-age`: it crashed or hung. Pair it with `ALERT_WEBHOOK_URL` for in-session alerts.
 
 ## Docker Compose (untested on the development machine)
 
-Docker was not available during development, so these steps are unverified.
+Docker was not available during development, so none of these steps has been run there.
 
 ```bash
-export POSTGRES_PASSWORD=choose-one
+export POSTGRES_PASSWORD=$(openssl rand -hex 24)   # keep it: the db volume stores it on first start
 docker compose up -d db
 docker compose run --rm app db upgrade
 docker compose run --rm app data download
 docker compose run -d app paper run
 ```
 
-Known gap: `docker-compose.yml` does not mount a shared `data/` volume. `docker compose run app kill` would create the kill file in a throwaway container and not reach the running session. With Compose, run `kill` through `docker compose exec` in the running session's container, or add a volume for `data/` to the `app` service. Reports written to `reports/` inside a container are also lost unless you mount that directory.
+The image ships `alembic.ini` and creates writable `data/` and `reports/`. Compose mounts named volumes at `/app/data` and `/app/reports`, shared by every `app` container, so `docker compose run --rm app kill` reaches a running session through the shared kill file, and reports persist. The `pgdata` volume holds the Postgres data; back it up (and test a restore) before it holds anything you cannot re-download.
 
 ## API keys for any future live use
 

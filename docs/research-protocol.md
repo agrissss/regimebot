@@ -34,6 +34,8 @@ If you add a feature, keep that test passing. A backtest that beats the real wor
 
 For each window, the config's grid is fitted on a 365-day train span, and the combination with the highest train profit factor (among those with at least 20 trades) runs once on the next 90 days. Parameters are chosen from train data only. Each test window starts from the initial equity; windows are not chained, so the out-of-sample total is the plain sum of the windows' net P&L. The default grid has 9 combinations (breakout `volume_z_min` x `stop_atr_mult`), 4 windows, so 36 variants are tried. Output: `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv`.
 
+Walk-forward uses the config's risk limits, including the 10% drawdown halt. A window that hits the halt stops trading early and its metrics cover only the period before it. The output reports per-window `train_halted_at` and `test_halted_at`, and the command prints how many test windows halted. Pass `--set risk.max_drawdown=1.0` for full windows. Report both runs when the halt matters, as the worked example does.
+
 Read the train columns as well as the test columns. If the best in-training profit factor is below 1, no combination in the grid worked even on the data it was fitted to.
 
 ### 3. One-touch holdout
@@ -101,14 +103,22 @@ Over the same five weeks, buy and hold lost 51.49 and random entries (3 seeds, c
 .venv/bin/regimebot backtest run --set risk.max_drawdown=1.0
 ```
 
-1,300 trades, net -4,726.92 USDT (-47.27%), profit factor 0.82, max drawdown 48.62%. Buy and hold over the two years: +5,213.78. Random entries with the same exits: median -6,107.72, range -6,471.48 to -4,814.97 (profit factor 0.69). Fees were 3,835.64, so before fees the loss was roughly 840. Reading: the strategies lose a little before costs and a lot after. Trading 1,300 times is expensive, and cost tuning cannot fix a gross result that is not positive. The entry rules do slightly better than random entries with the same exits, but nowhere near enough to cover costs, and the strategy is far behind buy and hold.
+1,300 trades, net -4,726.92 USDT (-47.27%), profit factor 0.82, max drawdown 48.62%. Buy and hold over the two years: +5,213.78. Random entries with the same exits: median -6,107.72, range -6,471.48 to -4,814.97 (profit factor 0.69). Fees were 3,835.64, so before fees the loss was about 891 (about 838 before fees and funding). Reading: the strategies lose a little before costs and a lot after. Trading 1,300 times is expensive, and cost tuning cannot fix a gross result that is not positive. The entry rules do slightly better than random entries with the same exits, but nowhere near enough to cover costs, and the strategy is far behind buy and hold.
 
 **Robustness** (two years, drawdown halt off). Moving each of four parameters by +/-20% keeps the net result between -4,279.65 and -5,302.76, so the loss is not an artefact of one parameter value. Doubling all costs gives -6,932.21. A 1.0x versus 1.5x gross leverage cap gives identical results: the cap never binds at 0.5% risk per trade.
 
-**Walk-forward** (9 combinations, 4 windows, 36 variants tried). The best in-training profit factor was below 1 in every window: 0.95, 0.93, 0.54, 0.80. Out-of-sample: -554.29 USDT over 465 trades, one winning quarter and three losing. Reading: the grid contains no setting that worked even in-sample, and the one winning quarter is what a random process produces among four. The first window's out-of-sample profit (about +1,650) was chosen from parameters whose training profit factor was 0.95, which is a reason to distrust it, not to build on it.
+**Walk-forward, default limits** (drawdown halt on; 9 combinations, 4 windows, 36 variants tried). Every training run hit the halt before the end of its year (first halts 2024-04-07, 2024-07-02, 2024-08-12, 2024-12-03), so training saw only part of each year. The best in-training profit factors were 0.95, 0.93, 0.54 and 0.80, on 174, 184, 82 and 106 trades up to the halt. Out-of-sample: 465 trades, net -554.29 USDT; window nets +1,654.36, -418.84, -858.99, -930.82. Test windows 1, 2 and 3 halted on 2025-04-28, 2025-09-08 and 2025-12-10, so they are short. Reading: windows that stop early cannot support a claim about a full year in either direction.
+
+**Walk-forward, drawdown halt off** (`--set risk.max_drawdown=1.0`, full windows; same grid, 36 variants):
+
+```bash
+.venv/bin/regimebot backtest walk-forward --set risk.max_drawdown=1.0
+```
+
+Best in-training profit factors 0.85, 0.96, 0.87 and 0.91 on 659, 647, 627 and 623 trades; training nets -2,143.72, -513.23, -1,827.04 and -1,289.81. Out-of-sample: 630 trades, net -1,976.62 USDT; test profit factors 1.43, 0.65, 0.86, 0.59; window nets +1,586.71, -1,557.25, -508.65, -1,497.43. One quarter won and three lost. Reading: on full windows the best parameter set in the grid lost money in training in every window, and the winning quarter came from parameters that had lost in training, so it is not evidence of an edge.
 
 **Regime study** (`regimebot regimes study`). A 5% move within 24 hours followed 23% / 37% / 59% of high-volatility-expansion bars on BTC / ETH / SOL, against 6% / 16% / 29% after compression. Regimes tell you how big the next move may be, not which way it goes. The breakout and trend strategies need the direction.
 
-**Artefacts.** `reports/run_2/report.html`, `reports/run_3/report.html`, `reports/walk_forward_windows.csv`, `reports/walk_forward_oos_trades.csv`, `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`. The `reports/` directory is git-ignored; the commands regenerate it.
+**Artefacts.** `reports/run_2/report.html`, `reports/run_3/report.html`, `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv` (halt off, the last run), `reports/walk_forward_windows_default_limits.csv` and `reports/walk_forward_oos_trades_default_limits.csv` (copies of the default-limits run), `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`. The `reports/` directory is git-ignored; the commands regenerate it.
 
 **Conclusion.** As specified, these strategies show no edge on this data. The system's job is to say so, and it does. Possible next steps, each of which would count as new trials: a strategy that uses regime for sizing or volatility rather than direction, lower trade frequency, or different data. None of these is a promise of an edge.
