@@ -1,5 +1,6 @@
 """Trend continuation: a pullback to the fast EMA, then a close through the prior bar."""
 
+import numpy as np
 import pandas as pd
 
 from regimebot.config import TrendConfig
@@ -14,6 +15,7 @@ class Trend:
         self.cfg = cfg
 
     def generate(self, symbol: str, window: pd.DataFrame, regime: Regime) -> Signal | None:
+        """Long in TREND_UP, short in TREND_DOWN, after a pullback to the fast EMA."""
         c = self.cfg
         if regime == Regime.TREND_UP:
             side = Side.LONG
@@ -27,7 +29,7 @@ class Trend:
         prior = window.iloc[-1 - c.pullback_lookback : -1]  # lookback bars, current excluded
         close, atr, vol_z = float(last["close"]), float(last["atr"]), float(last["volume_z"])
         cols = prior[["high", "low", "ema_fast", "atr"]]
-        if not all_finite(close, atr, vol_z) or not cols.notna().all().all():
+        if not all_finite(close, atr, vol_z) or not np.isfinite(cols.to_numpy(dtype=float)).all():
             return None
         if vol_z < c.volume_z_min:
             return None

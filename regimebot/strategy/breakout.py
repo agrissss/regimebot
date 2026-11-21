@@ -14,6 +14,7 @@ class Breakout:
         self.cfg = cfg
 
     def generate(self, symbol: str, window: pd.DataFrame, regime: Regime) -> Signal | None:
+        """Long above the Donchian high, short below the low, on volume after compression."""
         if window.empty:
             return None
         last = window.iloc[-1]

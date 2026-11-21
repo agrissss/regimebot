@@ -182,23 +182,74 @@ def test_trend_regime_must_match_side():
         assert trend().generate(SYMBOL, w, r) is None
 
 
-def test_trend_each_condition_required():
+SIDES = [
+    pytest.param(False, Regime.TREND_UP, id="long"),
+    pytest.param(True, Regime.TREND_DOWN, id="short"),
+]
+
+
+def sided(w: pd.DataFrame, short: bool) -> pd.DataFrame:
+    return mirror(w) if short else w
+
+
+@pytest.mark.parametrize(("short", "regime"), SIDES)
+def test_trend_each_condition_required(short, regime):
     # no pullback: every lookback low far above ema_fast + 0.5 atr
     w = trend_window()
     w["low"] = 100.9
-    assert trend().generate(SYMBOL, w, Regime.TREND_UP) is None
-    # close not above previous high
-    assert trend().generate(SYMBOL, trend_window(close=100.5), Regime.TREND_UP) is None
+    assert trend().generate(SYMBOL, sided(w, short), regime) is None
+    # close not beyond the previous bar's extreme
+    assert trend().generate(SYMBOL, sided(trend_window(close=100.5), short), regime) is None
     # volume filter
-    w = trend_window(volume_z=-0.5)
-    assert trend().generate(SYMBOL, w, Regime.TREND_UP) is None
+    assert trend().generate(SYMBOL, sided(trend_window(volume_z=-0.5), short), regime) is None
 
 
-def test_trend_pullback_uses_each_bars_own_ema_and_atr():
+@pytest.mark.parametrize(("short", "regime"), SIDES)
+def test_trend_pullback_uses_each_bars_own_ema(short, regime):
     w = trend_window()
     w["low"] = 101.0  # dip never reaches ema 100 + 0.5
     w.loc[w.index[-5], "ema_fast"] = 100.6  # that bar's own ema_fast brings it within range
-    assert trend().generate(SYMBOL, w, Regime.TREND_UP) is not None
+    assert trend().generate(SYMBOL, sided(w, short), regime) is not None
+
+
+@pytest.mark.parametrize(("short", "regime"), SIDES)
+def test_trend_pullback_uses_that_bars_own_atr(short, regime):
+    w = trend_window()
+    w["low"] = 101.0
+    assert trend().generate(SYMBOL, sided(w, short), regime) is None
+    w.loc[w.index[-5], "atr"] = 2.0  # band 100 + 1.0 reaches 101; current-bar atr stays 1.0
+    assert trend().generate(SYMBOL, sided(w, short), regime) is not None
+
+
+@pytest.mark.parametrize(("short", "regime"), SIDES)
+def test_trend_lookback_width_is_exactly_pullback_lookback(short, regime):
+    def window(pull_at: int, extra_low_at: int | None = None) -> pd.DataFrame:
+        w = trend_window()
+        w["low"] = 100.9  # no pullback anywhere
+        w.loc[w.index[pull_at], "low"] = 100.4
+        if extra_low_at is not None:
+            w.loc[w.index[extra_low_at], "low"] = 99.0
+        return sided(w, short)
+
+    oldest = trend().generate(SYMBOL, window(-13), regime)  # 12th bar back: inside
+    assert oldest is not None
+    assert trend().generate(SYMBOL, window(-14), regime) is None  # 13th bar back: outside
+    # a lower extreme just outside the lookback does not move the stop
+    with_outside = trend().generate(SYMBOL, window(-4, extra_low_at=-14), regime)
+    inside_only = trend().generate(SYMBOL, window(-4), regime)
+    assert with_outside is not None and inside_only is not None
+    assert with_outside.stop == inside_only.stop
+    # ... but at the edge of the lookback it does
+    at_edge = trend().generate(SYMBOL, window(-4, extra_low_at=-13), regime)
+    assert at_edge is None or at_edge.stop != inside_only.stop
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+@pytest.mark.parametrize("col", ["low", "high", "ema_fast", "atr"])
+def test_trend_inf_in_lookback(col, bad):
+    w = trend_window()
+    w.loc[w.index[-6], col] = bad
+    assert trend().generate(SYMBOL, w, Regime.TREND_UP) is None
 
 
 def test_trend_current_bar_excluded_from_lookback():
@@ -274,7 +325,7 @@ def test_mean_reversion_target_must_be_on_profit_side_with_min_rr():
 
 
 def test_mean_reversion_stop_too_wide():
-    # 1.5 ATR stop at 98 = 1.53% ok; 2.5 ATR = 2.55% > 2%
+    # ATR 1.0 -> stop 1.0 below 98 (1.02%) is ok; ATR 2.5 -> stop 2.5 (2.55%) exceeds the 2% max
     assert mr().generate(SYMBOL, mr_window(atr=2.5), Regime.RANGE) is None
 
 

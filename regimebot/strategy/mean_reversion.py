@@ -14,6 +14,7 @@ class MeanReversion:
         self.cfg = cfg
 
     def generate(self, symbol: str, window: pd.DataFrame, regime: Regime) -> Signal | None:
+        """In RANGE, fade a z-score beyond entry_z with the rolling mean as target."""
         if regime != Regime.RANGE or window.empty:
             return None
         last = window.iloc[-1]
