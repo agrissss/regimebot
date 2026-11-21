@@ -2,7 +2,8 @@
 
 Linear USDT perpetual: gross pnl = qty * (exit - entry) * side_sign (+1 long, -1 short).
 Fills are written out by hand (price chosen, fee shown as bps of notional) so only the
-accounting is under test; the random-trades invariant drives real fills from the fill model.
+accounting is under test, except in the two exact round trips and the random-trades invariant,
+which drive real fills from the fill model.
 """
 
 import json
@@ -28,13 +29,15 @@ def approx(x: float) -> object:
     return pytest.approx(x, rel=1e-9, abs=1e-12)
 
 
-def make_signal(side: Side, symbol: str = BTC, stop: float = 95.0, target: float = 110.0) -> Signal:
+def make_signal(
+    side: Side, symbol: str = BTC, stop: float = 95.0, target: float = 110.0, entry: float = 100.0
+) -> Signal:
     return Signal(
         strategy="breakout",
         symbol=symbol,
         ts=T_OPEN - timedelta(minutes=1),
         side=side,
-        entry=100.0,
+        entry=entry,
         stop=stop,
         target=target,
         atr=2.5,
@@ -296,6 +299,10 @@ def test_second_position_on_a_symbol_is_rejected() -> None:
         (make_signal(Side.SHORT, stop=105.0), make_fill(BUY, 1.0, 100.0, 0.05)),  # short by BUY
         (make_signal(Side.LONG), make_fill(BUY, 1.0, 100.0, 0.05, symbol=ETH)),  # other symbol
         (make_signal(Side.LONG, stop=100.0), make_fill(BUY, 1.0, 100.0, 0.05)),  # zero risk (1R)
+        (  # entry fill 2 minutes before the signal it executes (signal ts = T_OPEN - 1 minute)
+            make_signal(Side.LONG),
+            make_fill(BUY, 1.0, 100.0, 0.05, ts=T_OPEN - timedelta(minutes=2)),
+        ),
     ],
 )
 def test_open_rejects_fill_that_does_not_match_signal(signal: Signal, fill: Fill) -> None:
@@ -373,11 +380,121 @@ def test_position_state_round_trips_through_json(trail: float | None) -> None:
     assert restored.entry_ts.utcoffset() == timedelta(0)
 
 
-def test_position_from_state_rejects_naive_timestamp() -> None:
+def open_state() -> dict[str, object]:
     p = Portfolio(INITIAL)
-    state = p.open(make_signal(Side.LONG), make_fill(BUY, 1.0, 100.0, 0.05)).to_state()
+    return p.open(make_signal(Side.LONG), make_fill(BUY, 1.0, 100.0, 0.05)).to_state()
+
+
+def test_position_from_state_normalises_entry_ts_to_utc() -> None:
+    # 02:16 at +02:00 is 00:16 UTC (T_OPEN)
+    restored = Position.from_state({**open_state(), "entry_ts": "2024-01-01T02:16:00+02:00"})
+    assert restored.entry_ts == T_OPEN
+    assert restored.entry_ts.tzinfo is UTC
+
+
+def test_position_from_state_rejects_naive_timestamp() -> None:
     with pytest.raises(ValueError, match="timezone"):
-        Position.from_state({**state, "entry_ts": "2024-01-01T00:16:00"})
+        Position.from_state({**open_state(), "entry_ts": "2024-01-01T00:16:00"})
+
+
+def test_position_from_state_rejects_missing_or_unknown_keys() -> None:
+    state = open_state()
+    missing_fees = {k: v for k, v in state.items() if k != "fees"}  # would default to 0.0
+    with pytest.raises(ValueError, match="missing.*fees"):
+        Position.from_state(missing_fees)
+    with pytest.raises(ValueError, match="unknown.*leverage"):
+        Position.from_state({**state, "leverage": 2.0})
+
+
+# --- exact round trips through the real fill model -----------------------------------------
+
+COSTS = CostsConfig(
+    taker_fee_bps=5.0,
+    maker_fee_bps=2.0,
+    half_spread_bps=1.0,
+    slippage_bps=2.0,
+    impact_bps_per_pct=1.0,
+    max_participation=0.05,
+)
+
+
+def test_long_round_trip_through_fill_model_is_exact() -> None:
+    p = Portfolio(INITIAL)
+    signal = make_signal(Side.LONG, stop=97.0, target=106.0)  # decision close 100
+    # Entry at the next bar's open 100.5: ask = 100.5 * 1.0001 = 100.51005
+    #   asked 30 on a 400-volume bar -> cut to 0.05 * 400 = 20 ; participation 20 / 400 = 5%
+    #   slippage = 2 + 5 = 7 bps ; price = 100.51005 * 1.0007 = 100.580407035
+    #   fee = 20 * 100.580407035 * 5e-4 = 1.00580407035 ; vs ref 100: +58.0407035 bps
+    bid, ask = quote_from_bar_open(100.5, COSTS)
+    entry = market_fill(BTC, T_OPEN, BUY, 30.0, bid, ask, 100.0, 400.0, COSTS, True)
+    assert entry is not None
+    assert (entry.qty, entry.price) == (approx(20.0), approx(100.580407035))
+    assert (entry.fee, entry.slippage_bps) == (approx(1.00580407035), approx(58.0407035))
+    p.open(signal, entry)
+    # Funding at mark 103, rate +0.0001: long pays 20 * 103 * 0.0001 = 0.206
+    p.apply_funding(BTC, 103.0, 0.0001)
+    # Target exit: bar high 106.5 > 106 -> SELL 20 @ 106 ; maker fee 20 * 106 * 2e-4 = 0.424
+    exit_bar = Bar(BTC, T_CLOSE, 105.0, 106.5, 104.8, 106.2, 500.0)
+    exit_ = target_fill(BTC, exit_bar, SELL, p.positions[BTC].qty, 106.0, COSTS)
+    assert exit_ is not None
+    assert (exit_.price, exit_.fee) == (106.0, approx(0.424))
+    trade = p.close(BTC, exit_, ExitReason.TARGET)
+    # gross = 20 * (106 - 100.580407035) = 108.3918593
+    # fees = 1.00580407035 + 0.424 = 1.42980407035
+    # net = 108.3918593 - 1.42980407035 - 0.206 = 106.75605522965 ; cash = 10106.75605522965
+    # R = 106.75605522965 / (20 * (100.580407035 - 97)) = 106.75605522965 / 71.6081407
+    #   = 1.4908368543864455
+    check_money(
+        p,
+        trade,
+        gross=108.3918593,
+        fees=1.42980407035,
+        funding=0.206,
+        net=106.75605522965,
+        r=1.4908368543864455,
+    )
+    assert p.cash == approx(10106.75605522965)
+
+
+def test_short_round_trip_through_fill_model_is_exact() -> None:
+    p = Portfolio(INITIAL)
+    signal = make_signal(Side.SHORT, ETH, stop=52.0, target=46.0, entry=50.0)
+    # Entry at the next bar's open 49.8: bid = 49.8 * 0.9999 = 49.79502
+    #   SELL 10 on a 1000-volume bar (cap 50, no cut) ; participation 1% -> slippage 3 bps
+    #   price = 49.79502 * 0.9997 = 49.780081494 ; fee = 10 * 49.780081494 * 5e-4 = 0.24890040747
+    #   vs ref 50: (50 - 49.780081494) / 50 * 1e4 = +43.9837012 bps
+    bid, ask = quote_from_bar_open(49.8, COSTS)
+    entry = market_fill(ETH, T_OPEN, SELL, 10.0, bid, ask, 50.0, 1000.0, COSTS, True)
+    assert entry is not None
+    assert (entry.qty, entry.price) == (10.0, approx(49.780081494))
+    assert (entry.fee, entry.slippage_bps) == (approx(0.24890040747), approx(43.9837012))
+    p.open(signal, entry)
+    # Funding at mark 50.5, rate +0.0002: short receives, payment = -10 * 50.5 * 0.0002 = -0.101
+    p.apply_funding(ETH, 50.5, 0.0002)
+    # Gap stop: bar opens 53, above the 52 stop -> trigger max(52, 53) = 53
+    #   ask = 53 * 1.0001 = 53.0053 ; bar volume 20 -> participation 10 / 20 = 0.5
+    #   slippage = 2 + 50 = 52 bps ; price = 53.0053 * 1.0052 = 53.28092756
+    #   fee = 10 * 53.28092756 * 5e-4 = 0.2664046378
+    exit_bar = Bar(ETH, T_CLOSE, 53.0, 53.4, 52.6, 53.1, 20.0)
+    exit_ = stop_fill(ETH, exit_bar, BUY, p.positions[ETH].qty, 52.0, COSTS)
+    assert exit_ is not None
+    assert (exit_.price, exit_.fee) == (approx(53.28092756), approx(0.2664046378))
+    trade = p.close(ETH, exit_, ExitReason.STOP)
+    # gross = 10 * (53.28092756 - 49.780081494) * (-1) = -35.00846066
+    # fees = 0.24890040747 + 0.2664046378 = 0.51530504527
+    # net = -35.00846066 - 0.51530504527 - (-0.101) = -35.42276570527 ; cash = 9964.57723429473
+    # R = -35.42276570527 / (10 * (52 - 49.780081494)) = -35.42276570527 / 22.19918506
+    #   = -1.595678652595998
+    check_money(
+        p,
+        trade,
+        gross=-35.00846066,
+        fees=0.51530504527,
+        funding=-0.101,
+        net=-35.42276570527,
+        r=-1.595678652595998,
+    )
+    assert p.cash == approx(9964.57723429473)
 
 
 # --- invariant: once flat, sum(net_pnl) == cash - initial_equity ----------------------------
@@ -393,14 +510,7 @@ def test_random_trades_keep_cash_equal_to_sum_of_net_pnl() -> None:
     """3000 random opens, marks, funding events and exits (market, stop and target) through the
     real fill model; once flat, cash - initial_equity must equal the sum of net_pnl."""
     rng = random.Random(20240101)
-    costs = CostsConfig(
-        taker_fee_bps=5.0,
-        maker_fee_bps=2.0,
-        half_spread_bps=1.0,
-        slippage_bps=2.0,
-        impact_bps_per_pct=1.0,
-        max_participation=0.05,
-    )
+    costs = COSTS
     p = Portfolio(INITIAL)
     trades: list[Trade] = []
     fill_fees = 0.0  # independent ledger: every fee the fill model charged

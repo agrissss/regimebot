@@ -20,22 +20,16 @@ def _require_positive(name: str, value: float) -> None:
         raise ValueError(f"{name} must be positive and finite, got {value!r}")
 
 
-def _check_bar(bar: Bar) -> None:
-    """Stop and target fills read open/high/low; a malformed bar would price a wrong fill."""
+def _check_bar(bar: Bar, symbol: str) -> None:
+    """Stop and target fills read the bar; a malformed or foreign bar would price a wrong fill."""
+    if bar.symbol != symbol:
+        raise ValueError(f"bar is for {bar.symbol}, not {symbol}")
     for name, value in (("open", bar.open), ("high", bar.high), ("low", bar.low)):
         _require_positive(f"bar.{name}", value)
     if not bar.low <= bar.open <= bar.high:
         raise ValueError(f"bar open {bar.open} outside [low {bar.low}, high {bar.high}]")
-
-
-def _taker_price(side: OrderSide, bid: float, ask: float, slip_bps: float) -> float:
-    """Take the ask (BUY) or hit the bid (SELL), then move ``slip_bps`` further against us."""
-    if side == OrderSide.BUY:
-        return ask * (1 + slip_bps / 1e4)
-    price = bid * (1 - slip_bps / 1e4)
-    if price <= 0:
-        raise ValueError(f"slippage of {slip_bps:.0f} bps gives a non-positive SELL price")
-    return price
+    if not math.isfinite(bar.volume):
+        raise ValueError(f"bar.volume must be finite, got {bar.volume!r}")
 
 
 def _make_fill(
@@ -85,8 +79,9 @@ def market_fill(
 
     Slippage = ``slippage_bps`` + ``impact_bps_per_pct`` per 1% of ``bar_volume`` taken.
     Entries (``cap_participation``) are cut to ``max_participation * bar_volume`` and get no fill
-    (None) on a bar without volume. Exits are never cut; on a bar without volume they pay impact
-    as if they took ``max_participation``. Impact uses the quantity actually filled.
+    (None) on a bar without volume; impact uses the cut qty. Exits are never cut and always
+    fill: their participation is ``min(qty / bar_volume, 1)``, and 1 on a bar without volume,
+    so an exit never gets cheaper as the bar thins.
     """
     side = OrderSide(side)  # a plain "buy"/"sell" is fine; anything else raises ValueError
     for name, value in (("qty", qty), ("bid", bid), ("ask", ask), ("ref_price", ref_price)):
@@ -95,18 +90,18 @@ def market_fill(
         raise ValueError(f"crossed quote: bid {bid} > ask {ask}")
     if not math.isfinite(bar_volume):
         raise ValueError(f"bar_volume must be finite, got {bar_volume!r}")
-    if bar_volume <= 0:
-        if cap_participation:
+    if cap_participation:
+        if bar_volume <= 0:
             return None
-        participation = costs.max_participation
-    else:
-        if cap_participation:
-            qty = min(qty, costs.max_participation * bar_volume)
+        qty = min(qty, costs.max_participation * bar_volume)
         participation = qty / bar_volume
-    # ponytail: linear, unbounded impact; an exit far above a thin bar's volume can exceed 100%
-    # slippage and raise. Use square-root impact or split exits if that shows up in real runs.
+    else:
+        participation = 1.0 if bar_volume <= 0 else min(qty / bar_volume, 1.0)
     slip_bps = costs.slippage_bps + costs.impact_bps_per_pct * participation * 100
-    price = _taker_price(side, bid, ask, slip_bps)
+    if side == OrderSide.BUY:
+        price = ask * (1 + slip_bps / 1e4)
+    else:
+        price = bid * (1 - slip_bps / 1e4)
     return _make_fill(symbol, ts, side, qty, price, ref_price, costs.taker_fee_bps, "taker")
 
 
@@ -117,14 +112,14 @@ def stop_fill(
 
     A SELL stop triggers when ``bar.low <= stop_price`` at ``min(stop_price, bar.open)`` (a gap
     through the stop fills at the open); a BUY stop mirrors this with ``bar.high`` and ``max``.
-    Half spread and the fixed ``slippage_bps`` then go against the trader, compounded exactly
-    as in ``market_fill`` on a quote built around the trigger. Participation is unknown here,
-    so there is no impact term and no cut. Taker fee; ``ref_price`` is the stop level, so a gap
-    shows up as slippage.
+    The trigger is then priced exactly as an exit ``market_fill`` on a quote built around it:
+    half spread, then ``slippage_bps`` plus impact at participation ``min(qty / bar.volume, 1)``
+    (1 on a bar without volume), so a stop is never cheaper than a market exit on the same bar.
+    Taker fee; ``ref_price`` is the stop level, so a gap shows up as slippage.
     """
     _require_positive("qty", qty)
     _require_positive("stop_price", stop_price)
-    _check_bar(bar)
+    _check_bar(bar, symbol)
     side = OrderSide(side)
     if side == OrderSide.SELL:
         if bar.low > stop_price:
@@ -135,33 +130,31 @@ def stop_fill(
             return None
         trigger = max(stop_price, bar.open)
     bid, ask = quote_from_bar_open(trigger, costs)
-    price = _taker_price(side, bid, ask, costs.slippage_bps)
-    return _make_fill(symbol, bar.ts, side, qty, price, stop_price, costs.taker_fee_bps, "taker")
+    return market_fill(
+        symbol, bar.ts, side, qty, bid, ask, stop_price, bar.volume, costs, cap_participation=False
+    )
 
 
 def target_fill(
     symbol: str, bar: Bar, side: OrderSide, qty: float, target_price: float, costs: CostsConfig
 ) -> Fill | None:
-    """Resting limit exit inside ``bar``, or None if price did not trade through the target.
+    """Resting limit exit inside ``bar`` at exactly ``target_price``, or None if not filled.
 
     A SELL limit fills when ``bar.high > target_price``; a BUY limit when ``bar.low <
-    target_price``. A touch is not a fill (the queue ahead of us is unknown). The fill is at the
-    target, or at the open if the bar opened beyond it (a favourable gap: negative
-    ``slippage_bps``). Maker fee, no spread, no slippage.
+    target_price``. A touch is not a fill (the queue ahead of us is unknown). A bar that opens
+    beyond the target still fills at the target: a resting limit trades at its own price and
+    no price improvement is assumed. Maker fee, no spread, zero slippage.
     """
     _require_positive("qty", qty)
     _require_positive("target_price", target_price)
-    _check_bar(bar)
+    _check_bar(bar, symbol)
     side = OrderSide(side)
-    if side == OrderSide.SELL:
-        if bar.high <= target_price:
-            return None
-        price = max(target_price, bar.open)
-    else:
-        if bar.low >= target_price:
-            return None
-        price = min(target_price, bar.open)
-    return _make_fill(symbol, bar.ts, side, qty, price, target_price, costs.maker_fee_bps, "maker")
+    traded_through = bar.high > target_price if side == OrderSide.SELL else bar.low < target_price
+    if not traded_through:
+        return None
+    return _make_fill(
+        symbol, bar.ts, side, qty, target_price, target_price, costs.maker_fee_bps, "maker"
+    )
 
 
 def funding_payment(side: Side, qty: float, mark_price: float, rate: float) -> float:

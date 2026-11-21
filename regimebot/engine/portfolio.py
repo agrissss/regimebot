@@ -10,8 +10,8 @@ the risk module caps gross leverage at 1.5x.
 
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, fields
+from datetime import UTC, datetime
 from typing import Any
 
 from regimebot.execution.fill_model import funding_payment
@@ -59,7 +59,15 @@ class Position:
 
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "Position":
-        """Inverse of ``to_state``; raises ValueError on an unknown enum or a naive timestamp."""
+        """Inverse of ``to_state``; ``entry_ts`` comes back in UTC.
+
+        Raises ValueError on missing or unknown keys (a missing ``fees`` must not silently
+        default to 0), an unknown enum value or a naive timestamp.
+        """
+        expected = {f.name for f in fields(cls)}
+        missing, unknown = sorted(expected - set(state)), sorted(set(state) - expected)
+        if missing or unknown:
+            raise ValueError(f"position state: missing keys {missing}, unknown keys {unknown}")
         entry_ts = datetime.fromisoformat(state["entry_ts"])
         if entry_ts.utcoffset() is None:
             raise ValueError(f"entry_ts {state['entry_ts']!r} has no timezone")
@@ -68,7 +76,7 @@ class Position:
                 **state,
                 "side": Side(state["side"]),
                 "regime": Regime(state["regime"]),
-                "entry_ts": entry_ts,
+                "entry_ts": entry_ts.astimezone(UTC),
             }
         )
 
@@ -119,6 +127,8 @@ class Portfolio:
             raise ValueError(
                 f"{fill.side} fill for {fill.symbol} cannot open {signal.side} {signal.symbol}"
             )
+        if fill.ts < signal.ts:
+            raise ValueError(f"entry fill at {fill.ts} is before its signal at {signal.ts}")
         if fill.price == signal.stop:
             raise ValueError("entry price equals the stop: 1R would be zero")
         position = Position(

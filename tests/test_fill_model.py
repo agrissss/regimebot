@@ -40,8 +40,10 @@ def approx(x: float) -> object:
     return pytest.approx(x, rel=1e-9, abs=1e-12)
 
 
-def make_bar(open_: float, high: float, low: float) -> Bar:
-    return Bar(SYM, TS, open_, high, low, open_, 1000.0)
+def make_bar(
+    open_: float, high: float, low: float, volume: float = 1000.0, symbol: str = SYM
+) -> Bar:
+    return Bar(symbol, TS, open_, high, low, open_, volume)
 
 
 def check(
@@ -124,12 +126,45 @@ def test_zero_volume_bar_gives_no_entry() -> None:
     assert fill is None
 
 
-def test_zero_volume_exit_charges_impact_at_max_participation() -> None:
-    # participation taken as max_participation = 5% -> impact 5 bps; slippage = 7 bps
-    # price = 99.99 * 0.9993 = 99.920007 ; fee = 3 * 99.920007 * 5e-4 = 0.1498800105
-    # slippage vs ref 100 = 7.9993 bps
-    fill = market_fill(SYM, TS, SELL, 3.0, BID, ASK, 100.0, 0.0, COSTS, cap_participation=False)
-    check(fill, SELL, 3.0, 99.920007, 0.1498800105, 7.9993, "taker", 100.0)
+# Exits of qty 5: participation for impact = min(qty / volume, 1), and 1 when volume <= 0.
+#   volume 0    -> participation 1                 -> impact 100 bps -> slippage 102 bps
+#   volume 0.05 -> 5 / 0.05 = 100, capped at 1     -> impact 100 bps -> slippage 102 bps
+#   volume 10   -> 5 / 10 = 0.5                    -> impact  50 bps -> slippage  52 bps
+# SELL @ 102: 99.99 * (1 - 0.0102) = 98.970102 ; fee 5 * 98.970102 * 5e-4 = 0.247425255
+#             vs ref 100: (100 - 98.970102) / 100 * 1e4 = 102.9898 bps
+# SELL @ 52:  99.99 * (1 - 0.0052) = 99.470052 ; fee 5 * 99.470052 * 5e-4 = 0.24867513
+#             vs ref 100: 52.9948 bps
+# BUY @ 102:  100.01 * 1.0102 = 101.030102 ; fee 5 * 101.030102 * 5e-4 = 0.252575255
+#             vs ref 100: 103.0102 bps
+# BUY @ 52:   100.01 * 1.0052 = 100.530052 ; fee 5 * 100.530052 * 5e-4 = 0.25132513
+#             vs ref 100: 53.0052 bps
+@pytest.mark.parametrize(
+    ("side", "volume", "price", "fee", "slippage"),
+    [
+        (SELL, 0.0, 98.970102, 0.247425255, 102.9898),
+        (SELL, 0.05, 98.970102, 0.247425255, 102.9898),
+        (SELL, 10.0, 99.470052, 0.24867513, 52.9948),
+        (BUY, 0.0, 101.030102, 0.252575255, 103.0102),
+        (BUY, 0.05, 101.030102, 0.252575255, 103.0102),
+        (BUY, 10.0, 100.530052, 0.25132513, 53.0052),
+    ],
+)
+def test_thin_volume_exit_impact_is_bounded_at_full_participation(
+    side: OrderSide, volume: float, price: float, fee: float, slippage: float
+) -> None:
+    fill = market_fill(SYM, TS, side, 5.0, BID, ASK, 100.0, volume, COSTS, cap_participation=False)
+    check(fill, side, 5.0, price, fee, slippage, "taker", 100.0)
+
+
+@pytest.mark.parametrize("side", [BUY, SELL])
+def test_exit_never_gets_cheaper_as_volume_falls(side: OrderSide) -> None:
+    volumes = [1e6, 1000.0, 100.0, 10.0, 5.0, 1.0, 1e-9, 0.0]  # falling
+    slippages = []
+    for volume in volumes:
+        fill = market_fill(SYM, TS, side, 5.0, BID, ASK, 100.0, volume, COSTS, False)
+        assert fill is not None
+        slippages.append(fill.slippage_bps)
+    assert slippages == sorted(slippages)  # non-decreasing cost as the bar thins
 
 
 def test_impact_term_alone() -> None:
@@ -161,31 +196,27 @@ def test_market_fill_rejects_invalid_inputs(
         market_fill(SYM, TS, BUY, qty, bid, ask, ref, volume, COSTS, cap_participation=False)
 
 
-def test_market_sell_with_slippage_beyond_100_percent_raises() -> None:
-    # SELL 1000 on a 1-volume bar: participation 1000 -> impact 100000 bps -> price would be < 0
-    with pytest.raises(ValueError, match="non-positive"):
-        market_fill(SYM, TS, SELL, 1000.0, BID, ASK, 100.0, 1.0, COSTS, cap_participation=False)
-
-
-# --- stop_fill: half spread + fixed slippage against the trader, multiplied ------------------
-# SELL: trigger * (1 - 1e-4) * (1 - 2e-4) = trigger * 0.99970002
-# BUY:  trigger * (1 + 1e-4) * (1 + 2e-4) = trigger * 1.00030002
+# --- stop_fill: trigger, then half spread, then slippage + bounded impact from bar.volume ----
+# Participation 1% (qty 2 on volume 200, or qty 1 on volume 100) -> impact 1 bp -> 3 bps.
+# SELL: trigger * (1 - 1e-4) * (1 - 3e-4) ; BUY: trigger * (1 + 1e-4) * (1 + 3e-4)
 
 
 def test_sell_stop_touched_exactly_fills_at_stop_less_costs() -> None:
     # low == stop == 100 triggers; open 105 is above, so trigger = min(100, 105) = 100
-    # price = 100 * 0.99970002 = 99.970002 ; fee = 2 * 99.970002 * 5e-4 = 0.099970002
-    # slippage vs stop 100 = (100 - 99.970002) / 100 * 1e4 = 2.9998 bps
-    fill = stop_fill(SYM, make_bar(105.0, 106.0, 100.0), SELL, 2.0, 100.0, COSTS)
-    check(fill, SELL, 2.0, 99.970002, 0.099970002, 2.9998, "taker", 100.0)
+    # bid = 100 * 0.9999 = 99.99 ; price = 99.99 * 0.9997 = 99.960003
+    # fee = 2 * 99.960003 * 5e-4 = 0.099960003
+    # slippage vs stop 100 = (100 - 99.960003) / 100 * 1e4 = 3.9997 bps
+    fill = stop_fill(SYM, make_bar(105.0, 106.0, 100.0, volume=200.0), SELL, 2.0, 100.0, COSTS)
+    check(fill, SELL, 2.0, 99.960003, 0.099960003, 3.9997, "taker", 100.0)
 
 
 def test_sell_stop_gapped_through_fills_at_open() -> None:
     # bar opens at 97, below the 100 stop: trigger = min(100, 97) = 97
-    # price = 97 * 0.99970002 = 96.97090194 ; fee = 96.97090194 * 5e-4 = 0.04848545097
-    # slippage vs stop 100 = (100 - 96.97090194) / 100 * 1e4 = 302.909806 bps
-    fill = stop_fill(SYM, make_bar(97.0, 98.0, 96.0), SELL, 1.0, 100.0, COSTS)
-    check(fill, SELL, 1.0, 96.97090194, 0.04848545097, 302.909806, "taker", 100.0)
+    # bid = 97 * 0.9999 = 96.9903 ; price = 96.9903 * 0.9997 = 96.96120291
+    # fee = 96.96120291 * 5e-4 = 0.048480601455
+    # slippage vs stop 100 = (100 - 96.96120291) / 100 * 1e4 = 303.879709 bps
+    fill = stop_fill(SYM, make_bar(97.0, 98.0, 96.0, volume=100.0), SELL, 1.0, 100.0, COSTS)
+    check(fill, SELL, 1.0, 96.96120291, 0.048480601455, 303.879709, "taker", 100.0)
 
 
 def test_sell_stop_not_touched() -> None:
@@ -194,18 +225,49 @@ def test_sell_stop_not_touched() -> None:
 
 def test_buy_stop_touched_exactly_fills_at_stop_plus_costs() -> None:
     # high == stop == 100 triggers; open 95 is below, so trigger = max(100, 95) = 100
-    # price = 100 * 1.00030002 = 100.030002 ; fee = 2 * 100.030002 * 5e-4 = 0.100030002
-    # slippage vs stop 100 = 3.0002 bps
-    fill = stop_fill(SYM, make_bar(95.0, 100.0, 94.0), BUY, 2.0, 100.0, COSTS)
-    check(fill, BUY, 2.0, 100.030002, 0.100030002, 3.0002, "taker", 100.0)
+    # ask = 100 * 1.0001 = 100.01 ; price = 100.01 * 1.0003 = 100.040003
+    # fee = 2 * 100.040003 * 5e-4 = 0.100040003 ; slippage vs stop 100 = 4.0003 bps
+    fill = stop_fill(SYM, make_bar(95.0, 100.0, 94.0, volume=200.0), BUY, 2.0, 100.0, COSTS)
+    check(fill, BUY, 2.0, 100.040003, 0.100040003, 4.0003, "taker", 100.0)
 
 
 def test_buy_stop_gapped_through_fills_at_open() -> None:
     # bar opens at 103, above the 100 stop: trigger = max(100, 103) = 103
-    # price = 103 * 1.00030002 = 103.03090206 ; fee = 103.03090206 * 5e-4 = 0.05151545103
-    # slippage vs stop 100 = 303.090206 bps
-    fill = stop_fill(SYM, make_bar(103.0, 104.0, 102.0), BUY, 1.0, 100.0, COSTS)
-    check(fill, BUY, 1.0, 103.03090206, 0.05151545103, 303.090206, "taker", 100.0)
+    # ask = 103 * 1.0001 = 103.0103 ; price = 103.0103 * 1.0003 = 103.04120309
+    # fee = 103.04120309 * 5e-4 = 0.051520601545 ; slippage vs stop 100 = 304.120309 bps
+    fill = stop_fill(SYM, make_bar(103.0, 104.0, 102.0, volume=100.0), BUY, 1.0, 100.0, COSTS)
+    check(fill, BUY, 1.0, 103.04120309, 0.051520601545, 304.120309, "taker", 100.0)
+
+
+# Stops of qty 2 at 100 (touched exactly) on thin bars:
+#   volume 0 or 1e-6 -> participation 1 -> slippage 2 + 100 = 102 bps
+#   volume 4         -> 2 / 4 = 0.5     -> slippage 2 + 50  =  52 bps
+# SELL: 99.99 * 0.9898 = 98.970102 (fee 2 * 98.970102 * 5e-4 = 0.098970102, 102.9898 bps)
+#       99.99 * 0.9948 = 99.470052 (fee 0.099470052, 52.9948 bps)
+# BUY:  100.01 * 1.0102 = 101.030102 (fee 2 * 101.030102 * 5e-4 = 0.101030102, 103.0102 bps)
+#       100.01 * 1.0052 = 100.530052 (fee 0.100530052, 53.0052 bps)
+# These equal a market exit of the same qty and volume on the stop's quote: never cheaper.
+@pytest.mark.parametrize(
+    ("side", "bar_ohl", "volume", "price", "fee", "slippage"),
+    [
+        (SELL, (105.0, 106.0, 100.0), 0.0, 98.970102, 0.098970102, 102.9898),
+        (SELL, (105.0, 106.0, 100.0), 1e-6, 98.970102, 0.098970102, 102.9898),
+        (SELL, (105.0, 106.0, 100.0), 4.0, 99.470052, 0.099470052, 52.9948),
+        (BUY, (95.0, 100.0, 94.0), 0.0, 101.030102, 0.101030102, 103.0102),
+        (BUY, (95.0, 100.0, 94.0), 1e-6, 101.030102, 0.101030102, 103.0102),
+        (BUY, (95.0, 100.0, 94.0), 4.0, 100.530052, 0.100530052, 53.0052),
+    ],
+)
+def test_stop_on_thin_bar_pays_bounded_impact(
+    side: OrderSide,
+    bar_ohl: tuple[float, float, float],
+    volume: float,
+    price: float,
+    fee: float,
+    slippage: float,
+) -> None:
+    fill = stop_fill(SYM, make_bar(*bar_ohl, volume=volume), side, 2.0, 100.0, COSTS)
+    check(fill, side, 2.0, price, fee, slippage, "taker", 100.0)
 
 
 def test_buy_stop_not_touched() -> None:
@@ -225,11 +287,11 @@ def test_sell_target_traded_through_fills_at_target() -> None:
     check(fill, SELL, 2.0, 110.0, 0.044, 0.0, "maker", 110.0)
 
 
-def test_sell_target_gap_open_beyond_fills_at_open() -> None:
-    # opens at 112 above the 110 target: fills at 112 ; fee = 112 * 2e-4 = 0.0224
-    # slippage vs 110 = (110 - 112) / 110 * 1e4 = -181.8181... bps (better than the target)
+def test_sell_target_gap_open_beyond_still_fills_at_target() -> None:
+    # opens at 112 above the 110 target: a resting limit trades at its own price, so 110
+    # fee = 1 * 110 * 2e-4 = 0.022 ; slippage 0 (no price improvement assumed)
     fill = target_fill(SYM, make_bar(112.0, 113.0, 111.0), SELL, 1.0, 110.0, COSTS)
-    check(fill, SELL, 1.0, 112.0, 0.0224, -2 / 110 * 1e4, "maker", 110.0)
+    check(fill, SELL, 1.0, 110.0, 0.022, 0.0, "maker", 110.0)
 
 
 def test_buy_target_touch_is_not_a_fill() -> None:
@@ -242,11 +304,11 @@ def test_buy_target_traded_through_fills_at_target() -> None:
     check(fill, BUY, 2.0, 90.0, 0.036, 0.0, "maker", 90.0)
 
 
-def test_buy_target_gap_open_beyond_fills_at_open() -> None:
-    # opens at 88 below the 90 target: fills at 88 ; fee = 88 * 2e-4 = 0.0176
-    # slippage vs 90 = (88 - 90) / 90 * 1e4 = -222.2222... bps (better than the target)
+def test_buy_target_gap_open_beyond_still_fills_at_target() -> None:
+    # opens at 88 below the 90 target: fills at its own price 90
+    # fee = 1 * 90 * 2e-4 = 0.018 ; slippage 0
     fill = target_fill(SYM, make_bar(88.0, 89.0, 87.0), BUY, 1.0, 90.0, COSTS)
-    check(fill, BUY, 1.0, 88.0, 0.0176, -2 / 90 * 1e4, "maker", 90.0)
+    check(fill, BUY, 1.0, 90.0, 0.018, 0.0, "maker", 90.0)
 
 
 @pytest.mark.parametrize("fill_fn", [stop_fill, target_fill])
@@ -259,6 +321,8 @@ def test_buy_target_gap_open_beyond_fills_at_open() -> None:
         (make_bar(102.0, 101.0, 99.0), 1.0, 100.0),  # open above high
         (make_bar(100.0, 101.0, 0.0), 1.0, 100.0),  # zero low
         (make_bar(math.nan, 101.0, 99.0), 1.0, 100.0),  # NaN open
+        (make_bar(100.0, 101.0, 99.0, volume=math.nan), 1.0, 100.0),  # NaN volume
+        (make_bar(100.0, 101.0, 99.0, symbol="ETH/USDT:USDT"), 1.0, 100.0),  # other symbol
     ],
 )
 def test_bar_fills_reject_invalid_inputs(
