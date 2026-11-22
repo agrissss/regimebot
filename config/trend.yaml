@@ -1,0 +1,113 @@
+# Daily trend following (strategies.daily_trend) instead of the regime playbook strategies.
+# Select it with REGIMEBOT_CONFIG=config/trend.yaml. The playbook, regime and feature sections
+# are required by the schema but not used while daily_trend is enabled.
+database_url: sqlite:///data/regimebot.db
+exchange:
+  id: binanceusdm
+  symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+  base_timeframe: 1m
+  decision_timeframe: 1d       # one decision per day, at the 00:00 UTC close
+costs:
+  taker_fee_bps: 5.0
+  maker_fee_bps: 2.0
+  half_spread_bps: 1.0         # used when no live quote exists (backtest)
+  slippage_bps: 2.0            # fixed part, applied to taker fills
+  impact_bps_per_pct: 1.0      # extra bps per 1% of bar volume taken
+  max_participation: 0.05      # entry fills capped at this share of bar volume
+features:
+  atr_window: 14
+  rv_window: 96
+  pctile_window: 2880
+  adx_window: 14
+  ema_fast: 96
+  ema_slow: 384
+  volume_window: 96
+  donchian_window: 96
+  zscore_window: 96
+regime:
+  expansion_pctile: 0.90
+  compression_pctile: 0.20
+  adx_trend: 25.0
+  adx_range: 20.0
+  shock_z: 6.0
+  illiq_pctile: 0.99
+  max_spread_bps: 10.0
+  event_windows: []            # list of {start: ISO UTC, end: ISO UTC, label: str}
+playbook:                      # one entry per Regime value
+  trend_up:         {strategies: [trend, breakout], size_mult: 1.0, allow_entries: true,  force_close: false}
+  trend_down:       {strategies: [trend, breakout], size_mult: 1.0, allow_entries: true,  force_close: false}
+  range:            {strategies: [mean_reversion],  size_mult: 0.5, allow_entries: true,  force_close: false}
+  compression:      {strategies: [breakout],        size_mult: 1.0, allow_entries: true,  force_close: false}
+  expansion:        {strategies: [breakout],        size_mult: 0.5, allow_entries: true,  force_close: false}
+  liquidity_stress: {strategies: [],                size_mult: 0.0, allow_entries: false, force_close: true}
+  event_risk:       {strategies: [],                size_mult: 0.0, allow_entries: false, force_close: false}
+  no_trade:         {strategies: [],                size_mult: 0.0, allow_entries: false, force_close: false}
+strategies:
+  breakout:
+    enabled: false
+    min_target_pct: 0.05
+    min_rr: 2.5
+    stop_atr_mult: 1.5
+    max_stop_pct: 0.03
+    volume_z_min: 1.0
+    compression_lookback: 24   # bars; breakout must follow compression within this many bars
+    max_hold_bars: 288
+    trail_atr_mult: 3.0
+    plausibility_mult: 1.5
+  trend:
+    enabled: false
+    min_target_pct: 0.05
+    min_rr: 2.5
+    stop_atr_mult: 0.5         # buffer beyond the pullback extreme
+    max_stop_pct: 0.03
+    pullback_lookback: 12
+    pullback_atr_dist: 0.5     # pullback must come within this many ATR of ema_fast
+    volume_z_min: 0.0
+    max_hold_bars: 384
+    trail_atr_mult: 3.0
+    plausibility_mult: 1.5
+  mean_reversion:
+    enabled: false
+    min_target_pct: 0.0        # targets the rolling mean, not a 5% move
+    min_rr: 2.0
+    entry_z: 2.5
+    stop_atr_mult: 1.0
+    max_stop_pct: 0.02
+    max_hold_bars: 48
+    trail_atr_mult: null
+    plausibility_mult: 1.5
+  daily_trend:                 # target positions, rebalanced at each daily close
+    enabled: true
+    mode: long_short           # or long_flat: negative signals become 0
+    lookbacks: [20, 50, 100]   # days; signal = mean of sign(close - SMA_n)
+    vol_window: 30             # days of close-to-close returns, annualised with sqrt(365)
+    target_vol: 0.08           # weight = signal * min(max_asset_exposure, target_vol / n_symbols / vol)
+    rebalance_band: 0.01       # trade a change of at least this x equity (or a close or a flip)
+risk:
+  risk_per_trade: 0.005
+  max_gross_leverage: 1.5
+  max_asset_exposure: 0.75
+  max_group_exposure: 1.0
+  groups: {majors: ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]}
+  daily_loss: 0.015
+  weekly_loss: 0.04
+  max_drawdown: 0.10
+  streak_half: 3
+  streak_stop: 5
+  min_notional: 10.0           # quote units; smaller entries are rejected or cancelled
+backtest:
+  initial_equity: 10000.0
+  start: "2021-01-01T00:00:00Z"
+  end: "2026-11-21T00:00:00Z"
+walk_forward:
+  train_days: 365
+  test_days: 90
+  min_trades: 20
+  grid:
+    strategies.breakout.volume_z_min: [0.5, 1.0, 1.5]
+    strategies.breakout.stop_atr_mult: [1.0, 1.5, 2.0]
+paper:
+  poll_seconds: 10
+  stale_after_seconds: 180
+  warmup_bars: 110             # daily bars loaded before trading starts (101 needed): 110 days
+                               # of 1m candles, 159 requests of 1000 bars per symbol at start

@@ -8,6 +8,7 @@ bulk-inserts, and does not commit (``session_scope`` does).
 
 import dataclasses
 import json
+import math
 import os
 import subprocess
 from collections.abc import Iterable, Iterator, Sequence
@@ -340,23 +341,31 @@ def count_signals(session: Session, run_id: int) -> int:
 
 _TRADE_FIELDS = [f.name for f in dataclasses.fields(Trade)]  # also the TradeRow column names
 _TRADE_ENUMS: dict[str, type[Enum]] = {"side": Side, "regime": Regime, "exit_reason": ExitReason}
+# A daily_trend trade has no stop, target or R: NaN in a ``Trade``, NULL in the database.
+_TRADE_NAN_AS_NULL = ("initial_stop", "target", "r_multiple")
+
+
+def _trade_value(trade: Trade, name: str) -> Any:
+    value = getattr(trade, name)
+    if isinstance(value, Enum):
+        return value.value
+    if name in _TRADE_NAN_AS_NULL and math.isnan(value):
+        return None
+    return value
 
 
 def save_trades(session: Session, run_id: int, trades: Sequence[Trade]) -> None:
-    """Insert closed trades (every ``Trade`` field is stored; enums as their string values)."""
+    """Insert closed trades (every ``Trade`` field is stored; enums as their string values; a
+    NaN stop, target or R, and a None regime, as NULL)."""
     rows = [
-        {"run_id": run_id}
-        | {
-            name: v.value if isinstance(v := getattr(t, name), Enum) else v
-            for name in _TRADE_FIELDS
-        }
-        for t in trades
+        {"run_id": run_id} | {name: _trade_value(t, name) for name in _TRADE_FIELDS} for t in trades
     ]
     _insert_chunks(session, TradeRow, rows)
 
 
 def load_trades(session: Session, run_id: int) -> list[Trade]:
-    """A run's trades, ordered by entry time (then insertion order)."""
+    """A run's trades, ordered by entry time (then insertion order); NULL stop, target or R
+    come back as NaN, a NULL regime as None."""
     stmt = (
         select(TradeRow).where(TradeRow.run_id == run_id).order_by(TradeRow.entry_ts, TradeRow.id)
     )
@@ -364,7 +373,10 @@ def load_trades(session: Session, run_id: int) -> list[Trade]:
     for r in session.scalars(stmt):
         kwargs: dict[str, Any] = {name: getattr(r, name) for name in _TRADE_FIELDS}
         for name, enum_type in _TRADE_ENUMS.items():
-            kwargs[name] = enum_type(kwargs[name])
+            kwargs[name] = None if kwargs[name] is None else enum_type(kwargs[name])
+        for name in _TRADE_NAN_AS_NULL:
+            if kwargs[name] is None:
+                kwargs[name] = math.nan
         trades.append(Trade(**kwargs))
     return trades
 

@@ -1,7 +1,8 @@
 """Pydantic config models and YAML loading.
 
-``load_config`` reads ``config/default.yaml`` (or a given file), applies the
-``DATABASE_URL`` env var and dotted-path overrides, then validates.
+``load_config`` reads ``config/default.yaml`` (or the file named by the ``REGIMEBOT_CONFIG`` env
+var, or a given file), applies the ``DATABASE_URL`` env var and dotted-path overrides, then
+validates.
 """
 
 import hashlib
@@ -17,17 +18,19 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, PositiveInt, m
 
 from regimebot.types import Regime
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "default.yaml"
+CONFIG_ENV = "REGIMEBOT_CONFIG"  # path of the config file to load instead of the default
 MAX_GROSS_LEVERAGE = 1.5  # hard cap, not configurable above this
 
-Timeframe = Literal["1m", "5m", "15m", "1h", "4h"]
-StrategyName = Literal["breakout", "trend", "mean_reversion"]
+Timeframe = Literal["1m", "5m", "15m", "1h", "4h", "1d"]
+StrategyName = Literal["breakout", "trend", "mean_reversion"]  # the regime playbook's strategies
 Fraction = Annotated[float, Field(gt=0, le=1)]
 NonNegative = Annotated[float, Field(ge=0)]
 Bps = Annotated[float, Field(ge=0, le=1000)]  # 1000 bps = 10%
 UnitFraction = Annotated[float, Field(ge=0, le=1)]  # 0 allowed, e.g. size_mult 0.0
 
-_TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
+_TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 
 def timeframe_minutes(tf: str) -> int:
@@ -161,10 +164,28 @@ class MeanReversionConfig(_Model):
     plausibility_mult: float = Field(gt=0)
 
 
+class DailyTrendConfig(_Model):
+    """Daily trend following (``regimebot.strategy.daily_trend``): a target position per symbol,
+    rebalanced at each daily close, with no stop, target or regime. Every field has a default so
+    that run configs stored before it existed still validate (it is then disabled)."""
+
+    enabled: bool = False
+    mode: Literal["long_short", "long_flat"] = "long_short"  # long_flat: negative signals are 0
+    lookbacks: list[PositiveInt] = Field(default=[20, 50, 100], min_length=1)  # SMA lengths, days
+    vol_window: int = Field(default=30, ge=2)  # daily returns in the volatility estimate
+    target_vol: float = Field(default=0.08, gt=0)  # annualised, split over the configured symbols
+    rebalance_band: UnitFraction = 0.01  # trade only a change of at least this x equity
+
+    def warmup_bars(self) -> int:
+        """Daily bars of history before the first signal: max(lookbacks) + 1 and vol_window + 1."""
+        return max(*self.lookbacks, self.vol_window) + 1
+
+
 class StrategiesConfig(_Model):
     breakout: BreakoutConfig
     trend: TrendConfig
     mean_reversion: MeanReversionConfig
+    daily_trend: DailyTrendConfig = DailyTrendConfig()
 
 
 class RiskConfig(_Model):
@@ -248,16 +269,39 @@ class AppConfig(_Model):
         return self
 
     @model_validator(mode="after")
-    def _paper_warmup_covers_features(self) -> "AppConfig":
-        from regimebot.market_state.features import warmup_bars  # it imports this module
+    def _daily_trend_runs_alone_on_daily_bars(self) -> "AppConfig":
+        if not self.strategies.daily_trend.enabled:
+            return self
+        names = ("breakout", "trend", "mean_reversion")
+        if on := [name for name in names if getattr(self.strategies, name).enabled]:
+            raise ValueError(
+                "strategies.daily_trend replaces the regime playbook's strategies: disable "
+                f"{', '.join(on)} (a run uses either the playbook strategies or daily_trend)"
+            )
+        if self.exchange.decision_timeframe != "1d":
+            raise ValueError("strategies.daily_trend needs exchange.decision_timeframe: 1d")
+        return self
 
-        if self.paper.warmup_bars < (need := warmup_bars(self.features)):
+    @model_validator(mode="after")
+    def _paper_warmup_covers_features(self) -> "AppConfig":
+        if self.paper.warmup_bars < (need := decision_warmup_bars(self)):
             raise ValueError(
                 f"paper.warmup_bars {self.paper.warmup_bars} is below the {need} decision bars "
                 f"the feature windows need before every feature is valid: raise "
                 f"paper.warmup_bars to at least {need}"
             )
         return self
+
+
+def decision_warmup_bars(cfg: AppConfig) -> int:
+    """Decision bars of history the run's features need before a fully valid row (the backtest
+    loads them before ``backtest.start``, ``paper.warmup_bars`` must cover them): daily_trend's
+    windows when it is enabled (the regime features are then not computed), else every regime
+    feature window (``market_state.features.warmup_bars``)."""
+    from regimebot.market_state.features import warmup_bars  # it imports this module
+
+    trend = cfg.strategies.daily_trend
+    return trend.warmup_bars() if trend.enabled else warmup_bars(cfg.features)
 
 
 def _apply_override(raw: dict[str, Any], dotted: str, value: object) -> None:
@@ -278,11 +322,12 @@ def load_config(
 ) -> AppConfig:
     """Load and validate the config.
 
-    ``path=None`` uses ``config/default.yaml`` at the repository root. A non-empty
-    ``DATABASE_URL`` env var replaces ``database_url``; ``overrides`` (dotted path
-    to value) are applied last, before validation, so an explicit override wins.
+    ``path=None`` uses the file named by a non-empty ``REGIMEBOT_CONFIG`` env var (a relative path
+    is taken from the current directory), else ``config/default.yaml`` at the repository root. A
+    non-empty ``DATABASE_URL`` env var replaces ``database_url``; ``overrides`` (dotted path to
+    value) are applied last, before validation, so an explicit override wins.
     """
-    path = path or DEFAULT_CONFIG_PATH
+    path = path or Path(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH)
     with path.open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     if not isinstance(raw, dict):

@@ -165,20 +165,21 @@ class TradeRow(Base):
     symbol: Mapped[str] = mapped_column(String(32))
     strategy: Mapped[str] = mapped_column(String(32))
     side: Mapped[str] = mapped_column(String(8))
-    regime: Mapped[str] = mapped_column(String(32))
+    # NULL for a daily_trend trade, which has no regime, stop, target or R (migration 0003)
+    regime: Mapped[str | None] = mapped_column(String(32))
     qty: Mapped[float]
     entry_ts: Mapped[datetime]
     exit_ts: Mapped[datetime]
     entry_price: Mapped[float]
     exit_price: Mapped[float]
-    initial_stop: Mapped[float]
-    target: Mapped[float]
+    initial_stop: Mapped[float | None]
+    target: Mapped[float | None]
     gross_pnl: Mapped[float]
     fees: Mapped[float]
     funding: Mapped[float]
     net_pnl: Mapped[float]
     exit_reason: Mapped[str] = mapped_column(String(16))
-    r_multiple: Mapped[float]
+    r_multiple: Mapped[float | None]
     bars_held: Mapped[int] = mapped_column(Integer)
 
 

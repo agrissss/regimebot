@@ -39,8 +39,10 @@ def warmup_bars(cfg: FeaturesConfig) -> int:
 
 
 def warm_rows(features: pd.DataFrame) -> pd.Series:
-    """True on the rows where every column but ``DATA_DEPENDENT_COLUMNS`` is valid."""
-    return features.drop(columns=list(DATA_DEPENDENT_COLUMNS)).notna().all(axis=1)
+    """True on the rows where every column but ``DATA_DEPENDENT_COLUMNS`` is valid (any features
+    frame: daily_trend's has none of them)."""
+    data_dependent = [c for c in DATA_DEPENDENT_COLUMNS if c in features.columns]
+    return features.drop(columns=data_dependent).notna().all(axis=1)
 
 
 def _validate(candles: pd.DataFrame) -> pd.DatetimeIndex:

@@ -6,6 +6,8 @@ then caps its notional by the remaining per-asset, per-group and gross exposure 
 ``check_limits`` halts trading on a daily, weekly or drawdown loss limit or the kill file.
 Daily and weekly halts clear at the next UTC day / ISO week (Monday 00:00 UTC); drawdown and
 manual-kill halts stay until ``clear_halt``. All exposures are valued at the portfolio's marks.
+``evaluate_target`` approves a target position's rebalance (daily_trend) under the same kill
+switch and caps; the loss-streak rules do not apply to it.
 """
 
 import math
@@ -163,6 +165,60 @@ class RiskManager:
         if rule != "ok":
             qty = notional / signal.entry
         return RiskDecision(approved=True, qty=qty, rule=rule, detail=detail)
+
+    def evaluate_target(
+        self,
+        symbol: str,
+        current: float,
+        target: float,
+        price: float,
+        portfolio: Portfolio,
+        now: datetime,
+        pending: Mapping[str, float] | None = None,
+    ) -> tuple[RiskDecision, float]:
+        """Approve the order that moves ``symbol``'s target position from ``current`` to
+        ``target`` (signed base units) at ``price``, or reject it; returns the decision (its qty is
+        the order size, |approved target - current|) and the approved target (``current`` when
+        rejected).
+
+        Rules in order: kill_switch, no_equity; then the target's notional is cut to the room the
+        asset, group and gross caps leave (rule cap_asset, cap_group or cap_gross; ties go to the
+        earlier cap, as in ``evaluate``): the symbol's own position does not count against itself,
+        ``pending`` (symbol -> notional that queued orders add) counts like open exposure. A zero
+        target (a close) is never cut. An order under ``risk.min_notional`` is rejected as
+        too_small. The loss-streak rules (day_stopped, the streak size cut) do not apply: a target
+        position has no discrete stopped trades. Day/week rollovers for ``now`` apply first.
+        """
+        now = _utc(now, "now")
+        pending = pending or {}
+        for name, notional in pending.items():
+            if not (math.isfinite(notional) and notional >= 0):
+                raise ValueError(f"pending notional for {name} must be >= 0, got {notional!r}")
+        if not (math.isfinite(price) and price > 0):
+            raise ValueError(f"price for {symbol} must be positive, got {price!r}")
+        self._roll(now)
+        equity = portfolio.equity
+        if self.halted_reason is not None:
+            return _reject("kill_switch", f"{symbol}: halted: {self.halted_reason}"), current
+        if self.kill_file.exists():
+            return _reject("kill_switch", f"{symbol}: kill file {self.kill_file} exists"), current
+        if not (math.isfinite(equity) and equity > 0):
+            return _reject("no_equity", f"{symbol}: equity {equity!r} is not positive"), current
+        notional, rule = abs(target) * price, "ok"
+        detail = f"{symbol}: target {target:+.8g} from {current:+.8g} at {price:.8g}"
+        own = portfolio.exposure(symbol)
+        for cap_rule, label, room in self._rooms(symbol, portfolio, pending, equity):
+            if cap_rule != "cap_asset":
+                room += own  # the group and gross used exposure include the symbol's own
+            if notional > 0 and room < notional:
+                notional, rule = max(room, 0.0), cap_rule
+                detail = f"{symbol}: {label} room {room:.2f} caps target {target:+.8g}"
+        approved = target if rule == "ok" else math.copysign(notional / price, target)
+        order = abs(approved - current)
+        if order * price < self.risk.min_notional:
+            why = f"{symbol}: order notional {order * price:.2f} < {self.risk.min_notional}"
+            return _reject("too_small", why), current
+        return RiskDecision(approved=True, qty=order, rule=rule, detail=detail), approved
 
     def _rooms(
         self, symbol: str, portfolio: Portfolio, pending: Mapping[str, float], equity: float

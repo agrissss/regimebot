@@ -358,9 +358,11 @@ def _random_html(result: BacktestResult, baselines: Baselines, paper: bool) -> s
 
 
 def _min_rr(cfg: AppConfig) -> dict[str, float]:
-    """Each configured strategy's minimum reward-to-risk."""
+    """Each configured strategy's minimum reward-to-risk (daily_trend has none)."""
     return {
-        name: getattr(cfg.strategies, name).min_rr for name in type(cfg.strategies).model_fields
+        name: config.min_rr
+        for name in type(cfg.strategies).model_fields
+        if hasattr(config := getattr(cfg.strategies, name), "min_rr")
     }
 
 

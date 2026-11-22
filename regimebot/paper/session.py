@@ -39,7 +39,7 @@ from regimebot.market_state.features import warm_rows
 from regimebot.paper import state
 from regimebot.reporting.alerts import alert
 from regimebot.risk.manager import RiskManager
-from regimebot.strategy import Strategy, build_strategies
+from regimebot.strategy import AnyStrategy, build_strategies
 from regimebot.types import Bar, Mode, Quote, RiskEvent
 
 log = structlog.get_logger(__name__)
@@ -100,7 +100,7 @@ class PaperSession:
         kill_file: Path,
         clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
-        strategies: Sequence[Strategy] | None = None,
+        strategies: Sequence[AnyStrategy] | None = None,
     ) -> None:
         self.cfg = cfg
         self.exchange = exchange
@@ -549,8 +549,7 @@ class PaperSession:
         for symbol in self._symbols:
             if quotes is not None and symbol not in quotes:
                 continue
-            flat = symbol not in self.portfolio.positions
-            entry = quotes is not None and flat and self.engine.is_active(symbol)
+            entry = quotes is not None and self.engine.has_queued_order(symbol)
             if not (symbol in exits or entry):
                 continue
             if (quote := self._quote(symbol)) is not None:

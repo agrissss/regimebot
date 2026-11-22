@@ -67,7 +67,9 @@ def append_log(session: Session, run_id: int, log: RunLog, marks: FlushMarks) ->
     """
     new_signals = log.signals[len(marks.signal_ids) :]
     ids = marks.signal_ids + repo.save_signals(session, run_id, new_signals)
-    decisions = [(ids[i], ts, d) for i, ts, d in log.decisions[marks.decisions :]]
+    decisions = [
+        (None if i is None else ids[i], ts, d) for i, ts, d in log.decisions[marks.decisions :]
+    ]
     repo.save_risk_decisions(session, run_id, decisions)
     repo.save_fills(session, run_id, log.fills[marks.fills :])
     repo.save_trades(session, run_id, log.trades[marks.trades :])
