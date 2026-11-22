@@ -385,13 +385,16 @@ def _time_shift_html(result: BacktestResult, baselines: Baselines, paper: bool) 
         f"<p><strong>Strategy beat {beaten} of {len(runs)} time-shifted runs</strong> on net "
         f"P&amp;L, and {sharpe} of {len(runs)} on Sharpe.</p>"
     )
-    rows = [["Strategy (reference)", _count(ref.n_trades), _money(ref.net_pnl),
-             _ratio(ref.sharpe), *_period(result),
-             "yes" if first_permanent_halt(result.log.risk_events) else "no"]]  # fmt: skip
-    for seed, run, m in zip(baselines.time_shift_seeds, runs, shifted, strict=True):
-        halt = first_permanent_halt(run.log.risk_events)
-        rows.append([f"Shift seed {seed}", _count(m.n_trades), _money(m.net_pnl),
-                     _ratio(m.sharpe), *_period(run), "yes" if halt else "no"])  # fmt: skip
+    labelled = [("Strategy (reference)", result, ref)]
+    labelled += [
+        (f"Shift seed {seed}", run, m)
+        for seed, run, m in zip(baselines.time_shift_seeds, runs, shifted, strict=True)
+    ]
+    rows = [
+        [label, _count(m.n_trades), _money(m.net_pnl), _ratio(m.sharpe), *_period(run)]
+        + ["yes" if first_permanent_halt(run.log.risk_events) else "no"]
+        for label, run, m in labelled
+    ]
     note = (
         "<p>Daily trend has no entries to randomise, so its baseline reruns the same engine, "
         "costs and risk limits with each symbol's daily target-weight series circularly "

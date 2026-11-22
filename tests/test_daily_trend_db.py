@@ -6,6 +6,7 @@ Postgres job runs them against ``TEST_DATABASE_URL``."""
 import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -57,8 +58,8 @@ def test_a_target_trade_stores_null_stop_target_r_and_regime_and_loads_them_as_n
         run_id = repo.create_run(s, Mode.BACKTEST, cfg)
         repo.save_trades(s, run_id, [NAN_TRADE])
     with session_scope(engine) as s:
-        row = s.execute(select(TradeRow.initial_stop, TradeRow.target, TradeRow.r_multiple,
-                               TradeRow.regime)).one()  # fmt: skip
+        columns = (TradeRow.initial_stop, TradeRow.target, TradeRow.r_multiple, TradeRow.regime)
+        row = s.execute(select(*columns)).one()
         assert tuple(row) == (None, None, None, None)
         (loaded,) = repo.load_trades(s, run_id)
     assert repr(loaded) == repr(NAN_TRADE)
@@ -102,8 +103,7 @@ def test_a_stored_trend_backtest_comes_back_as_it_ran(database_url: str, tmp_pat
         },
     )
     closes = [100.0 + 10 * math.sin(k / 3) for k in range(30)]
-    minutes = [c for a, b in zip(closes, closes[1:], strict=False) for c in
-               [a + (b - a) * (i + 1) / 1440 for i in range(1440)]]  # fmt: skip
+    minutes = [a + (b - a) * (i + 1) / 1440 for a, b in pairwise(closes) for i in range(1440)]
     candles = {
         BTC: candles_from_closes(minutes),
         ETH: candles_from_closes([m / 2 for m in minutes]),
@@ -130,4 +130,13 @@ def test_a_stored_trend_backtest_comes_back_as_it_ran(database_url: str, tmp_pat
     assert [tuple(r) for r in stored_decisions] == [
         (None, d.rule, d.qty) for _, _, d in result.log.decisions
     ]
+    engine.dispose()
+
+
+def test_a_playbook_trade_with_a_nan_stop_still_fails_loudly(database_url: str) -> None:
+    upgrade_to_head(database_url)
+    engine = make_engine(database_url)
+    broken = replace(NAN_TRADE, strategy="breakout", regime=Regime.RANGE, target=97.0)
+    with pytest.raises(ValueError, match="initial_stop is NaN"), session_scope(engine) as s:
+        repo.save_trades(s, repo.create_run(s, Mode.BACKTEST, load_config()), [broken])
     engine.dispose()

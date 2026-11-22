@@ -185,9 +185,11 @@ class RiskManager:
         asset, group and gross caps leave (rule cap_asset, cap_group or cap_gross; ties go to the
         earlier cap, as in ``evaluate``): the symbol's own position does not count against itself,
         ``pending`` (symbol -> notional that queued orders add) counts like open exposure. A zero
-        target (a close) is never cut. An order under ``risk.min_notional`` is rejected as
-        too_small. The loss-streak rules (day_stopped, the streak size cut) do not apply: a target
-        position has no discrete stopped trades. Day/week rollovers for ``now`` apply first.
+        target (a close) is never cut. A target worth less than ``risk.min_notional`` becomes
+        zero: a position is never left under it, and a close is never too small. Any other order
+        under ``risk.min_notional`` is rejected as too_small. The loss-streak rules (day_stopped,
+        the streak size cut) do not apply: a target position has no discrete stopped trades.
+        Day/week rollovers for ``now`` apply first.
         """
         now = _utc(now, "now")
         pending = pending or {}
@@ -214,8 +216,10 @@ class RiskManager:
                 notional, rule = max(room, 0.0), cap_rule
                 detail = f"{symbol}: {label} room {room:.2f} caps target {target:+.8g}"
         approved = target if rule == "ok" else math.copysign(notional / price, target)
+        if abs(approved) * price < self.risk.min_notional:
+            approved = 0.0
         order = abs(approved - current)
-        if order * price < self.risk.min_notional:
+        if order == 0 or (approved != 0 and order * price < self.risk.min_notional):
             why = f"{symbol}: order notional {order * price:.2f} < {self.risk.min_notional}"
             return _reject("too_small", why), current
         return RiskDecision(approved=True, qty=order, rule=rule, detail=detail), approved

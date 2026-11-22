@@ -6,6 +6,7 @@ Hand-computed numbers use zero costs unless a test says otherwise; ``TREND_CFG``
 caps, band 0.01, min notional 10).
 """
 
+import json
 import math
 from datetime import timedelta
 
@@ -66,6 +67,7 @@ def test_default_config_has_daily_trend_disabled_and_trend_yaml_enables_it_alone
     assert cfg.backtest.start.isoformat() == "2021-01-01T00:00:00+00:00"
     assert cfg.backtest.end.isoformat() == "2026-11-21T00:00:00+00:00"
     assert [type(s) for s in build_strategies(cfg)] == [DailyTrend]
+    assert all(key.startswith("strategies.daily_trend.") for key in cfg.walk_forward.grid)
     assert timeframe_minutes("1d") == 1440
 
 
@@ -161,3 +163,18 @@ def test_weights_above_the_gross_cap_are_scaled_down_together() -> None:
     # each capped at 0.75 (signal 1, -1, 0.5): gross 0.75 + 0.75 + 0.375 = 1.875 > 1.5
     assert got == {BTC: approx(0.6), ETH: approx(-0.6), SOL: approx(0.3)}
     assert sum(abs(w) for w in got.values()) == approx(1.5)
+
+
+def test_a_disabled_default_daily_trend_section_leaves_existing_config_hashes_unchanged() -> None:
+    from regimebot.config import config_hash, config_json
+
+    assert config_hash(load_config()) == "128cd0ef746fcece"  # default.yaml before daily_trend
+    assert "daily_trend" not in config_json(load_config())
+    changed = load_config(overrides={"strategies.daily_trend.target_vol": 0.1})  # still disabled
+    assert "daily_trend" in config_json(changed) and config_hash(changed) != "128cd0ef746fcece"
+    trend = trend_cfg()
+    off = trend_cfg(**{"strategies.daily_trend.enabled": False, "paper.warmup_bars": 2976})
+    assert '"daily_trend":{"enabled":true' in config_json(trend)
+    assert '"daily_trend":{' not in config_json(off) and config_hash(trend) != config_hash(off)
+    stored = json.loads(config_json(load_config())) | {"database_url": "sqlite://"}
+    assert AppConfig.model_validate(stored) == load_config(overrides={"database_url": "sqlite://"})

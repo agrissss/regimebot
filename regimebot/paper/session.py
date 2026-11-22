@@ -542,9 +542,10 @@ class PaperSession:
             self.engine.request_flatten(now)
 
     def _fill_queued(self, quotes: dict[str, Quote] | None) -> None:
-        """Fill queued orders at fresh quotes: exits on every poll, entries only on the poll of
-        their decision (``quotes`` given). A symbol whose pre-decision quote failed is not filled
-        on that poll: its entry expires at the next decision, its exit waits for the next poll."""
+        """Fill queued orders at fresh quotes: exits on every poll, entries and target-position
+        orders (reductions too) only on the poll of their decision (``quotes`` given). A symbol
+        whose pre-decision quote failed is not filled on that poll: its entry or target order
+        expires at the next decision, its exit waits for the next poll."""
         exits = self.engine.queued_exits
         for symbol in self._symbols:
             if quotes is not None and symbol not in quotes:

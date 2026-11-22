@@ -184,6 +184,9 @@ def test_a_close_is_never_cut_and_an_order_under_min_notional_is_too_small(
     rm, p = risk_and_book(tmp_path, trend_cfg(), btc_qty=70.0)
     decision, approved = rm.evaluate_target(BTC, 70.0, 70.05, 100.0, p, D1)  # order 5 < 10
     assert (decision.approved, decision.rule, approved) == (False, "too_small", 70.0)
+    # a target worth under min notional is a close: the position is never left as dust
+    decision, approved = rm.evaluate_target(BTC, 70.0, 0.05, 100.0, p, D1)
+    assert (decision.approved, decision.qty, approved) == (True, 70.0, 0.0)
 
 
 def test_the_kill_switch_blocks_a_rebalance_but_the_loss_streak_rules_do_not(
@@ -276,24 +279,28 @@ def test_a_sign_change_is_one_order_through_zero_and_a_zero_target_closes(
     assert engine.portfolio.cash - 10_000.0 == approx(sum(t.net_pnl for t in engine.log.trades))
 
 
-def test_no_order_is_under_min_notional_so_a_position_under_it_stays_as_dust(
-    tmp_path: Path,
-) -> None:
-    w = {D1: {BTC: 0.0005}, D2: {BTC: 0.5}, D3: {BTC: 0.0008}, D4: {BTC: 0.0}}
+def test_a_target_under_min_notional_counts_as_zero_so_no_dust_is_left(tmp_path: Path) -> None:
+    w = {D1: {BTC: 0.0005}, D2: {BTC: 0.5}, D3: {BTC: 0.0008}}
     engine = make(tmp_path, w, **{"strategies.daily_trend.rebalance_band": 0.0})
-    decide(engine, D1, 100.0)  # 0.0005 x 10 000 = 5 < min notional 10: rejected
-    assert not engine.has_queued_order(BTC)
-    for ts in (D2, D3, D4):
+    decide(engine, D1, 100.0)  # 0.0005 x 10 000 = 5 < min notional 10: zero, and flat already
+    assert not engine.has_queued_order(BTC) and engine.log.decisions == []
+    for ts in (D2, D3):
         decide(engine, ts, 100.0)
         fill_at(engine, ts, 100.0)
-    # D3 left 0.08 (8 notional); its zero target at D4 would be an order of 8: rejected too
-    assert decisions(engine) == [
-        (D1, "too_small", 0.0),
-        (D2, "ok", 50.0),
-        (D3, "ok", approx(49.92)),
-        (D4, "too_small", 0.0),
-    ]
-    assert engine.portfolio.positions[BTC].qty == approx(0.08)
+    # D3's 8 would be a position under min notional: the whole 50 closes instead
+    assert decisions(engine) == [(D2, "ok", 50.0), (D3, "ok", 50.0)]
+    assert engine.portfolio.positions == {} and len(engine.log.trades) == 1
+
+
+def test_a_position_under_min_notional_still_closes_below_the_band(tmp_path: Path) -> None:
+    w = {D1: {BTC: 0.0015}, D2: {BTC: 0.0}}
+    engine = make(tmp_path, w, **{"strategies.daily_trend.rebalance_band": 0.0})
+    decide(engine, D1, 100.0)  # 0.15 x 100 = 15
+    fill_at(engine, D1, 100.0)
+    decide(engine, D2, 50.0)  # now worth 7.5: the close is an order under min notional and band
+    fill_at(engine, D2, 50.0)
+    assert decisions(engine) == [(D1, "ok", approx(0.15)), (D2, "ok", approx(0.15))]
+    assert engine.portfolio.positions == {}
 
 
 def test_an_unfilled_target_order_expires_at_the_next_decision(tmp_path: Path) -> None:
@@ -320,15 +327,38 @@ def test_an_order_that_adds_is_cut_by_participation_one_that_reduces_is_not(
     assert engine2.portfolio.positions == {} and engine2.log.fills[-1].qty == 50.0
 
 
-def test_minute_bars_are_not_needed_and_on_minute_never_exits_a_target_position(
+def test_the_opening_leg_of_a_flip_is_capped_like_an_entry(tmp_path: Path) -> None:
+    w = {D1: {BTC: 0.5}, D2: {BTC: -0.3}, D3: {BTC: -0.3}}
+    engine = make(tmp_path, w)
+    decide(engine, D1, 100.0)
+    fill_at(engine, D1, 100.0)  # long 50
+    decide(engine, D2, 100.0)  # target -30: one order through zero
+    fill_at(engine, D2, 100.0, volume=200.0)  # the closing 50 in full, the opening 5% of 200
+    assert (engine.log.fills[-1].side, engine.log.fills[-1].qty) == (SELL, 60.0)
+    assert engine.portfolio.signed_qty(BTC) == -10.0 and len(engine.log.trades) == 1
+    decide(engine, D3, 100.0)  # the rest of the target follows at the next decision
+    fill_at(engine, D3, 100.0)
+    assert decisions(engine)[-1] == (D3, "ok", 20.0) and engine.portfolio.signed_qty(BTC) == -30.0
+    # an opening leg under min notional is dropped: the flip only closes
+    thin = make(tmp_path, {D1: {BTC: 0.5}, D2: {BTC: -0.3}})
+    decide(thin, D1, 100.0)
+    fill_at(thin, D1, 100.0)
+    decide(thin, D2, 100.0)
+    fill_at(thin, D2, 100.0, volume=1.0)  # 5% of 1 = 0.05, worth 5 < 10
+    assert thin.log.fills[-1].qty == 50.0 and thin.portfolio.positions == {}
+
+
+def test_on_minute_never_exits_a_target_position_and_marks_it_on_the_hour(
     tmp_path: Path,
 ) -> None:
     engine = make(tmp_path, {D1: {BTC: 0.5}})
-    assert engine.needs_minute_bars is False
+    assert engine.needs_minute_bars is False  # a feed may send only the hour bars
     decide(engine, D1, 100.0)
     fill_at(engine, D1, 100.0)
-    engine.on_minute(Bar(BTC, D1 + 2 * MINUTE, 100.0, 200.0, 1.0, 100.0, 1e6))
-    assert engine.portfolio.positions[BTC].qty == 50.0
+    engine.on_minute(Bar(BTC, D1 + 2 * MINUTE, 100.0, 200.0, 1.0, 120.0, 1e6))
+    assert engine.portfolio.last_prices[BTC] == 100.0  # not an hour boundary: nothing
+    engine.on_minute(Bar(BTC, D1 + 60 * MINUTE, 100.0, 200.0, 1.0, 101.0, 1e6))
+    assert engine.portfolio.last_prices[BTC] == 101.0 and engine.portfolio.positions[BTC].qty == 50
 
 
 def test_a_halt_flattens_target_positions_and_blocks_rebalancing(tmp_path: Path) -> None:
@@ -346,17 +376,58 @@ def test_a_halt_flattens_target_positions_and_blocks_rebalancing(tmp_path: Path)
 
 def test_the_loss_streak_rules_do_not_apply_to_target_positions(tmp_path: Path) -> None:
     # two losing trades in a row would stop a playbook strategy for the day (streak_stop 2)
-    w = {}
-    for k in range(12):
-        w[T0 + k * DAY] = {BTC: 0.2 if k % 2 == 0 else 0.0}
+    days = [T0 + k * DAY for k in range(14)]
+    w = {ts: {BTC: 0.2 if k % 2 == 0 or k >= 12 else 0.0} for k, ts in enumerate(days)}
     engine = make(tmp_path, w, **{"risk.streak_stop": 2, "risk.streak_half": 1})
-    for k in range(12):
-        ts = T0 + k * DAY
+    for k, ts in enumerate(days[:12]):  # six losing round trips closed by the target
         decide(engine, ts, 100.0 if k % 2 == 0 else 99.0)
         fill_at(engine, ts, 100.0 if k % 2 == 0 else 99.0)
     assert len(engine.log.trades) == 6 and all(t.net_pnl < 0 for t in engine.log.trades)
-    assert engine.risk.loss_streak == 0 and engine.risk.day_stopped is None
     assert [d.rule for _, _, d in engine.log.decisions] == ["ok"] * 12
+    # and two losing closes through the engine's exit path (kill, end of data)
+    for ts, reason in ((days[12], ExitReason.KILL), (days[13], ExitReason.END_OF_DATA)):
+        decide(engine, ts, 100.0)
+        fill_at(engine, ts, 100.0)
+        engine.flatten_all(ts + 2 * MINUTE, {BTC: 99.0}, reason)
+    assert [(t.exit_reason, t.net_pnl < 0) for t in engine.log.trades[-2:]] == [
+        (ExitReason.KILL, True),
+        (ExitReason.END_OF_DATA, True),
+    ]
+    assert engine.risk.loss_streak == 0 and engine.risk.day_stopped is None
+
+
+def two_symbol_engine(tmp_path: Path, weights: dict[datetime, dict[str, float]]) -> Engine:
+    return make(tmp_path, weights, **{"exchange.symbols": [BTC, ETH]})
+
+
+def decide2(engine: Engine, ts: datetime, closes: dict[str, float]) -> None:
+    row = {"signal": 1.0, "vol": 0.5}
+    engine.on_decision(
+        ts,
+        {
+            s: pd.DataFrame([{"close": c, **row}], index=pd.DatetimeIndex([ts]))
+            for s, c in closes.items()
+        },
+    )
+
+
+def test_an_add_is_cut_at_the_cap_while_a_reduction_is_queued_and_follows_next_decision(
+    tmp_path: Path,
+) -> None:
+    w = {D1: {BTC: 0.75}, D2: {BTC: 0.5, ETH: 0.5}, D3: {BTC: 0.5, ETH: 0.5}}
+    engine = two_symbol_engine(tmp_path, w)  # majors group cap 1.0 x equity
+    decide2(engine, D1, {BTC: 100.0, ETH: 50.0})
+    engine.fill_queued(BTC, D1 + MINUTE, 100.0, 100.0, 1e9)  # BTC 75, 7 500
+    decide2(engine, D2, {BTC: 120.0, ETH: 50.0})  # BTC worth 9 000 of 11 500 equity
+    # BTC's reduction to 5 750 is queued first; it frees no room before it fills, so ETH's
+    # 5 750 is cut to the group room left beside BTC's 9 000: 11 500 - 9 000 = 2 500
+    (btc, eth) = engine.log.decisions[-2:]
+    assert (btc[2].rule, eth[2].rule, eth[2].qty) == ("ok", "cap_group", approx(50.0))
+    for s, price in ((BTC, 120.0), (ETH, 50.0)):
+        engine.fill_queued(s, D2 + MINUTE, price, price, 1e9)
+    decide2(engine, D3, {BTC: 120.0, ETH: 50.0})  # the rest of ETH's target now fits
+    assert engine.log.decisions[-1][2].rule == "ok"
+    assert engine.log.decisions[-1][2].qty == approx(5_750 / 50 - 50)
 
 
 def test_a_trend_config_takes_exactly_one_target_strategy(tmp_path: Path) -> None:

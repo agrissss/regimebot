@@ -350,9 +350,14 @@ def with_overrides(cfg: AppConfig, overrides: Mapping[str, object]) -> AppConfig
 
 def config_json(cfg: AppConfig) -> str:
     """Canonical JSON of the strategy config, without ``database_url`` (it may hold a password
-    and must not change the identity of a run between SQLite and Postgres)."""
+    and must not change the identity of a run between SQLite and Postgres), and without a
+    disabled ``strategies.daily_trend`` at its defaults (added later: configs from before it keep
+    their hash, and their stored JSON validates back to the same config)."""
+    exclude: dict[str, Any] = {"database_url": True}
+    if cfg.strategies.daily_trend == DailyTrendConfig():
+        exclude["strategies"] = {"daily_trend": True}
     return json.dumps(
-        cfg.model_dump(mode="json", exclude={"database_url"}), sort_keys=True, separators=(",", ":")
+        cfg.model_dump(mode="json", exclude=exclude), sort_keys=True, separators=(",", ":")
     )
 
 

@@ -16,13 +16,17 @@ With a ``TargetStrategy`` (daily_trend) the decision step is different and every
 is the same: no regime, no stop, target or time exit; at each decision every symbol with a target
 weight is traded toward it (``_rebalance``), and the order fills like an entry at the next
 ``fill_queued``. Halts, queued exits, funding, flattening and the equity snapshot work as for the
-playbook strategies; the loss-streak rules do not apply (no discrete stopped trades).
+playbook strategies; the loss-streak rules do not apply (no discrete stopped trades). Because a
+day has one decision, the loss limits are also checked at every hour boundary: ``on_minute``
+marks each open position at the bar closing on the hour and, once all are marked, checks them on
+that equity; a halt queues KILL exits, which fill at the next ``fill_queued`` (the next bar's
+open in a backtest, the next poll's quote in paper).
 """
 
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -53,6 +57,8 @@ from regimebot.types import (
 log = structlog.get_logger(__name__)
 
 REGIME_INPUTS = ("close", *REQUIRED_FEATURES)  # every value ``classify`` reads
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+LIMIT_CHECK = timedelta(hours=1)  # target positions: loss limits checked on each hour boundary
 
 
 @dataclass
@@ -110,10 +116,11 @@ def _last_row(window: pd.DataFrame | None, ts: datetime) -> tuple[dict[str, floa
 class Engine:
     """Regimes, signals, risk, fills and trades for ``cfg.exchange.symbols``.
 
-    At most one position or queued order per symbol. A queued exit takes the whole position;
-    a queued entry fills once, possibly cut by the participation cap, and only before the next
-    decision. ``strategies`` are looked up by name in each regime's playbook order. A
-    daily_trend config takes exactly one ``TargetStrategy`` instead (and nothing else).
+    At most one position or queued order per symbol (a target position may also have one
+    queued order, toward its target). A queued exit takes the whole position; a queued entry
+    fills once, possibly cut by the participation cap, and only before the next decision.
+    ``strategies`` are looked up by name in each regime's playbook order. A daily_trend config
+    takes exactly one ``TargetStrategy`` instead (and nothing else).
     """
 
     def __init__(
@@ -149,6 +156,10 @@ class Engine:
         self._targets: dict[str, _QueuedTarget] = {}  # a target position's queued order
         self._exits: dict[str, ExitReason] = {}
         self._last_close: dict[str, float] = {}  # last decision close: exit ref_price
+        # target positions: the hour each was last marked at (loss limits once all are)
+        # ponytail: not saved, so a restart between two symbols' bars of one hour skips that
+        # hour's check; save it with the engine state if feeds ever split an hour across polls.
+        self._marked_hour: dict[str, datetime] = {}
 
     def is_active(self, symbol: str) -> bool:
         """True when ``symbol`` has an open position or a queued order (it needs bars)."""
@@ -165,8 +176,9 @@ class Engine:
 
     @property
     def needs_minute_bars(self) -> bool:
-        """False for a target strategy: its positions have no stop or target to check, so a
-        feed may skip ``on_minute`` (it is a no-op for them)."""
+        """False for a target strategy: its positions have no stop or target to check, so a feed
+        may send ``on_minute`` only the bars closing on an hour boundary (the loss-limit checks)
+        and a ``fill_queued`` after each (a halt's exits)."""
         return self._target is None
 
     @property
@@ -291,9 +303,13 @@ class Engine:
     def on_minute(self, bar: Bar) -> None:
         """Check ``bar`` against the open position's stop, then its target (stop first when one
         bar touches both: the order inside a bar is unknown, so assume the worse). A target
-        position has neither: nothing to do."""
+        position has neither: its bar closing on an hour boundary marks it, and checks the loss
+        limits once every open position is marked at that hour (``_check_hour``)."""
+        if self._target is not None:
+            self._check_hour(bar)
+            return
         position = self.portfolio.positions.get(bar.symbol)
-        if position is None or self._target is not None:
+        if position is None:
             return
         exit_side = exit_order_side(position.side)
         fill = stop_fill(bar.symbol, bar, exit_side, position.qty, position.stop, self.cfg.costs)
@@ -305,6 +321,21 @@ class Engine:
         )
         if fill is not None:
             self._close(fill, ExitReason.TARGET)
+
+    def _check_hour(self, bar: Bar) -> None:
+        """Target positions: mark ``bar.symbol`` at the close of its bar ending on an hour
+        boundary (also its exit ``ref_price``); once every open position is marked at that hour,
+        check the loss limits on that equity and, if halted, flatten as at a decision. A day and
+        week start at the check at their 00:00 roll, the previous daily close."""
+        if bar.symbol not in self.portfolio.positions or (bar.ts - _EPOCH) % LIMIT_CHECK:
+            return
+        self.portfolio.mark({bar.symbol: bar.close})
+        self._last_close[bar.symbol] = bar.close
+        self._marked_hour[bar.symbol] = bar.ts
+        if all(self._marked_hour.get(s) == bar.ts for s in self.portfolio.positions):
+            self.log.risk_events.extend(self.risk.check_limits(self.portfolio, bar.ts))
+            if self.risk.must_flatten:
+                self.request_flatten(bar.ts)
 
     def on_funding(self, symbol: str, ts: datetime, rate: float, mark_price: float) -> None:
         """Settle a funding event stamped ``ts`` on a position held at that time. A position
@@ -422,8 +453,12 @@ class Engine:
         ``rebalance_band`` x equity in notional, or when the target is zero or changes sign while
         a position is open (a flip is one order through zero). The risk manager may cut the
         target to the cap room or reject the order (one decision each, without a signal);
-        orders approved earlier in this decision count toward the caps. A symbol without a
-        weight (stale, not warm) or with a queued exit is left as it is."""
+        orders approved earlier in this decision count toward the caps, so a cap that binds
+        serves the symbols in configured order (not pro rata), and a queued reduction frees
+        room only once it fills (the rest of a cut target follows at the next decision). A
+        symbol without a weight (stale, not warm) or with a queued exit is left as it is. A
+        target under ``risk.min_notional`` counts as zero, so a position is always closed in
+        full."""
         weights = strategy.weights(ts, rows)
         equity = self.portfolio.equity
         band = self.cfg.strategies.daily_trend.rebalance_band * equity
@@ -434,6 +469,8 @@ class Engine:
             price = rows[symbol]["close"]
             current = self.portfolio.signed_qty(symbol)
             target = weights[symbol] * equity / price
+            if abs(target) * price < self.cfg.risk.min_notional:
+                target = 0.0
             closing = current != 0 and (target == 0 or (target > 0) != (current > 0))
             if target == current or not (closing or abs(target - current) * price >= band):
                 continue
@@ -515,20 +552,29 @@ class Engine:
         """Trade ``symbol`` to its queued target (still queued), or cancel the order; it leaves
         the queue only once decided. An order that only adds exposure is cut to
         ``max_participation`` of ``bar_volume`` and cancelled (``no_liquidity``) with no fill or
-        one under ``risk.min_notional``, as an entry is; one that reduces, closes or flips the
-        position always fills in full, as an exit does. ``expired`` as for an entry."""
+        one under ``risk.min_notional``, as an entry is; one that reduces or closes the position
+        always fills in full, as an exit does. A flip closes in full and opens only as much as an
+        entry could (``max_participation`` of ``bar_volume``; nothing when that is worth less
+        than ``risk.min_notional`` at the decision close): still one order, and the rest of the
+        target is traded at the next decision. ``expired`` as for an entry."""
         if ts >= order.ts + self._decision_width:
             detail = f"first fill offered at {ts}, decision at {order.ts}"
             self._cancel_target(symbol, ts, "expired", detail)
             return
         current = self.portfolio.signed_qty(symbol)
         adds = current * order.target >= 0 and abs(order.target) > abs(current)
-        delta = order.target - current
+        qty = abs(order.target - current)
+        if current * order.target < 0:  # a flip: cap its opening leg like an entry
+            room = self.cfg.costs.max_participation * max(bar_volume, 0.0)
+            opening = min(abs(order.target), room)
+            if opening * order.ref_price < self.cfg.risk.min_notional:
+                opening = 0.0
+            qty = abs(current) + opening
         fill = market_fill(
             symbol,
             ts,
-            OrderSide.BUY if delta > 0 else OrderSide.SELL,
-            abs(delta),
+            OrderSide.BUY if order.target > current else OrderSide.SELL,
+            qty,
             bid,
             ask,
             order.ref_price,

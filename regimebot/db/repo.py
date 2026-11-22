@@ -350,6 +350,10 @@ def _trade_value(trade: Trade, name: str) -> Any:
     if isinstance(value, Enum):
         return value.value
     if name in _TRADE_NAN_AS_NULL and math.isnan(value):
+        if trade.regime is not None:  # a playbook trade always has them: a NaN is a bug
+            raise ValueError(
+                f"{trade.strategy} trade: {name} is NaN (only a target trade has none)"
+            )
         return None
     return value
 
