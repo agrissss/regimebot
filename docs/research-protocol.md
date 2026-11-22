@@ -132,6 +132,22 @@ Development on BTC, ETH and SOL, 2021-01-01 to 2026-11-21 (data already examined
 - Long/flat is reported alongside but does not decide.
 - Limits of this test, stated in advance: these coins move with BTC, so this is a test that the rule is not fitted to three price series, not a fully independent sample; it is a daily-close simulation, not the engine; a pass makes the rule a candidate to build into the engine and paper trade, nothing more.
 
+##### Result on the ten other coins (run once, 2026-11-22): FAIL on two of seven criteria
+
+| Criterion (long/short) | Required | Result | |
+|---|---|---|---|
+| Total return | above 0 | +112.22% | pass |
+| Sharpe | at least 0.40 | 0.56 | pass |
+| Positive calendar years | at least 4 of 6 | 3 of 6 (2021 +64.4%, 2022 -11.3%, 2023 -3.5%, 2024 +43.4%, 2025 -21.4%, 2026 +33.8%) | fail |
+| Max drawdown | no worse than -40% | -46.86% | fail |
+| Coins contributing positively | at least 6 of 10 | 8 of 10 | pass |
+| Sharpe above time-shifted runs | at least 190 of 200 | 198 of 200 | pass |
+| Total return with costs doubled | above 0 | +70.01% | pass |
+
+Long/flat on the same coins (reported, not deciding): +227.68%, Sharpe 1.05, max drawdown -28.20%, positive in 4 of 6 years. Buy and hold: +438% with a 79% drawdown.
+
+Reading it honestly: by the criteria written in advance this is a fail, and it is recorded as one. What the test does show is that the timing of the rule carries information on coins it was not developed on (198 of 200, profitable at double costs, 8 of 10 coins), which none of the brief's rule sets managed. What it also shows is that the ride is rough: half the years lose and the drawdown was 47% at this sizing. Part of that drawdown is a sizing error in the prototype (the volatility target assumes uncorrelated coins, and these ten move together), but the losing years are not. This is the normal profile of trend following, and it is not compatible with a 10% drawdown limit unless positions, and returns, are cut to roughly a quarter. All daily data for these 13 coins has now been examined; the remaining clean test is paper trading forward.
+
 ### 4. Sensitivity
 
 ```bash
