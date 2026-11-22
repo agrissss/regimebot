@@ -177,6 +177,23 @@ Third attempt (2026-11-22): a different strategy, daily trend following (`resear
 
 Conclusion: as specified, these strategies show no edge on this data. The regimes carry information about how much price will move, but not which way, and the strategies depend on direction. See [docs/research-protocol.md](docs/research-protocol.md) for how to read these numbers.
 
+## Daily trend strategy (the current candidate)
+
+A fourth strategy of a different kind, added after the three from the original brief showed no edge. It is selected with a second config file:
+
+```bash
+export REGIMEBOT_CONFIG=config/trend.yaml
+.venv/bin/regimebot backtest run          # 2021-01-01 to 2026-11-21 by default in this config
+.venv/bin/regimebot report RUN_ID
+.venv/bin/regimebot paper run --resume latest
+```
+
+Rule: once a day at the 00:00 UTC close, per coin, the signal is the average of sign(close - SMA) over 20, 50 and 100 days. The target position is that signal times a volatility-scaled weight (`target_vol` 8% a year spread over the coins, capped by the usual asset, group and gross limits); the engine trades the difference at the next 1-minute open. There is no stop, no target and no regime. The kill switch and the daily-loss, weekly-loss and drawdown limits apply and are checked every hour. A run uses either this strategy or the regime playbook, never both.
+
+Engine result on BTC, ETH and SOL, 2021-01-01 to 2026-11-21, 10,000 USDT, default limits (run 26): net +2,890.68 (+28.91%), max drawdown 9.22%, fees 241.22, funding paid 439.67, every calendar year positive (+487, +144, +469, +276, +237, +1,278), ahead of 30 of 30 runs with randomly time-shifted positions; four one-day daily-loss stops, no permanent halt. With all limits off (run 25): +29.38%, max drawdown 9.15%. That is under 5% a year, and the drawdown sits just under the 10% limit that would stop the run for good.
+
+What this is and is not: the rule was developed on these three coins, so that result is in-sample. Its one pre-registered test on ten other coins (at larger sizing, as a prototype) was profitable and well timed but failed two of seven criteria: 3 of 6 years profitable and a 47% drawdown. It is a candidate for paper trading, not a proven edge. Expect losing years. See [docs/research-protocol.md](docs/research-protocol.md#third-rule-set-daily-trend-following-2026-11-22).
+
 ## Tests and linters
 
 ```bash
