@@ -91,6 +91,34 @@ Commands:
 .venv/bin/regimebot report RUN_ID --random-seeds 30
 ```
 
+#### Second rule set: 1-hour breakout only (search on 2024-2026, 2026-11-22)
+
+After the fail above, 16 variants were tried on the already-used 2024-01-01 to 2026-11-21 data (drawdown halt off): each strategy alone and in combinations at 15 minutes, and breakout/trend combinations at 1-hour and 4-hour decisions. Every 15-minute variant lost. The best was **breakout only at a 1-hour decision timeframe** (`exchange.decision_timeframe=1h`, `features.pctile_window=720`, trend and mean reversion disabled, everything else default): 345 trades, net +2,466.97, profit factor 1.22, max drawdown 12.16%, positive in 2024 (+193), 2025 (+1,795) and 2026 (+479), ahead of 29 of 30 random-entry seeds. Parameters moved by +/-20% gave +2,062 to +2,715; costs x2 gave +474. Weak points: expectancy 0.18 R with a 95% bootstrap interval of -0.02 to 0.40 (zero is inside it), shorts made nothing (+1.66), and without the best 18 trades the result is -2,402. It is the best of 16 tries on used data, so by itself it proves nothing.
+
+##### Pre-registered criteria for 2021-2023 (written before the data was downloaded, 2026-11-22)
+
+- Data: 2021-01-01 to 2023-11-30, never downloaded or examined before this commit. Configuration frozen as above; no changes after seeing any result.
+- Pass only if, with the drawdown halt off, ALL hold: net P&L after all costs above 0; profit factor at least 1.10; at least 150 trades; ahead of at least 24 of 30 random-entry seeds; maximum drawdown at most 25%; net P&L positive in at least two of the three calendar years.
+- The run with default limits (10% drawdown halt) is reported alongside but does not decide.
+- A fail means the 2024-2026 result was selection luck. A pass means the rule set has survived one honest test; it is then a candidate for paper trading forward, not proof of future profit.
+
+##### Result on 2021-2023 (run once, 2026-11-22): FAIL
+
+Runs 23 (halt off) and 24 (default limits), 2021-01-01 to 2023-11-30, 30 random-entry seeds.
+
+| Criterion (halt off, run 23) | Required | Result | |
+|---|---|---|---|
+| Net P&L after all costs | above 0 | -912.38 (-9.12%) | fail |
+| Profit factor | at least 1.10 | 0.91 | fail |
+| Trades | at least 150 | 329 | pass |
+| Random-entry seeds beaten | at least 24 of 30 | 19 of 30 (random median -1,151.10) | fail |
+| Maximum drawdown | at most 25% | 16.25% | pass |
+| Calendar years with positive net P&L | at least 2 of 3 | 2 (2021 +101, 2022 -1,114, 2023 +101) | pass |
+
+Fees 860.70, funding 198.58. Expectancy -0.06 R per trade (95% bootstrap interval -0.22 to 0.12). With default limits (run 24) the drawdown halt stopped trading at -606.64 (-6.07%) after 208 trades.
+
+Conclusion: the +2,467 on 2024-2026 was selection luck, as the criteria said a fail would mean. Across all six years the 1-hour breakout rule set is roughly flat before its drawdowns (+2,467 and -912) and is not distinguishable from random entries with the same risk management. No rule set built from this brief's ingredients (price-and-volume regimes, breakout, trend, mean reversion) has shown an edge after costs. All data from 2021 to 2026-11-21 has now been examined; the only clean test left for any further idea is paper trading forward.
+
 ### 4. Sensitivity
 
 ```bash
