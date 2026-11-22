@@ -1,8 +1,9 @@
 """Self-contained HTML report (inline CSS, no JavaScript, no external requests), CSVs and PNGs.
 
 The report is built to avoid flattering the strategy: costs are shown, the strategy sits beside
-buy-and-hold and random entry, the result without its best 5% of trades is shown, and a risk
-warning comes first.
+buy-and-hold and random entry (daily trend: time-shifted weights), the result without its best 5%
+of trades is shown, and a risk warning comes first. A daily-trend run has no stop, target, R or
+regime: those metrics show "n/a", never zeros.
 """
 
 import base64
@@ -122,11 +123,12 @@ def _equity_chart(result: BacktestResult, baselines: Baselines, path: Path) -> s
     ):
         full = baselines.buy_and_hold_full
         ax.plot(full.index, full.to_numpy(), label="buy and hold (full period)", linestyle=":")
-    for i, rnd in enumerate(baselines.random_entry):
+    label = "time-shifted (each seed)" if baselines.time_shift else "random entry (each seed)"
+    for i, rnd in enumerate(baselines.random_entry or baselines.time_shift):
         ax.plot(
             rnd.equity.index,
             rnd.equity.to_numpy(),
-            label="random entry (each seed)" if i == 0 else None,
+            label=label if i == 0 else None,
             color="gray",
             alpha=0.5,
             linewidth=0.8,
@@ -220,10 +222,11 @@ def _median_metrics(all_metrics: Sequence[Metrics]) -> Metrics:
     return Metrics(**values)  # type: ignore[arg-type]  # n_trades was rounded to an int above
 
 
-def _random_column(baselines: Baselines) -> dict[str, str]:
-    if not baselines.random_entry:
+def _runs_column(runs: Sequence[BacktestResult]) -> dict[str, str]:
+    """Median metrics of baseline runs (random entry or time shift), net P&L with its range."""
+    if not runs:
         return {}
-    metrics = [_active_metrics(r)[0] for r in baselines.random_entry]
+    metrics = [_active_metrics(r)[0] for r in runs]
     col = _metric_column(_median_metrics(metrics))
     pnls = [m.net_pnl for m in metrics]
     col["Net P&L"] = f"{_money(median_or_nan(pnls))} ({_money(min(pnls))} to {_money(max(pnls))})"
@@ -243,8 +246,10 @@ def _halt_sentence(result: BacktestResult, halt: RiskEvent | None) -> str:
     )
 
 
-def _ci_text(ci: tuple[float, float]) -> str:
+def _ci_text(ci: tuple[float, float], has_r: bool) -> str:
     lo, hi = ci
+    if not has_r:
+        return "n/a (no stop: R is not defined)"
     if math.isnan(lo):
         return f"n/a (under {BOOTSTRAP_MIN_TRADES} trades)"
     return f"{_ratio(lo)} to {_ratio(hi)}"
@@ -257,26 +262,30 @@ def _headline(
     ci: tuple[float, float],
     period_end: str,
     paper: bool,
+    has_r: bool,
 ) -> str:
     initial = result.cfg.backtest.initial_equity
     strategy_col = {}
     for label, value in _metric_column(strategy).items():
         strategy_col[label] = value
         if label == "Expectancy (R per trade)":
-            strategy_col[CI_LABEL] = _ci_text(ci)
+            strategy_col[CI_LABEL] = _ci_text(ci, has_r)
+    trend = result.cfg.strategies.daily_trend.enabled
+    runs = baselines.time_shift if trend else baselines.random_entry
     cols = [
         strategy_col,
         _bh_column(baselines.buy_and_hold, initial),
-        {} if paper else _random_column(baselines),
+        {} if paper else _runs_column(runs),
     ]
     missing = ["n/a", "n/a", "n/a: backtest only" if paper else "n/a"]
     rows = [
         [label, *(c.get(label, na) for c, na in zip(cols, missing, strict=True))]
         for label in strategy_col
     ]
-    out = _table(
-        ["Metric", "Strategy", "Buy and hold", "Random entry (median of seeds, range)"], rows
+    third = (
+        "Time-shifted (median of runs, range)" if trend else "Random entry (median of seeds, range)"
     )
+    out = _table(["Metric", "Strategy", "Buy and hold", third], rows)
     full = baselines.buy_and_hold_full
     if full is not None and full is not baselines.buy_and_hold:
         c = _bh_column(full, initial)
@@ -355,6 +364,45 @@ def _random_html(result: BacktestResult, baselines: Baselines, paper: bool) -> s
         )
         + note
     )
+
+
+def _time_shift_html(result: BacktestResult, baselines: Baselines, paper: bool) -> str:
+    """Daily trend's baseline: how many time-shifted runs the strategy beat on net P&L and on
+    Sharpe, each over its active period, and one row per run."""
+    if paper:
+        return (
+            "<p>Time-shift baseline: n/a: backtest only. It reruns the engine over stored history; "
+            "a paper run is compared with buy and hold over its own period.</p>"
+        )
+    runs = baselines.time_shift
+    if not runs:
+        return "<p>Time-shift baseline not computed (n/a).</p>"
+    ref = _active_metrics(result)[0]
+    shifted = [_active_metrics(r)[0] for r in runs]
+    beaten = sum(m.net_pnl < ref.net_pnl for m in shifted)
+    sharpe = sum(m.sharpe < ref.sharpe for m in shifted)  # NaN compares False: not beaten
+    head = (
+        f"<p><strong>Strategy beat {beaten} of {len(runs)} time-shifted runs</strong> on net "
+        f"P&amp;L, and {sharpe} of {len(runs)} on Sharpe.</p>"
+    )
+    rows = [["Strategy (reference)", _count(ref.n_trades), _money(ref.net_pnl),
+             _ratio(ref.sharpe), *_period(result),
+             "yes" if first_permanent_halt(result.log.risk_events) else "no"]]  # fmt: skip
+    for seed, run, m in zip(baselines.time_shift_seeds, runs, shifted, strict=True):
+        halt = first_permanent_halt(run.log.risk_events)
+        rows.append([f"Shift seed {seed}", _count(m.n_trades), _money(m.net_pnl),
+                     _ratio(m.sharpe), *_period(run), "yes" if halt else "no"])  # fmt: skip
+    note = (
+        "<p>Daily trend has no entries to randomise, so its baseline reruns the same engine, "
+        "costs and risk limits with each symbol's daily target-weight series circularly "
+        "shifted by its own random offset (seeded, at least 30 decisions from either end, a "
+        "quarter of the period if it is shorter). That keeps each symbol's turnover and "
+        "long/short mix and destroys the timing: if the strategy does not clearly beat these "
+        "runs, its timing carries no information. Each run covers the strategy's active "
+        f"period. Seeds used: {', '.join(str(x) for x in baselines.time_shift_seeds)}.</p>"
+    )
+    headers = ["Run", "Trades", "Net P&L", "Sharpe", "Period end (UTC)", "Decision bars"]
+    return head + _table([*headers, "Permanent halt"], rows) + note
 
 
 def _min_rr(cfg: AppConfig) -> dict[str, float]:
@@ -518,9 +566,11 @@ def write_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = result.cfg
     paper = execution is not None
+    trend = cfg.strategies.daily_trend.enabled
     metrics, halt = _active_metrics(result)
     active_trades, _, _ = active_period(result.trades, result.equity, result.log.risk_events)
     ci = expectancy_ci([t.r_multiple for t in active_trades])
+    has_r = any(math.isfinite(t.r_multiple) for t in active_trades) or not active_trades
     if paper:
         last = result.equity.index[-1] if len(result.equity) else result.start
         period_end = last.isoformat()
@@ -567,18 +617,27 @@ def write_report(
             "<p>This is a paper-trading run: live market data, simulated fills (no order was "
             "sent). Every number is net of all modelled fees (taker and maker), spread, slippage "
             "and funding. Buy and hold covers the same period and ignores funding and volume "
-            "impact; random entry is a backtest-only baseline. A paper run shows whether the "
+            f"impact; {'time shift' if trend else 'random entry'} is a backtest-only baseline. "
+            "A paper run shows whether the "
             "system trades as its backtest would, on a short sample; it is not evidence of an "
             "edge.</p>"
         )
     else:
         period = f"Backtest period: {result.start.isoformat()} to {period_end} (UTC)"
+        column = "time-shifted" if trend else "random-entry"
         honesty = (
             "<p>This is one in-sample backtest on past data. Every number is net of all modelled "
             "fees (taker and maker), spread, slippage and funding. Buy and hold ignores funding "
-            "and volume impact. The random-entry column summarises a few seeds, which is still a "
+            f"and volume impact. The {column} column summarises a few seeds, which is still a "
             "small sample. If the strategy does not clearly beat both columns after costs, there "
             "is no evidence of an edge.</p>"
+        )
+    if trend:
+        honesty += (
+            "<p>Daily trend following holds a target position per symbol and rebalances at "
+            "each daily close: a trade runs from flat to flat (or to a flip), its partial "
+            "rebalances are fills of that trade. It has no stop, target or regime, so the R, "
+            "stop and target metrics are n/a.</p>"
         )
     info = (
         f"<p>Config hash: <code>{html.escape(config_hash(cfg))}</code><br>"
@@ -590,18 +649,24 @@ def write_report(
         f"{_halt_sentence(result, halt)}"
         f"{honesty}"
     )
-    headline = _headline(result, baselines, metrics, ci, period_end, paper)
+    headline = _headline(result, baselines, metrics, ci, period_end, paper, has_r)
+    if trend:
+        baseline = _section("Time-shift baseline", _time_shift_html(result, baselines, paper))
+        regimes = "<p>n/a: daily_trend uses no regimes (its trades have none).</p>"
+    else:
+        baseline = _section("Random-entry baseline", _random_html(result, baselines, paper))
+        regimes = _breakdown_html(result, "regime")
     parts = [
         warning,
         _section("Run", info),
         _section("Headline metrics", _halt_sentence(result, halt) + headline),
-        _section("Random-entry baseline", _random_html(result, baselines, paper)),
+        baseline,
         _section(
             "Equity and drawdown",
             f'<img alt="equity curve" src="data:image/png;base64,{equity_png}">'
             f'<img alt="drawdown" src="data:image/png;base64,{drawdown_png}">',
         ),
-        _section("Breakdown by regime", _breakdown_html(result, "regime")),
+        _section("Breakdown by regime", regimes),
         _section("Breakdown by symbol", _breakdown_html(result, "symbol")),
         _section("Breakdown by strategy", _breakdown_html(result, "strategy")),
         _section("Breakdown by side", _breakdown_html(result, "side")),

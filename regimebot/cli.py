@@ -1,6 +1,7 @@
 """Command-line entry point."""
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict
@@ -20,7 +21,7 @@ from regimebot.backtest.baselines import Baselines, compute_baselines
 from regimebot.backtest.robustness import cost_stress, leverage_compare, sensitivity
 from regimebot.backtest.runner import BacktestResult, load_result, persist_result, run_backtest
 from regimebot.backtest.walk_forward import walk_forward
-from regimebot.config import AppConfig, load_config, timeframe_minutes
+from regimebot.config import AppConfig, decision_warmup_bars, load_config, timeframe_minutes
 from regimebot.data.exchange import CcxtExchange
 from regimebot.data.history import download_candles, download_funding
 from regimebot.data.resample import resample
@@ -33,7 +34,7 @@ from regimebot.data.validate import (
 from regimebot.db import repo
 from regimebot.db.session import make_engine, session_scope, upgrade_to_head
 from regimebot.logging import configure_logging
-from regimebot.market_state.features import compute_features, warmup_bars
+from regimebot.market_state.features import compute_features
 from regimebot.market_state.regime import classify_frame
 from regimebot.market_state.study import regime_study
 from regimebot.paper.session import EXCHANGE_MAX_RETRIES, EXCHANGE_TIMEOUT_MS, PaperSession
@@ -49,7 +50,12 @@ from regimebot.reporting.report import write_report
 from regimebot.risk.manager import DEFAULT_KILL_FILE
 from regimebot.types import Mode
 
-app = typer.Typer(help="Regime-aware crypto trading research system.", no_args_is_help=True)
+app = typer.Typer(
+    help="Regime-aware crypto trading research system. Every command reads config/default.yaml, "
+    "or the config file named by the REGIMEBOT_CONFIG environment variable (for daily trend "
+    "following: REGIMEBOT_CONFIG=config/trend.yaml regimebot ...).",
+    no_args_is_help=True,
+)
 
 db_app = typer.Typer(help="Database commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
@@ -103,9 +109,10 @@ MAX_GAPS_SHOWN = 10
 
 def history_start(cfg: AppConfig) -> datetime:
     """Where stored history must begin so that decisions from ``backtest.start`` see warm
-    features: ``warmup_bars`` decision bars earlier, rounded up to whole days, plus one day."""
+    features: ``decision_warmup_bars`` decision bars earlier, rounded up to whole days, plus one
+    day."""
     width = timedelta(minutes=timeframe_minutes(cfg.exchange.decision_timeframe))
-    days = -(-warmup_bars(cfg.features) * width // timedelta(days=1)) + 1  # ceil, + 1
+    days = -(-decision_warmup_bars(cfg) * width // timedelta(days=1)) + 1  # ceil, + 1
     return cfg.backtest.start - timedelta(days=days)
 
 
@@ -430,7 +437,8 @@ def report(
         typer.Option(
             min=0,
             max=MAX_RANDOM_SEEDS,
-            help="Number of random-entry seeds (0, 1, ... N-1), at most 50; 0 skips. Backtests.",
+            help="Number of random-entry seeds (0, 1, ... N-1; daily trend: time-shifted runs), "
+            "at most 50; 0 skips. Backtests.",
         ),
     ] = 3,
 ) -> None:
@@ -471,7 +479,8 @@ def report(
     if paper:
         baselines = _paper_baselines(result, candles, funding)
     else:
-        typer.echo("recomputing baselines (buy and hold, random entry) ...")
+        kind = "time shift" if cfg.strategies.daily_trend.enabled else "random entry"
+        typer.echo(f"recomputing baselines (buy and hold, {kind}) ...")
         baselines = compute_baselines(
             result, candles, funding, n_signals, seeds=tuple(range(random_seeds))
         )
@@ -699,9 +708,10 @@ def paper_status(
     typer.echo(f"rejected bars: {rejected or 0}")
     typer.echo(f"open positions: {len(status.positions)}")
     for p in status.positions:
+        exits = "" if math.isnan(p.stop) else f" stop={p.stop:g} target={p.target:g}"
         typer.echo(
             f"  {p.symbol} {p.side} qty={p.qty:g} entry={p.entry_price:g} at "
-            f"{p.entry_ts.isoformat()} stop={p.stop:g} target={p.target:g} ({p.strategy})"
+            f"{p.entry_ts.isoformat()}{exits} ({p.strategy})"
         )
     typer.echo("last regime:")
     for symbol, (ts, regime) in status.last_regimes.items():

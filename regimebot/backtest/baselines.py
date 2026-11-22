@@ -1,8 +1,12 @@
-"""Baselines the strategy must beat to claim an edge: buy-and-hold and random entry.
+"""Baselines the strategy must beat to claim an edge: buy-and-hold, and random entry or (for
+daily trend) time-shifted weights.
 
-Both pay the same modelled costs as the strategy. Random entry reruns the real engine, playbook
+All pay the same modelled costs as the strategy. Random entry reruns the real engine, playbook
 and risk manager with only the entry decision randomised, so it isolates what the strategy's
-signal adds over coin flips with the same stop/target geometry and similar trade frequency.
+signal adds over coin flips with the same stop/target geometry and similar trade frequency. A
+daily-trend run has no entries to randomise: its baseline reruns the engine with each symbol's
+daily target-weight series circularly shifted by a random offset, which keeps the turnover and
+the long/short mix and destroys the timing.
 """
 
 import math
@@ -16,11 +20,13 @@ import numpy as np
 import pandas as pd
 import structlog
 
-from regimebot.backtest.runner import BacktestResult, run_backtest
+from regimebot.backtest.runner import BacktestResult, decision_features, run_backtest
 from regimebot.config import AppConfig, BreakoutConfig, CostsConfig
 from regimebot.data.resample import resample
 from regimebot.reporting.metrics import active_period
 from regimebot.strategy.base import build_signal
+from regimebot.strategy.daily_trend import NAME as DAILY_TREND
+from regimebot.strategy.daily_trend import DailyTrend
 from regimebot.types import Regime, Side, Signal
 
 log = structlog.get_logger(__name__)
@@ -32,8 +38,9 @@ class Baselines:
 
     ``buy_and_hold`` covers the strategy's active period (up to a permanent halt), and
     ``buy_and_hold_full`` the whole backtest. ``random_entry`` holds one result per seed, all run
-    with the calibrated entry probability ``random_p``. ``closes`` are the market itself: every
-    symbol's decision-bar closes (one column each) over the loaded history.
+    with the calibrated entry probability ``random_p``; a daily-trend run has ``time_shift``
+    results (one per seed in ``time_shift_seeds``) instead. ``closes`` are the market itself:
+    every symbol's decision-bar closes (one column each) over the loaded history.
     """
 
     buy_and_hold: pd.Series | None = None
@@ -43,6 +50,8 @@ class Baselines:
     random_p: float | None = None
     reference_signals: int | None = None
     closes: pd.DataFrame | None = None
+    time_shift: tuple[BacktestResult, ...] = ()
+    time_shift_seeds: tuple[int, ...] = ()
 
 
 def buy_and_hold(
@@ -159,6 +168,85 @@ def calibrate_p(
     return p1
 
 
+MIN_SHIFT = 30  # decisions: an offset is at least this far from either end (a quarter if shorter)
+
+
+class ShiftedWeights:
+    """Stub ``TargetStrategy``: target weights read from a table (decision ts x symbol; NaN or
+    a missing ts: no view, the position is held), named like daily trend."""
+
+    name = DAILY_TREND
+
+    def __init__(self, table: pd.DataFrame) -> None:
+        symbols = [str(c) for c in table.columns]
+        stamps = pd.DatetimeIndex(table.index).to_pydatetime()
+        values = table.to_numpy(dtype=float).tolist()
+        self._by_ts = {
+            ts: dict(zip(symbols, row, strict=True)) for ts, row in zip(stamps, values, strict=True)
+        }
+
+    def weights(self, ts: datetime, rows: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
+        row = self._by_ts.get(ts, {})
+        return {s: w for s, w in row.items() if s in rows and math.isfinite(w)}
+
+
+def weight_table(
+    cfg: AppConfig,
+    candles: Mapping[str, pd.DataFrame],
+    funding: Mapping[str, pd.Series],
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    """Daily trend's target weight per decision in ``[start, end)`` (rows) and symbol (columns),
+    as the engine gets it: from each symbol's decision row at that time; NaN where a symbol has
+    no weight (no bar at that time, or its windows are not full yet)."""
+    symbols = list(cfg.exchange.symbols)
+    strategy = DailyTrend(cfg.strategies.daily_trend, cfg.risk, symbols)
+    features = {s: decision_features(cfg, candles[s], funding.get(s)) for s in symbols}
+    stamps = sorted(set().union(*(f.index for f in features.values())))
+    stamps = [ts for ts in stamps if start <= ts < end]
+    frames = {s: f.reindex(stamps) for s, f in features.items()}
+    table = pd.DataFrame(np.nan, index=pd.DatetimeIndex(stamps), columns=symbols)
+    for i, ts in enumerate(stamps):
+        rows = {
+            s: {name: float(f[name].iloc[i]) for name in ("close", "signal", "vol")}
+            for s, f in frames.items()
+            if math.isfinite(f["close"].iloc[i])
+        }
+        for symbol, w in strategy.weights(ts.to_pydatetime(), rows).items():
+            table.iloc[i, symbols.index(symbol)] = w
+    return table
+
+
+def time_shift(
+    cfg: AppConfig,
+    candles: Mapping[str, pd.DataFrame],
+    funding: Mapping[str, pd.Series],
+    start: datetime,
+    end: datetime,
+    table: pd.DataFrame,
+    seed: int,
+) -> BacktestResult:
+    """Rerun the engine on ``[start, end)`` with each column of ``table`` (``weight_table``)
+    circularly shifted by its own seeded random offset, at least ``MIN_SHIFT`` decisions (a
+    quarter of them if fewer) from either end, as the prototype does. Raises ValueError under 4
+    decisions."""
+    n = len(table)
+    if n < 4:
+        raise ValueError(f"a time shift needs at least 4 decisions, got {n}")
+    rng = np.random.default_rng(seed)
+    low = min(MIN_SHIFT, n // 4)
+    shifted = pd.DataFrame(
+        {s: np.roll(table[s].to_numpy(), int(rng.integers(low, n - low))) for s in table},
+        index=table.index,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        kill = Path(tmp) / "KILL"
+        return run_backtest(
+            cfg, candles, funding, start, end, kill, strategies=[ShiftedWeights(shifted)]
+        )
+
+
 def compute_baselines(
     result: BacktestResult,
     candles: Mapping[str, pd.DataFrame],
@@ -170,7 +258,8 @@ def compute_baselines(
     run's signal count). Buy and hold is given for the active period (up to the reference's
     first permanent halt, cut as in ``active_period``) and the full period; random entry runs once
     per seed at a calibrated probability, under the same risk limits, over that same active
-    period (so frequency and window match the strategy's)."""
+    period (so frequency and window match the strategy's). A daily-trend run gets one time-shift
+    run per seed instead (``time_shift``, over the active period)."""
     cfg = result.cfg
     decision = {
         s: resample(df, cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe)
@@ -186,6 +275,13 @@ def compute_baselines(
         active = _hold_until(window, cut, cfg)
         end = cut.to_pydatetime() + timedelta(microseconds=1)  # decisions are in [start, end)
     seeds = tuple(seeds)
+    closes = pd.DataFrame({s: df["close"] for s, df in decision.items()})
+    if cfg.strategies.daily_trend.enabled:
+        table = weight_table(cfg, candles, funding, result.start, end)
+        shifts = tuple(
+            time_shift(cfg, candles, funding, result.start, end, table, s) for s in seeds
+        )
+        return Baselines(active, full, closes=closes, time_shift=shifts, time_shift_seeds=seeds)
     runs: tuple[BacktestResult, ...] = ()
     p = None
     if seeds:
@@ -200,7 +296,6 @@ def compute_baselines(
             seed=seeds[0],
         )
         runs = tuple(random_entry(cfg, candles, funding, result.start, end, s, p=p) for s in seeds)
-    closes = pd.DataFrame({s: df["close"] for s, df in decision.items()})
     return Baselines(active, full, runs, seeds, p, n_signals, closes)
 
 
