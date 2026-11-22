@@ -42,6 +42,7 @@ class ExitReason(StrEnum):
     REGIME = "regime"
     KILL = "kill"
     END_OF_DATA = "end_of_data"
+    SIGNAL = "signal"  # a target position (daily_trend) closed or flipped by its target
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,12 +106,19 @@ class Fill:
 
 @dataclass(frozen=True, slots=True)
 class Trade:
-    """One closed position."""
+    """One closed position.
+
+    A target position (daily_trend) is one trade from flat to flat (or to a flip): ``qty`` is the
+    total qty of its entry-side fills, ``entry_price`` and ``exit_price`` the quantity-weighted
+    averages of its entry-side and exit-side fills, fees and funding are summed over its life. It
+    has no stop, target or regime: ``initial_stop``, ``target`` and ``r_multiple`` are NaN (NULL
+    in the database) and ``regime`` is None.
+    """
 
     symbol: str
     strategy: str
     side: Side
-    regime: Regime
+    regime: Regime | None
     qty: float
     entry_ts: datetime
     exit_ts: datetime

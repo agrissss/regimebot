@@ -73,6 +73,13 @@ strategies:
     max_hold_bars: 48
     trail_atr_mult: null
     plausibility_mult: 1.5
+  daily_trend:                 # target positions, daily; replaces the three above (config/trend.yaml)
+    enabled: false
+    mode: long_short           # or long_flat: negative signals become 0
+    lookbacks: [20, 50, 100]   # days; signal = mean of sign(close - SMA_n)
+    vol_window: 30             # days of close-to-close returns, annualised with sqrt(365)
+    target_vol: 0.08           # weight = signal * min(max_asset_exposure, target_vol / n_symbols / vol)
+    rebalance_band: 0.01       # trade a change of at least this x equity (or a close or a flip)
 risk:
   risk_per_trade: 0.005
   max_gross_leverage: 1.5

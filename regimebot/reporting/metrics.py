@@ -44,7 +44,9 @@ class Metrics:
     (0.1 = 10%); ``avg_*_slippage_bps`` are basis points; ``expectancy_r`` is in R multiples;
     ``turnover`` and ``max_gross_leverage_seen`` (largest gross exposure / equity at a
     snapshot) are multiples of equity; ``sharpe``, ``sortino`` and ``profit_factor`` are plain
-    ratios. NaN means "not computable from this data"."""
+    ratios. NaN means "not computable from this data": ``target_hit_rate`` and ``stop_out_rate``
+    count the trades that had a target and a stop, and ``expectancy_r`` needs every trade's R, so
+    all three are NaN for target positions (daily_trend), which have none."""
 
     net_pnl: float
     return_pct: float  # fraction of initial equity
@@ -184,9 +186,10 @@ def compute_metrics(
     losers = [p for p in pnls if p < 0]
     drop = best_trades_dropped(n)
     kept = sorted(pnls, reverse=True)[drop:]
+    with_stop = [t for t in trades if math.isfinite(t.initial_stop)]
     stopped = sum(
         t.exit_reason == ExitReason.STOP or (t.exit_reason == ExitReason.TRAIL and t.net_pnl < 0)
-        for t in trades
+        for t in with_stop
     )
     net_pnl = float(sum(pnls))
     final = float(equity.iloc[-1]) if len(equity) else initial_equity + net_pnl
@@ -208,15 +211,21 @@ def compute_metrics(
         turnover=sum(t.qty * t.entry_price for t in trades) / initial_equity,
         fees=float(sum(t.fees for t in trades)),
         funding=float(sum(t.funding for t in trades)),
-        target_hit_rate=(
-            sum(t.exit_reason == ExitReason.TARGET for t in trades) / n if n else math.nan
-        ),
-        stop_out_rate=stopped / n if n else math.nan,
+        target_hit_rate=_target_hit_rate(trades),
+        stop_out_rate=stopped / len(with_stop) if with_stop else math.nan,
         net_pnl_without_best_5pct=float(sum(kept)),
         avg_entry_slippage_bps=entry_slip,
         avg_exit_slippage_bps=exit_slip,
         max_gross_leverage_seen=_max_leverage(equity, gross_exposure),
     )
+
+
+def _target_hit_rate(trades: Sequence[Trade]) -> float:
+    """Share of the trades with a target that exited there; NaN when none had one."""
+    with_target = [t for t in trades if math.isfinite(t.target)]
+    if not with_target:
+        return math.nan
+    return sum(t.exit_reason == ExitReason.TARGET for t in with_target) / len(with_target)
 
 
 def expectancy_ci(r_multiples: Sequence[float], seed: int = 0) -> tuple[float, float]:
@@ -245,18 +254,15 @@ def meets_min_rr(trade: Trade, min_rr: float) -> bool:
 
 def strategy_quality(trades: Sequence[Trade], min_rr: Mapping[str, float]) -> pd.DataFrame:
     """Per strategy: ``target_hit_rate`` (share of exits at the target; mean reversion's target
-    is not a 5% move, so one number over all strategies misleads) and ``met_min_rr`` (share of
-    trades that met the strategy's ``min_rr`` at the actual entry fill; NaN for a strategy not in
-    ``min_rr``). Indexed by strategy, sorted."""
+    is not a 5% move, so one number over all strategies misleads; NaN for daily_trend, which has
+    no target) and ``met_min_rr`` (share of trades that met the strategy's ``min_rr`` at the
+    actual entry fill; NaN for a strategy not in ``min_rr``). Indexed by strategy, sorted."""
     rows: dict[str, list[Trade]] = defaultdict(list)
     for t in trades:
         rows[t.strategy].append(t)
     out = pd.DataFrame(
         {
-            "target_hit_rate": {
-                s: float(np.mean([t.exit_reason == ExitReason.TARGET for t in ts]))
-                for s, ts in rows.items()
-            },
+            "target_hit_rate": {s: _target_hit_rate(ts) for s, ts in rows.items()},
             "met_min_rr": {
                 s: float(np.mean([meets_min_rr(t, min_rr[s]) for t in ts]))
                 if s in min_rr

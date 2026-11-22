@@ -2,11 +2,15 @@
 
 Per symbol, base candles are resampled to the decision timeframe and features are computed once
 on the full history (causal, so later rows never change earlier ones; rows before ``start`` are
-warm-up only). The runner then walks the decision timeline (the sorted union of every symbol's
-decision bars in ``[start, end)``). Between decisions T(k-1) and T(k) it replays, for each symbol
-with an open position or queued order, the base bars with ``T(k-1) < ts <= T(k)``: the first one
-fills queued orders at its open, every one is checked for stops and targets, and funding events
-in the interval are settled at their timestamps. Events of all symbols run in time order.
+warm-up only): the regime features, or daily_trend's when it is enabled. The runner then walks
+the decision timeline (the sorted union of every symbol's decision bars in ``[start, end)``).
+Between decisions T(k-1) and T(k) it replays, for each symbol with an open position or queued
+order, the base bars with ``T(k-1) < ts <= T(k)``: the first one fills queued orders at its open,
+every one is checked for stops and targets, and funding events in the interval are settled at
+their timestamps. Events of all symbols run in time order. A target strategy's positions have no
+stop or target: only their bars closing on an hour boundary are replayed (the engine marks them
+and checks the loss limits there), each followed by a fill at the next bar's open (a halt's
+exits fill there).
 """
 
 import tempfile
@@ -23,13 +27,14 @@ from regimebot.config import AppConfig, timeframe_minutes
 from regimebot.data.resample import resample
 from regimebot.data.validate import FUNDING_GAP_TOLERANCE, funding_gaps
 from regimebot.db import repo
-from regimebot.engine.loop import Engine, RunLog
+from regimebot.engine.loop import LIMIT_CHECK, Engine, RunLog
 from regimebot.engine.portfolio import Portfolio
 from regimebot.execution.fill_model import quote_from_bar_open
 from regimebot.market_state.features import compute_features, warm_rows
 from regimebot.reporting.metrics import Metrics, compute_metrics, first_permanent_halt
 from regimebot.risk.manager import RiskManager
-from regimebot.strategy import Strategy, build_strategies
+from regimebot.strategy import AnyStrategy, build_strategies
+from regimebot.strategy.daily_trend import trend_features
 from regimebot.types import Bar, ExitReason, Mode, RiskEvent, Trade
 
 WINDOW_ROWS = 400  # trailing feature rows handed to strategies at each decision
@@ -92,8 +97,11 @@ def _dt(ns: int) -> datetime:
 def decision_features(
     cfg: AppConfig, candles: pd.DataFrame, funding: pd.Series | None
 ) -> pd.DataFrame:
-    """Base ``candles`` resampled to the decision timeframe, with ``compute_features`` columns."""
+    """Base ``candles`` resampled to the decision timeframe, with ``compute_features`` columns;
+    with daily_trend enabled, its ``trend_features`` instead (the regime features are not used)."""
     decision = resample(candles, cfg.exchange.base_timeframe, cfg.exchange.decision_timeframe)
+    if cfg.strategies.daily_trend.enabled:
+        return trend_features(decision, cfg.strategies.daily_trend)
     features = compute_features(decision, cfg.features, cfg.regime.compression_pctile, funding)
     return features.copy()  # copy() consolidates the columns into one block: faster slices
 
@@ -170,15 +178,26 @@ def _replay_interval(
     engine: Engine, feeds: Mapping[str, _Feed], k: int, base_width_ns: int
 ) -> None:
     """Feed the base bars and funding events between decisions k-1 and k, in time order, for
-    every symbol that has an open position or a queued order."""
+    every symbol that has an open position or a queued order (a target strategy: only the bars
+    closing on an hour boundary, each followed by a fill at the next bar's open)."""
     events: list[tuple[int, int, int, str, int]] = []  # (ns, kind, symbol order, symbol, row)
+    hour_ns = int(LIMIT_CHECK / timedelta(microseconds=1)) * 1000
     for order, (symbol, feed) in enumerate(feeds.items()):
         if not engine.is_active(symbol):
             continue
         first, stop = int(feed.bar_end[k - 1]), int(feed.bar_end[k])
         if first < stop:  # queued orders fill at the open of the first bar
             events.append((int(feed.bar_ts[first]) - base_width_ns, _FILL, order, symbol, first))
-        events.extend((int(feed.bar_ts[i]), _BAR, order, symbol, i) for i in range(first, stop))
+        if engine.needs_minute_bars:
+            events.extend((int(feed.bar_ts[i]), _BAR, order, symbol, i) for i in range(first, stop))
+        else:
+            hours = first + np.flatnonzero(feed.bar_ts[first:stop] % hour_ns == 0)
+            for i in hours.tolist():
+                events.append((int(feed.bar_ts[i]), _BAR, order, symbol, i))
+                if i + 1 < stop:  # the last bar's next open is the next interval's first fill
+                    events.append(
+                        (int(feed.bar_ts[i + 1]) - base_width_ns, _FILL, order, symbol, i + 1)
+                    )
         funding_rows = range(int(feed.funding_end[k - 1]), int(feed.funding_end[k]))
         events.extend((int(feed.funding_ts[j]), _FUNDING, order, symbol, j) for j in funding_rows)
     events.sort()
@@ -204,7 +223,7 @@ def run_backtest(
     start: datetime,
     end: datetime,
     kill_file: Path,
-    strategies: Sequence[Strategy] | None = None,
+    strategies: Sequence[AnyStrategy] | None = None,
 ) -> BacktestResult:
     """Backtest ``cfg.exchange.symbols`` on base-timeframe ``candles`` for decisions in
     ``[start, end)``; open positions are flattened at the last decision (END_OF_DATA).
@@ -258,7 +277,7 @@ def run_metrics(
     funding: Mapping[str, pd.Series],
     start: datetime,
     end: datetime,
-    strategies: Sequence[Strategy] | None = None,
+    strategies: Sequence[AnyStrategy] | None = None,
 ) -> tuple[Metrics, BacktestResult, str]:
     """One backtest on a fresh kill file path (it does not exist, so nothing is halted): its
     metrics over the whole run, the result, and the ISO time of its first permanent halt (max
@@ -277,7 +296,9 @@ def persist_result(session: Session, result: BacktestResult, note: str = "") -> 
     run_id = repo.create_run(session, Mode.BACKTEST, result.cfg, note)
     signal_ids = repo.save_signals(session, run_id, log.signals)
     repo.save_risk_decisions(
-        session, run_id, [(signal_ids[i], ts, decision) for i, ts, decision in log.decisions]
+        session,
+        run_id,
+        [(None if i is None else signal_ids[i], ts, d) for i, ts, d in log.decisions],
     )
     repo.save_fills(session, run_id, log.fills)
     repo.save_trades(session, run_id, log.trades)

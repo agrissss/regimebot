@@ -1,11 +1,14 @@
-"""Strategy protocol and the shared trade-geometry helpers.
+"""Strategy protocols and the shared trade-geometry helpers.
 
 Strategies are pure: they read the features frame (last row = decision bar) and
 return a ``Signal`` or ``None``. Sizing and playbook permission live elsewhere.
+A ``TargetStrategy`` (daily trend) instead names a target weight per symbol.
 """
 
 import math
-from typing import Protocol
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -19,6 +22,22 @@ class Strategy(Protocol):
     name: str
 
     def generate(self, symbol: str, window: pd.DataFrame, regime: Regime) -> Signal | None: ...
+
+
+@runtime_checkable
+class TargetStrategy(Protocol):
+    """Holds a target position per symbol instead of signalling entries: at each decision, the
+    signed target weight (fraction of equity) of every symbol it has a view on, from the decision
+    rows (feature values at ``ts``). The engine trades toward it; risk caps it."""
+
+    name: str
+
+    def weights(
+        self, ts: datetime, rows: Mapping[str, Mapping[str, float]]
+    ) -> dict[str, float]: ...
+
+
+AnyStrategy = Strategy | TargetStrategy
 
 
 def all_finite(*values: float) -> bool:

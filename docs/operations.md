@@ -241,3 +241,9 @@ In backtests the spread is modelled as a constant, so the `liquidity_stress` reg
 
 - Paper trading has not yet completed a supervised 24-hour soak (see Before you start).
 - Raising `features.pctile_window` above about 2,900 in a backtest also requires raising `paper.warmup_bars`.
+
+## Running the daily trend strategy
+
+Set `REGIMEBOT_CONFIG=config/trend.yaml` for every command (backtest, report, paper, kill). After pulling this version run `regimebot db upgrade` once (migration 0003 lets trades without a stop, target or R-multiple be stored as empty rather than zero).
+
+Paper: `regimebot paper run --resume latest` fetches about 130 days of 1-minute history per coin on first start, then decides once a day just after 00:00 UTC. Between decisions it only watches the kill file and, every hour, the loss and drawdown limits. A session that was down over midnight acts at the next daily close it sees. A machine that sleeps misses decisions; keep it awake (`caffeinate -s` on macOS) or run it on an always-on host. `regimebot paper status`, `regimebot kill` and `regimebot paper end` work as for the other strategies.

@@ -10,6 +10,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 
+@pytest.fixture(autouse=True)
+def _default_config_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests load ``config/default.yaml`` (or the file they name), whatever the shell exports."""
+    monkeypatch.delenv("REGIMEBOT_CONFIG", raising=False)
+
+
 @pytest.fixture
 def database_url(tmp_path: Path) -> Iterator[str]:
     """URL of a fresh, empty database for one test.

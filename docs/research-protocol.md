@@ -148,6 +148,10 @@ Long/flat on the same coins (reported, not deciding): +227.68%, Sharpe 1.05, max
 
 Reading it honestly: by the criteria written in advance this is a fail, and it is recorded as one. What the test does show is that the timing of the rule carries information on coins it was not developed on (198 of 200, profitable at double costs, 8 of 10 coins), which none of the brief's rule sets managed. What it also shows is that the ride is rough: half the years lose and the drawdown was 47% at this sizing. Part of that drawdown is a sizing error in the prototype (the volatility target assumes uncorrelated coins, and these ten move together), but the losing years are not. This is the normal profile of trend following, and it is not compatible with a 10% drawdown limit unless positions, and returns, are cut to roughly a quarter. All daily data for these 13 coins has now been examined; the remaining clean test is paper trading forward.
 
+##### Daily trend in the engine (2026-11-22)
+
+The rule was then built into the engine as `strategies.daily_trend` (`config/trend.yaml`), with sizing changed to `target_vol / n` per coin (the prototype's `/ sqrt(n)` assumed uncorrelated coins) and `target_vol` 0.08, chosen so the historical drawdown stays under the 10% limit. Through the engine's fill model on 1-minute data, BTC, ETH and SOL, 2021-01-01 to 2026-11-21: default limits (run 26) +2,890.68 (+28.91%), max drawdown 9.22%, 440 trades, all six years positive, ahead of 30 of 30 time-shifted runs on net P&L and 29 of 30 on Sharpe; all limits off (run 25) +29.38%, max drawdown 9.15%. The prototype at the same sizing gives +32.6% and -9.35%, so the engine reproduces it; the small gap is the later start (100 daily bars from 2020-11-01), the rebalance band and the fill model. This is in-sample for these three coins. The remaining clean test is paper trading forward.
+
 ### 4. Sensitivity
 
 ```bash
