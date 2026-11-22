@@ -247,3 +247,13 @@ In backtests the spread is modelled as a constant, so the `liquidity_stress` reg
 Set `REGIMEBOT_CONFIG=config/trend.yaml` for every command (backtest, report, paper, kill). After pulling this version run `regimebot db upgrade` once (migration 0003 lets trades without a stop, target or R-multiple be stored as empty rather than zero).
 
 Paper: `regimebot paper run --resume latest` fetches about 130 days of 1-minute history per coin on first start, then decides once a day just after 00:00 UTC. Between decisions it only watches the kill file and, every hour, the loss and drawdown limits. A session that was down over midnight acts at the next daily close it sees. A machine that sleeps misses decisions; keep it awake (`caffeinate -s` on macOS) or run it on an always-on host. `regimebot paper status`, `regimebot kill` and `regimebot paper end` work as for the other strategies.
+
+### On Kraken data
+
+`config/kraken.yaml` is `config/trend.yaml` with `exchange.id: krakenfutures` and the linear perpetuals `BTC/USD:USD`, `ETH/USD:USD`, `SOL/USD:USD`. Use `REGIMEBOT_CONFIG=config/kraken.yaml` for every command. Funding on Kraken is hourly; the engine applies each stored funding event as it comes, so nothing else changes. The modelled 5 bps taker fee equals Kraken's entry-tier futures fee.
+
+History: `regimebot data download --start 2026-06-01` (about 250,000 one-minute bars per coin, a few minutes). Only data from 2026-06-01 was downloaded, so the long backtests remain on Binance data.
+
+Check made on 2026-11-22, same rule and dates (2026-10-12 to 2026-11-22) on both venues: Kraken +383.74 (+3.84%, 9 trades, fees 4.77, funding -3.78), Binance +392.23 (+3.92%, 9 trades, fees 4.55, funding -5.21). Six weeks say nothing about an edge; the point is that the two venues give nearly the same result for a once-a-day rule. Daily closes differed by about 5 bps on average, 19 bps at most.
+
+Kraken is thinner at the fill minute (00:00 to 00:01 UTC). Over 175 days the 5% participation cap was worth under 1,000 USD on 10 days for BTC, 63 for ETH and 98 for SOL, so some orders fill in part and the rest waits for the next daily decision. In the six-week check that cut turnover by about 6% (9,534 against 10,106 with a 25% cap) and changed the result by about 4 USD. The cap is left at 5%: it is the pessimistic choice. An account much larger than 10,000 would need fills spread over several minutes, which the engine does not do.
