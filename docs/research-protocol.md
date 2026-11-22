@@ -232,3 +232,21 @@ Best in-training profit factors 0.84, 0.96, 0.87 and 0.91 on 677, 647, 627 and 6
 **Artefacts.** `reports/run_5/report.html` (default limits), `reports/run_6/report.html` (halt off), `reports/walk_forward_windows.csv` and `reports/walk_forward_oos_trades.csv` (halt off, the last run), `reports/walk_forward_windows_default_limits.csv` and `reports/walk_forward_oos_trades_default_limits.csv` (copies of the default-limits run, made by hand), `reports/sensitivity.csv`, `reports/cost_stress.csv`, `reports/leverage_compare.csv`, `reports/regime_study_*.csv`. The `reports/` directory is git-ignored; the commands regenerate it. Runs 1 to 3 in the development database predate the warm-up fix and are superseded.
 
 **Conclusion.** As specified, these strategies show no edge on this data. The system's job is to say so, and it does. Possible next steps, each of which would count as new trials: a strategy that uses regime for sizing or volatility rather than direction, lower trade frequency, or different data. None of these is a promise of an edge.
+
+## Funding carry check (2026-11-22)
+
+Question: can a market-neutral funding carry (hold spot, short the same notional of the perpetual) add a stream of small, frequent gains next to the daily trend strategy? Prototype: `research/funding_carry.py`. One rule, chosen before looking and not tuned: per coin, hold the carry while the trailing 7-day funding sum is positive. Cost 21 bps of notional per entry or exit; return on capital is half the funding because half the capital is perp margin. Basis moves are ignored. Data: BTC, ETH, SOL, 2021-01-01 to 2026-11-21, already used for other work, so this is in-sample.
+
+```bash
+.venv/bin/python research/funding_carry.py BTC,ETH,SOL
+```
+
+| | Always on, no trading costs | 7-day rule, with costs | 7-day rule, 2x costs |
+|---|---|---|---|
+| Total | +25.1% | +28.10% | +19.44% |
+| Max drawdown | -6.9% | -1.03% | -3.50% |
+| 2021 / 2022 / 2023 | +17.5% / -5.3% / +2.8% | +17.6% / -0.3% / +3.0% | +16.7% / -2.1% / +2.1% |
+| 2024 / 2025 / 2026 | +6.7% / +1.8% / +0.8% | +6.1% / +0.3% / -0.3% | +5.6% / -1.3% / -1.8% |
+| Positive months | 83% of 71 | 75% of 71 | 56% of 71 |
+
+Reading: the carry is real but almost all of it was earned in 2021 and 2024. At 2025-2026 funding levels it earns about 1% a year always-on and about zero with the on/off rule after costs. It is not worth building a spot leg into the engine at these levels. It was not run on the ten other coins, because the result on the first three already answers the question. Revisit if funding stays high for weeks (as a guide, 2024 averaged about 13% a year on notional).
