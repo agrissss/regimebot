@@ -171,6 +171,8 @@ Cost-model note: the modelled 3 bps per side of spread plus slippage is pessimis
 
 Holdout (run once, 2026-11-21): 2026-01-01 to 2026-11-21 had never been used for any parameter or design choice, and it was a falling market, unlike 2024-2025. The frozen default configuration was run on it once against pass criteria written down beforehand, and it failed: with the drawdown halt off, 503 trades, net -3,983.88 (-39.84%), profit factor 0.60, max drawdown 45.04%, better than only 2 of 30 random-entry seeds (buy and hold -4,097.71); with the default limits, trading halted on 2026-03-16 at -369.37 (-3.69%). Breakout alone also lost (-344.04). This closes the question for this rule set: no edge after costs in a rising or a falling market. Details and criteria: [docs/research-protocol.md](docs/research-protocol.md#pre-registered-criteria-for-the-2026-holdout).
 
+Second attempt (2026-11-22): 16 variants were then searched on the used 2024-2026 data. The best, breakout only at a 1-hour decision timeframe, made +2,466.97 there (profit factor 1.22, ahead of 29 of 30 random seeds) and was run once on 2021-2023, never examined before, against criteria committed in advance. It failed: -912.38 (-9.12%), profit factor 0.91, ahead of only 19 of 30 random seeds. The 2024-2026 result was selection luck. Details: [docs/research-protocol.md](docs/research-protocol.md#second-rule-set-1-hour-breakout-only-search-on-2024-2026-2026-11-22).
+
 Conclusion: as specified, these strategies show no edge on this data. The regimes carry information about how much price will move, but not which way, and the strategies depend on direction. See [docs/research-protocol.md](docs/research-protocol.md) for how to read these numbers.
 
 ## Tests and linters
