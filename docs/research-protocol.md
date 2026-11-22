@@ -119,6 +119,35 @@ Fees 860.70, funding 198.58. Expectancy -0.06 R per trade (95% bootstrap interva
 
 Conclusion: the +2,467 on 2024-2026 was selection luck, as the criteria said a fail would mean. Across all six years the 1-hour breakout rule set is roughly flat before its drawdowns (+2,467 and -912) and is not distinguishable from random entries with the same risk management. No rule set built from this brief's ingredients (price-and-volume regimes, breakout, trend, mean reversion) has shown an edge after costs. All data from 2021 to 2026-11-21 has now been examined; the only clean test left for any further idea is paper trading forward.
 
+#### Third rule set: daily trend following (2026-11-22)
+
+A different kind of strategy from the brief's: one decision per coin per day, no regimes, no fixed 5% target. Prototype: `research/daily_trend.py` (vectorised, outside the engine). Rule: at each 00:00 UTC close the signal is the average of sign(close - SMA) over 20, 50 and 100 days, between -1 and 1; position size is the signal times an equal-risk volatility target (15% annualised), capped at 0.75x per coin and 1.5x gross; costs 8 bps per unit of turnover plus actual funding. The reasons to expect an edge are known ones (trend persistence in crypto is documented; costs are negligible at about 25x turnover a year), not a pattern found in this data.
+
+Development on BTC, ETH and SOL, 2021-01-01 to 2026-11-21 (data already examined): 24 single-lookback variants (SMA, momentum, Donchian; long/flat, long/short, funding filter) were all profitable, Sharpe 0.2 to 1.1. The combined long/short rule above: +129.90%, Sharpe 0.79, max drawdown -28.54%, positive every year (2021 +27.4%, 2022 +2.2%, 2023 +11.6%, 2024 +6.0%, 2025 +4.5%, 2026 +42.8%), Sharpe above 197 of 200 runs with randomly time-shifted positions. Long/flat: +119.74%, Sharpe 1.03, max drawdown -22.28%, one losing year (2022, -13.8%). Buy and hold: +894% with an 85% drawdown.
+
+##### Pre-registered criteria for ten other coins (written before their data was fetched, 2026-11-22)
+
+- Universe, fixed here: BNB, XRP, DOGE, ADA, AVAX, LINK, LTC, DOT, BCH, TRX (Binance USDT perpetuals listed before 2021; none ever downloaded in this project). Same script, same parameters, long/short, 2021-01-01 to 2026-11-21. One run.
+- Pass only if ALL hold: total return above 0; Sharpe at least 0.40; positive in at least 4 of the 6 calendar years; max drawdown no worse than -40%; at least 6 of the 10 coins contribute positively; Sharpe above at least 190 of 200 time-shifted runs; total return still above 0 with costs doubled.
+- Long/flat is reported alongside but does not decide.
+- Limits of this test, stated in advance: these coins move with BTC, so this is a test that the rule is not fitted to three price series, not a fully independent sample; it is a daily-close simulation, not the engine; a pass makes the rule a candidate to build into the engine and paper trade, nothing more.
+
+##### Result on the ten other coins (run once, 2026-11-22): FAIL on two of seven criteria
+
+| Criterion (long/short) | Required | Result | |
+|---|---|---|---|
+| Total return | above 0 | +112.22% | pass |
+| Sharpe | at least 0.40 | 0.56 | pass |
+| Positive calendar years | at least 4 of 6 | 3 of 6 (2021 +64.4%, 2022 -11.3%, 2023 -3.5%, 2024 +43.4%, 2025 -21.4%, 2026 +33.8%) | fail |
+| Max drawdown | no worse than -40% | -46.86% | fail |
+| Coins contributing positively | at least 6 of 10 | 8 of 10 | pass |
+| Sharpe above time-shifted runs | at least 190 of 200 | 198 of 200 | pass |
+| Total return with costs doubled | above 0 | +70.01% | pass |
+
+Long/flat on the same coins (reported, not deciding): +227.68%, Sharpe 1.05, max drawdown -28.20%, positive in 4 of 6 years. Buy and hold: +438% with a 79% drawdown.
+
+Reading it honestly: by the criteria written in advance this is a fail, and it is recorded as one. What the test does show is that the timing of the rule carries information on coins it was not developed on (198 of 200, profitable at double costs, 8 of 10 coins), which none of the brief's rule sets managed. What it also shows is that the ride is rough: half the years lose and the drawdown was 47% at this sizing. Part of that drawdown is a sizing error in the prototype (the volatility target assumes uncorrelated coins, and these ten move together), but the losing years are not. This is the normal profile of trend following, and it is not compatible with a 10% drawdown limit unless positions, and returns, are cut to roughly a quarter. All daily data for these 13 coins has now been examined; the remaining clean test is paper trading forward.
+
 ### 4. Sensitivity
 
 ```bash

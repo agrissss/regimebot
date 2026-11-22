@@ -173,6 +173,8 @@ Holdout (run once, 2026-11-21): 2026-01-01 to 2026-11-21 had never been used for
 
 Second attempt (2026-11-22): 16 variants were then searched on the used 2024-2026 data. The best, breakout only at a 1-hour decision timeframe, made +2,466.97 there (profit factor 1.22, ahead of 29 of 30 random seeds) and was run once on 2021-2023, never examined before, against criteria committed in advance. It failed: -912.38 (-9.12%), profit factor 0.91, ahead of only 19 of 30 random seeds. The 2024-2026 result was selection luck. Details: [docs/research-protocol.md](docs/research-protocol.md#second-rule-set-1-hour-breakout-only-search-on-2024-2026-2026-11-22).
 
+Third attempt (2026-11-22): a different strategy, daily trend following (`research/daily_trend.py`, a prototype outside the engine). On BTC, ETH and SOL over 2021-2026 it made +129.90% (Sharpe 0.79, max drawdown -28.54%). Run once on ten other coins against criteria committed in advance, it made +112.22% (Sharpe 0.56, better timed than 198 of 200 randomised runs, still positive at double costs) but failed two of the seven criteria: only 3 of 6 years were profitable and the drawdown reached -46.86%. Recorded as a fail; it is the only rule set here whose timing held up on unseen coins, and it is not yet built into the engine or paper traded. Details: [docs/research-protocol.md](docs/research-protocol.md#third-rule-set-daily-trend-following-2026-11-22).
+
 Conclusion: as specified, these strategies show no edge on this data. The regimes carry information about how much price will move, but not which way, and the strategies depend on direction. See [docs/research-protocol.md](docs/research-protocol.md) for how to read these numbers.
 
 ## Tests and linters
