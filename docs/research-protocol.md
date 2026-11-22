@@ -250,3 +250,18 @@ Question: can a market-neutral funding carry (hold spot, short the same notional
 | Positive months | 83% of 71 | 75% of 71 | 56% of 71 |
 
 Reading: the carry is real but almost all of it was earned in 2021 and 2024. At 2025-2026 funding levels it earns about 1% a year always-on and about zero with the on/off rule after costs. It is not worth building a spot leg into the engine at these levels. It was not run on the ten other coins, because the result on the first three already answers the question. Revisit if funding stays high for weeks (as a guide, 2024 averaged about 13% a year on notional).
+
+## 4-hour trend check (2026-11-22)
+
+Question: does the daily trend rule work on 4-hour bars, to give results on a shorter horizon? Prototype: `research/trend_4h.py` (same rule, lookbacks of 20, 50 and 100 four-hour bars, volatility from 30 days of 4-hour returns, same sizing and 8 bps cost as `research/daily_trend.py`). Data: BTC, ETH, SOL, 2021-01-01 to 2026-11-21, in-sample. Four runs were made in total: three rebalance bands, and one at doubled costs.
+
+| Band | Total | Sharpe | Max drawdown | Years positive | Positive weeks | Turnover a year |
+|---|---|---|---|---|---|---|
+| 0.01 | +86.39% | 0.62 | -21.90% | 5 of 6 (2025: -15.5%) | 44% | 146x equity |
+| 0.03 | +79.51% | 0.59 | -22.07% | 5 of 6 | 44% | 145x |
+| 0.05 | +97.06% | 0.67 | -21.94% | 5 of 6 | 45% | 140x |
+| 0.03, 2x costs | -7.13% | 0.04 | -38.67% | 5 of 6 (2025: -26.2%) | n/a | 145x |
+
+The timing test put the 0.01 run above 199 of 200 time-shifted runs, so the signal is real before costs. But the rule turns the book over about 145 times a year and pays about 11.6% of equity a year in costs; at doubled costs the whole result is gone. The daily rule on the same coins made +129.90% (Sharpe 0.79) and stayed profitable at doubled costs on the ten other coins. The 4-hour version is also no more regular: 44% of weeks and 48% of months are positive.
+
+Decision: rejected on cost fragility, without spending fresh coins on a confirmation run. A wider band does not help because the turnover comes from sign flips, not from small resizing.
