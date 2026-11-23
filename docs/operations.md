@@ -257,3 +257,39 @@ History: `regimebot data download --start 2026-06-01` (about 250,000 one-minute 
 Check made on 2026-11-22, same rule and dates (2026-10-12 to 2026-11-22) on both venues: Kraken +383.74 (+3.84%, 9 trades, fees 4.77, funding -3.78), Binance +392.23 (+3.92%, 9 trades, fees 4.55, funding -5.21). Six weeks say nothing about an edge; the point is that the two venues give nearly the same result for a once-a-day rule. Daily closes differed by about 5 bps on average, 19 bps at most.
 
 Kraken is thinner at the fill minute (00:00 to 00:01 UTC). Over 175 days the 5% participation cap was worth under 1,000 USD on 10 days for BTC, 63 for ETH and 98 for SOL, so some orders fill in part and the rest waits for the next daily decision. In the six-week check that cut turnover by about 6% (9,534 against 10,106 with a 25% cap) and changed the result by about 4 USD. The cap is left at 5%: it is the pessimistic choice. An account much larger than 10,000 would need fills spread over several minutes, which the engine does not do.
+
+## Parallel paper sessions
+
+Four rule sets paper-trade side by side on Kraken Futures public data so they can be compared. Each config has its own SQLite database (one file per session, because two sessions writing one SQLite file fail with "database is locked") and its own log. Each starts from 10,000 with the default risk limits.
+
+| Config | Rule set | Database | Log | Run id |
+|---|---|---|---|---|
+| `config/kraken.yaml` | daily trend, long/short | `data/regimebot.db` | `data/paper_kraken.log` | 31 |
+| `config/kraken_trend_longflat.yaml` | daily trend, long/flat | `data/paper_kraken_trend_longflat.db` | `data/paper_kraken_trend_longflat.log` | 1002 |
+| `config/kraken_playbook_15m.yaml` | the original 15-minute playbook (mean reversion, trend, breakout) | `data/paper_kraken_playbook_15m.db` | `data/paper_kraken_playbook_15m.log` | 2002 |
+| `config/kraken_breakout_1h.yaml` | breakout only, 1-hour decisions (`features.pctile_window` 720) | `data/paper_kraken_breakout_1h.db` | `data/paper_kraken_breakout_1h.log` | 3002 |
+
+**Warning.** The playbook and the 1-hour breakout rule sets LOST money in backtests: the playbook lost 45% over 2024-2025 (drawdown halt off), and the 1-hour breakout failed its pre-registered 2021-2023 confirmation test (-9.12%). They run on paper for comparison only. One night or one week of results says nothing about an edge, for any of the four.
+
+```bash
+scripts/paper_all.sh start    # start each session that is not running; safe to re-run
+scripts/paper_all.sh status   # paper status for each, with its process id; exits 1 if one is hung
+```
+
+`start` launches each missing session like a single one: `REGIMEBOT_CONFIG=config/<name>.yaml nohup caffeinate -i .venv/bin/regimebot paper run --resume latest >> data/paper_<name>.log 2>&1 &`. It recognises a running session by the `REGIMEBOT_CONFIG` value in the process environment, so start sessions with the script or with exactly that value. Set the same `REGIMEBOT_CONFIG` for every other command about a session (`paper status`, `paper end`, `report`). A backtest with one of these configs writes to that session's database, so run it while the session is stopped.
+
+Two things are shared by every session, whatever the config, because the paper code keys them to the repository rather than to the database:
+
+- **The kill file.** `regimebot kill` creates `<repo>/data/KILL`, which halts and flattens every running session, run 31 included; each halted run then needs its own `regimebot paper clear-halt RUN_ID` under its own config. To stop one session, send it SIGTERM instead: `kill <pid>`, with the pid from `scripts/paper_all.sh status`. It stops cleanly and `start` resumes it.
+- **The run locks.** A run's lock is `data/paper_run_<id>.lock` and run ids are numbered per database, so two running sessions with the same run id block each other (the second refuses to start, "already running"). Each new database therefore holds one placeholder row in `runs` (mode `reserved`, ids 1000, 2000 and 3000), and its runs are numbered after it.
+
+Adding another session: copy a config, give it its own `database_url`, add its name to `CONFIGS` in `scripts/paper_all.sh`, then once:
+
+```bash
+export REGIMEBOT_CONFIG=config/<name>.yaml
+.venv/bin/regimebot db upgrade
+sqlite3 data/paper_<name>.db "INSERT INTO runs (id, mode, config_hash, config_json, git_sha, started_at, ended_at, note) VALUES (4000, 'reserved', '', '{}', '', datetime('now'), datetime('now'), 'run id offset: paper run locks are shared across databases')"
+.venv/bin/regimebot data download --start 2026-06-01 --end "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"   # optional
+```
+
+The download is optional (the session fetches its own warm-up on first start) but is needed for a backtest.
