@@ -1,7 +1,8 @@
 """Daily trend target orders that keep working (``strategies.daily_trend.fill_minutes``): the
 unfilled rest fills at each later base bar's open, every slice capped by ``max_participation`` of
 its bar and priced like the first fill, until the target is reached or the window ends; a halt,
-the kill file, a new decision and ``risk.min_notional`` end it; backtest and paper do the same;
+the kill file, a new decision and ``risk.min_notional`` end it; backtest and paper run the same
+engine (paper sizing each slice from the last closed bar, one bar behind the backtest);
 ``fill_minutes`` 1 (the default) is the previous single fill.
 
 Engine tests: ``config/trend.yaml`` on BTC, zero costs unless a test says otherwise, 10 000
@@ -18,7 +19,7 @@ import pandas as pd
 import pytest
 from fakes import Clock, ReplayExchange
 from pydantic import ValidationError
-from synth import BTC, MINUTE, candles_from_closes
+from synth import BTC, ETH, MINUTE, candles_from_closes
 from test_daily_trend_engine import D1, D2, D3, FREE, Fixed, approx, decide, decisions, trend_cfg
 from test_daily_trend_paper import LAG, START, market, unlag
 from test_daily_trend_paper import cfg as paper_cfg
@@ -202,6 +203,26 @@ def test_a_new_decision_replaces_a_working_order(tmp_path: Path) -> None:
     assert e.portfolio.signed_qty(BTC) == 30.0 and not e.has_queued_order(BTC)
 
 
+def test_a_flip_closes_in_full_then_its_opening_leg_works_as_capped_adds(tmp_path: Path) -> None:
+    e = engine(tmp_path, 30, {D1: {BTC: 0.5}, D2: {BTC: -0.3}})
+    decide(e, D1, 100.0)
+    offer(e, D1, 1e9)  # long 50
+    decide(e, D2, 100.0)  # target -30: one order of 80 through zero
+    for k, volume in enumerate([200.0, 200.0, 400.0, 1e9]):
+        offer(e, D2 + k * MINUTE, volume)
+    # the closing 50 in full plus an opening 5% of 200 = 10; then adds of 10 and the 10 left (a
+    # 20 cap); nothing past the target
+    sells = [(f.ts, f.side, f.qty) for f in e.log.fills[1:]]
+    assert sells == [
+        (D2, OrderSide.SELL, 60.0),
+        (D2 + MINUTE, OrderSide.SELL, 10.0),
+        (D2 + 2 * MINUTE, OrderSide.SELL, 10.0),
+    ]
+    assert e.portfolio.signed_qty(BTC) == -30.0 and not e.has_queued_order(BTC)
+    assert len(e.log.trades) == 1 and e.log.trades[0].qty == 50.0  # the long, closed by the flip
+    assert decisions(e) == [(D1, "ok", 50.0), (D2, "ok", 80.0)]
+
+
 def test_a_dust_rest_under_min_notional_ends_the_working_order(tmp_path: Path) -> None:
     e = engine(tmp_path, 30)
     decide(e, D1, 100.0)
@@ -275,17 +296,21 @@ def thin_cfg() -> AppConfig:
     )
 
 
-def thin_market() -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
+def thin_market(varying: bool = False) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
     """``test_daily_trend_paper``'s market with 20 a bar: 5% is 1 BTC or ETH, so most orders
-    need many slices and many end with their window."""
+    need many slices and many end with their window. ``varying``: 10 and 30 a bar in turn."""
     candles, funding = market()
-    return {s: df.assign(volume=20.0) for s, df in candles.items()}, funding
+    volume = (lambda n: np.where(np.arange(n) % 2 == 0, 10.0, 30.0)) if varying else None
+    return {
+        s: df.assign(volume=20.0 if volume is None else volume(len(df)))
+        for s, df in candles.items()
+    }, funding
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, now: datetime) -> None:
+    def __init__(self, tmp_path: Path, now: datetime, varying: bool = False) -> None:
         self.cfg = thin_cfg()
-        candles, funding = thin_market()
+        candles, funding = thin_market(varying)
         self.clock = Clock(now)
         self.exchange = ReplayExchange(candles, funding, self.cfg.costs, self.clock)
         self.db = make_engine(f"sqlite:///{tmp_path / 'paper.db'}")
@@ -322,7 +347,9 @@ def unlagged(log: RunLog, end: datetime) -> dict[str, object]:
     }
 
 
-def test_paper_works_an_order_over_the_minutes_exactly_like_the_backtest(tmp_path: Path) -> None:
+def test_at_constant_volume_paper_works_an_order_like_the_backtest(tmp_path: Path) -> None:
+    """Constant bar volume: paper reproduces the backtest row for row (live fills LAG later).
+    With varying volume it does not, by one bar (next test)."""
     rig = Rig(tmp_path, START + LAG)
     session = rig.session()
     session.start()
@@ -336,6 +363,30 @@ def test_paper_works_an_order_over_the_minutes_exactly_like_the_backtest(tmp_pat
     first = [f for f in ref.fills if START <= f.ts < START + timedelta(days=1)]
     assert len(first) == 2 * FILL_MINUTES  # BTC and ETH, a slice at each minute of the window
     assert sum(d.rule == "no_liquidity" for _, _, d in ref.decisions) >= 5
+
+
+def test_paper_sizes_each_slice_one_bar_behind_the_backtest(tmp_path: Path) -> None:
+    """The known offset (ADR 0004, ADR 0006): slice k fills at the bar opening at START + k
+    minutes in both, priced alike; the backtest caps it at 5% of that bar's volume, paper at 5% of
+    the last closed bar's, the one that closed at START + k minutes."""
+    rig = Rig(tmp_path, START + LAG, varying=True)
+    session = rig.session()
+    session.start()
+    rig.poll(session, START, range(FILL_MINUTES + 2))
+    candles, funding = thin_market(varying=True)
+    day = START + timedelta(days=1)
+    ref = run_backtest(thin_cfg(), candles, funding, START, day + MINUTE, tmp_path / "BT").log
+    for symbol in (BTC, ETH):
+        volume = candles[symbol]["volume"]
+        paper = [(unlag(f.ts), f.qty, f.bid) for f in session.log.fills if f.symbol == symbol]
+        back = [(f.ts, f.qty, f.bid) for f in ref.fills if f.symbol == symbol and f.ts < day]
+        bars = [START + k * MINUTE for k in range(FILL_MINUTES)]
+        assert [ts for ts, _, _ in paper] == [ts for ts, _, _ in back] == bars
+        assert [bid for *_, bid in paper] == [bid for *_, bid in back]  # the same quotes
+        assert [q for _, q, _ in paper] == [approx(0.05 * volume[ts]) for ts in bars]
+        assert [q for _, q, _ in back] == [approx(0.05 * volume[ts + MINUTE]) for ts in bars]
+        assert {round(q, 9) for _, q, _ in paper + back} == {0.5, 1.5}  # 5% of 10 and of 30
+        assert all(p != b for (_, p, _), (_, b, _) in zip(paper, back, strict=True))
 
 
 def test_a_restart_mid_fill_drops_the_working_order_without_filling_twice(

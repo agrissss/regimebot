@@ -284,7 +284,7 @@ Method: the engine (`run_backtest`, 1-minute fills, default costs and risk limit
 Read with:
 
 - `kraken_hold` hit the 10% drawdown limit on 2022-05-09 and, that halt being permanent, stayed flat for the rest of the run: its 0% years are the halt, not the market, and the row says little about buying and holding. Its paper session will stop trading the same way once it is 10% below its peak.
-- Warm-up: the Binance history starts on 2020-11-01, so a rule trades only from its first fully warm decision: `kraken_trend_fast` 2020-12-30, `kraken_hold` 2020-12-31, SMA and Donchian 20/50/100 2021-02-09, momentum 2021-02-10, `kraken_trend_slow` 2021-05-20.
+- Warm-up: each run loads history before 2021-01-01 to fill its windows, but the stored Binance history only reaches back to 2020-11-01. `kraken_trend_fast` (warm from 2020-12-30) and `kraken_hold` (from 2020-12-31) are therefore warm at the first decision on 2021-01-01 and trade from it; the 100- and 200-day rules trade only from their first fully warm decision: SMA and Donchian 20/50/100 2021-02-09, momentum 2021-02-10, `kraken_trend_slow` 2021-05-20.
 - Every run had one-day `daily_loss` halts: 4 to 6 for the five trend rules; `kraken_hold` 3, then a `weekly_loss` halt and the permanent one.
 - `fill_minutes: 30` changes nothing here: on Binance at 10,000 the 5% cap never bound, and the `kraken_trend_ls_fill` row reproduces the `fill_minutes` 1 run (run 26's numbers) log row for log row.
 

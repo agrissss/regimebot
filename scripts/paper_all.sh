@@ -54,10 +54,15 @@ start() {
 status() {
   rc=0
   for name in $CONFIGS; do
-    if pid=$(running "$name"); then proc="pid $pid"; else proc="no process"; fi
+    if pid=$(running "$name"); then proc="pid $pid"; else pid=""; proc="no process"; fi
     echo "== $name (config/$name.yaml, $proc)"
     if ! ready "$name"; then
-      echo "database not set up yet: no session"
+      if [ -n "$pid" ]; then
+        echo "session running, but its database fails the set-up check (no runs table or no rows)"
+        rc=1
+      else
+        echo "database not set up yet: no session"
+      fi
       echo
       continue
     fi

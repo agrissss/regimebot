@@ -89,7 +89,9 @@ class PaperSession:
     symbol at this decision: a queued entry then expires at the next decision (the engine's
     rule), a queued exit is retried on every poll until it fills. A target order that keeps
     working (``strategies.daily_trend.fill_minutes``) is offered a fill again at the first poll of
-    each newer bar, at a fresh quote with that bar's volume, until the engine ends it. The kill
+    each newer bar, at a fresh quote, until the engine ends it. Every slice, like the first fill,
+    is sized from the last closed bar's volume: one bar behind the backtest, which uses the volume
+    of the bar the fill opens (ADR 0004, ADR 0006); with varying volume the slices differ. The kill
     file is checked on every poll: it halts (open or flat) and flattens at once, not only at the
     next decision. Every halt is alerted, and so is a halt that clears.
     """

@@ -10,10 +10,11 @@ ADR 0004 caps a fill at 5% of its bar's volume (`costs.max_participation`) and g
 
 `strategies.daily_trend.fill_minutes` (default 1: ADR 0004 unchanged). Above 1, the part of a target order the cap cut keeps working, in backtest and paper alike (one `Engine`):
 
-- It is offered a fill at the open of each later 1-minute bar within `fill_minutes` of the decision (paper: a fresh quote on the first poll after each new bar, with that bar's volume). Each slice is for what is left of the target the risk manager approved at the decision, never more, capped at 5% of its own bar and priced and costed like the first fill. A bar that cannot fill it (no volume, a slice under `risk.min_notional`) is skipped.
+- It is offered a fill at the open of each later 1-minute bar within `fill_minutes` of the decision (paper: a fresh quote on the first poll after each new bar). Each slice is for what is left of the target the risk manager approved at the decision, never more, capped at 5% of its own bar and priced and costed like the first fill. A bar that cannot fill it (no volume, a slice under `risk.min_notional`) is skipped.
 - It ends when the rest is worth less than `risk.min_notional` (done), with the window's last bar or an offer after it (the rest dropped, a `no_liquidity` decision row), on a halt or while the kill file exists (`kill_switch`), or at the next decision (`expired`, which trades from the current position).
 - The caps are not evaluated again per slice: the slices add up to at most the order approved at the decision, which a single fill could have taken whole.
 - Working orders are not saved: a paper restart drops the rest. Their fills are in the restored portfolio, so nothing fills twice.
+- Paper sizes every slice one bar behind the backtest. As ADR 0004 says for the first fill, the backtest caps a slice at 5% of the bar it fills at (the bar opening then), paper at 5% of the last closed bar, the only volume it has at that moment. With constant volume the two agree row for row; with varying volume each paper slice is capped by the previous bar's volume (a test pins this offset). Not changed: paper cannot know the volume of a bar that has not closed.
 
 ## Consequences
 

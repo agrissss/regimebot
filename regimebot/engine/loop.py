@@ -655,8 +655,19 @@ class Engine:
         self._cancel_target(symbol, ts, "no_liquidity", detail)
 
     def _cancel_target(self, symbol: str, ts: datetime, rule: str, detail: str) -> None:
-        """Drop ``symbol``'s queued target order, recording that it will not fill."""
-        del self._targets[symbol]
+        """Drop ``symbol``'s queued target order, recording that it will not fill (and logging
+        the rest a working order drops: window over, replaced, halted, stopped)."""
+        order = self._targets.pop(symbol)
+        if self._works:
+            rest = abs(order.target - self.portfolio.signed_qty(symbol))
+            log.info(
+                "target_rest_dropped",
+                symbol=symbol,
+                ts=ts.isoformat(),
+                reason=rule,
+                rest_qty=rest,
+                rest_notional=rest * order.ref_price,
+            )
         decision = RiskDecision(False, 0.0, rule, f"{symbol}: {detail}")
         self.log.decisions.append((None, ts, decision))
 
