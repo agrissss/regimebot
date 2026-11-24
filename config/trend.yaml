@@ -83,6 +83,7 @@ strategies:
     vol_window: 30             # days of close-to-close returns, annualised with sqrt(365)
     target_vol: 0.08           # weight = signal * min(max_asset_exposure, target_vol / n_symbols / vol)
     rebalance_band: 0.01       # trade a change of at least this x equity (or a close or a flip)
+    signal: sma                # or donchian, momentum, hold (always long)
     fill_minutes: 1            # minutes an order keeps filling at later 1m opens (1: one fill)
 risk:
   risk_per_trade: 0.005

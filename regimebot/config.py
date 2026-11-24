@@ -175,13 +175,19 @@ class DailyTrendConfig(_Model):
     vol_window: int = Field(default=30, ge=2)  # daily returns in the volatility estimate
     target_vol: float = Field(default=0.08, gt=0)  # annualised, split over the configured symbols
     rebalance_band: UnitFraction = 0.01  # trade only a change of at least this x equity
+    # the rule (regimebot.strategy.daily_trend): mean sign of close vs SMA_n, vs the mid of the
+    # n-day close channel, or of the n-day return, over lookbacks; hold: always +1
+    signal: Literal["sma", "donchian", "momentum", "hold"] = "sma"
     # minutes a target order keeps working: its unfilled rest fills at each later base bar's open
     # (1: one fill per decision); at most a day, the decision width
     fill_minutes: int = Field(default=1, ge=1, le=1440)
 
     def warmup_bars(self) -> int:
-        """Daily bars of history before the first signal: max(lookbacks) + 1 and vol_window + 1."""
-        return max(*self.lookbacks, self.vol_window) + 1
+        """Daily bars of history before the first signal: max(lookbacks) + 1 (a momentum return
+        over n days needs n + 1 closes, an SMA or channel n) and vol_window + 1; hold reads no
+        lookback."""
+        lookback = 0 if self.signal == "hold" else max(self.lookbacks)
+        return max(lookback, self.vol_window) + 1
 
 
 class StrategiesConfig(_Model):
@@ -351,7 +357,7 @@ def with_overrides(cfg: AppConfig, overrides: Mapping[str, object]) -> AppConfig
     return AppConfig.model_validate(raw)
 
 
-LATER_TREND_FIELDS = ("fill_minutes",)  # daily_trend fields added after runs were stored
+LATER_TREND_FIELDS = ("signal", "fill_minutes")  # daily_trend fields added after stored runs
 _TREND_DEFAULTS = DailyTrendConfig().model_dump()
 
 
