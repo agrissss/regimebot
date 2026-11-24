@@ -10,7 +10,8 @@ every one is checked for stops and targets, and funding events in the interval a
 their timestamps. Events of all symbols run in time order. A target strategy's positions have no
 stop or target: only their bars closing on an hour boundary are replayed (the engine marks them
 and checks the loss limits there), each followed by a fill at the next bar's open (a halt's
-exits fill there).
+exits fill there); an order working over several bars (``strategies.daily_trend.fill_minutes``)
+is also offered a fill at the open of each bar in its window.
 """
 
 import tempfile
@@ -179,15 +180,15 @@ def _replay_interval(
 ) -> None:
     """Feed the base bars and funding events between decisions k-1 and k, in time order, for
     every symbol that has an open position or a queued order (a target strategy: only the bars
-    closing on an hour boundary, each followed by a fill at the next bar's open)."""
+    closing on an hour boundary, each followed by a fill at the next bar's open, and a fill at
+    the open of every bar a working order may fill at). One fill per bar at most."""
     events: list[tuple[int, int, int, str, int]] = []  # (ns, kind, symbol order, symbol, row)
     hour_ns = int(LIMIT_CHECK / timedelta(microseconds=1)) * 1000
     for order, (symbol, feed) in enumerate(feeds.items()):
         if not engine.is_active(symbol):
             continue
         first, stop = int(feed.bar_end[k - 1]), int(feed.bar_end[k])
-        if first < stop:  # queued orders fill at the open of the first bar
-            events.append((int(feed.bar_ts[first]) - base_width_ns, _FILL, order, symbol, first))
+        fills = {first} if first < stop else set()  # queued orders fill at the first bar's open
         if engine.needs_minute_bars:
             events.extend((int(feed.bar_ts[i]), _BAR, order, symbol, i) for i in range(first, stop))
         else:
@@ -195,9 +196,11 @@ def _replay_interval(
             for i in hours.tolist():
                 events.append((int(feed.bar_ts[i]), _BAR, order, symbol, i))
                 if i + 1 < stop:  # the last bar's next open is the next interval's first fill
-                    events.append(
-                        (int(feed.bar_ts[i + 1]) - base_width_ns, _FILL, order, symbol, i + 1)
-                    )
+                    fills.add(i + 1)
+        if (until := engine.working_until(symbol)) is not None:  # every bar opening before it
+            end = np.searchsorted(feed.bar_ts, pd.Timestamp(until).value + base_width_ns)
+            fills.update(range(first + 1, min(int(end), stop)))
+        events.extend((int(feed.bar_ts[i]) - base_width_ns, _FILL, order, symbol, i) for i in fills)
         funding_rows = range(int(feed.funding_end[k - 1]), int(feed.funding_end[k]))
         events.extend((int(feed.funding_ts[j]), _FUNDING, order, symbol, j) for j in funding_rows)
     events.sort()

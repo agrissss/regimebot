@@ -175,6 +175,9 @@ class DailyTrendConfig(_Model):
     vol_window: int = Field(default=30, ge=2)  # daily returns in the volatility estimate
     target_vol: float = Field(default=0.08, gt=0)  # annualised, split over the configured symbols
     rebalance_band: UnitFraction = 0.01  # trade only a change of at least this x equity
+    # minutes a target order keeps working: its unfilled rest fills at each later base bar's open
+    # (1: one fill per decision); at most a day, the decision width
+    fill_minutes: int = Field(default=1, ge=1, le=1440)
 
     def warmup_bars(self) -> int:
         """Daily bars of history before the first signal: max(lookbacks) + 1 and vol_window + 1."""
@@ -348,14 +351,22 @@ def with_overrides(cfg: AppConfig, overrides: Mapping[str, object]) -> AppConfig
     return AppConfig.model_validate(raw)
 
 
+LATER_TREND_FIELDS = ("fill_minutes",)  # daily_trend fields added after runs were stored
+_TREND_DEFAULTS = DailyTrendConfig().model_dump()
+
+
 def config_json(cfg: AppConfig) -> str:
     """Canonical JSON of the strategy config, without ``database_url`` (it may hold a password
-    and must not change the identity of a run between SQLite and Postgres), and without a
-    disabled ``strategies.daily_trend`` at its defaults (added later: configs from before it keep
-    their hash, and their stored JSON validates back to the same config)."""
+    and must not change the identity of a run between SQLite and Postgres), without a disabled
+    ``strategies.daily_trend`` at its defaults, and without its fields added later
+    (``LATER_TREND_FIELDS``) while they are at their defaults. Configs from before those existed
+    keep their hash, and their stored JSON validates back to the same config."""
     exclude: dict[str, Any] = {"database_url": True}
-    if cfg.strategies.daily_trend == DailyTrendConfig():
+    trend = cfg.strategies.daily_trend
+    if trend == DailyTrendConfig():
         exclude["strategies"] = {"daily_trend": True}
+    elif later := {k for k in LATER_TREND_FIELDS if getattr(trend, k) == _TREND_DEFAULTS[k]}:
+        exclude["strategies"] = {"daily_trend": later}
     return json.dumps(
         cfg.model_dump(mode="json", exclude=exclude), sort_keys=True, separators=(",", ":")
     )

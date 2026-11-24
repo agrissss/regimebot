@@ -87,9 +87,11 @@ class PaperSession:
     (each up to about 11 s with the ``EXCHANGE_*`` client settings); the entry expiry at T + one
     decision width bounds the lag of an entry. A failed quote means no spread and no fill for that
     symbol at this decision: a queued entry then expires at the next decision (the engine's
-    rule), a queued exit is retried on every poll until it fills. The kill file is checked on
-    every poll: it halts (open or flat) and flattens at once, not only at the next decision.
-    Every halt is alerted, and so is a halt that clears.
+    rule), a queued exit is retried on every poll until it fills. A target order that keeps
+    working (``strategies.daily_trend.fill_minutes``) is offered a fill again at the first poll of
+    each newer bar, at a fresh quote with that bar's volume, until the engine ends it. The kill
+    file is checked on every poll: it halts (open or flat) and flattens at once, not only at the
+    next decision. Every halt is alerted, and so is a halt that clears.
     """
 
     def __init__(
@@ -123,6 +125,7 @@ class PaperSession:
         self._marks = state.FlushMarks()
         self._newest: dict[str, Bar] = {}  # newest bar fed to the engine, per symbol
         self._last_funding: dict[str, datetime] = {}  # newest funding event fed, per symbol
+        self._offered: dict[str, datetime] = {}  # newest bar at the last fill offered, per symbol
         self._rejected: dict[str, int] = {}  # polled bars dropped by the OHLC sanity rules
         self._last_rejected: dict[str, datetime] = {}  # newest of them, per symbol
         self._last_decision = _EPOCH
@@ -151,9 +154,11 @@ class PaperSession:
         downtime are NOT replayed: the first poll skips a decision whose wait has ended (logged
         at info, not alerted: it closed before this process started), and the session continues
         at the next live decision. A ``stopped_at`` marker of the previous clean stop is cleared
-        as soon as the run is locked, before the warm-up. Queued entries are not
-        saved: ``run_forever`` cancels them on a clean stop, while after a hard kill (SIGKILL)
-        an approved entry is left without a closing decision row.
+        as soon as the run is locked, before the warm-up. Queued entries and target orders,
+        working ones included, are not saved: ``run_forever`` cancels them on a clean stop,
+        while after a hard kill (SIGKILL) an approved one is left without a closing decision row.
+        A working target order's rest is thus dropped by a restart; its fills are in the restored
+        portfolio, so nothing fills twice, and the next decision trades from there.
         """
         try:
             run_id = self._start(resume_run_id)
@@ -543,15 +548,23 @@ class PaperSession:
 
     def _fill_queued(self, quotes: dict[str, Quote] | None) -> None:
         """Fill queued orders at fresh quotes: exits on every poll, entries and target-position
-        orders (reductions too) only on the poll of their decision (``quotes`` given). A symbol
-        whose pre-decision quote failed is not filled on that poll: its entry or target order
-        expires at the next decision, its exit waits for the next poll."""
+        orders (reductions too) on the poll of their decision (``quotes`` given), and a working
+        target order (``Engine.working_until``) on the first poll of each newer base bar after
+        that, once per bar. A symbol whose pre-decision quote failed is not filled on that poll:
+        its entry or target order expires at the next decision (a working one is offered at the
+        next bar instead), its exit waits for the next poll."""
         exits = self.engine.queued_exits
         for symbol in self._symbols:
             if quotes is not None and symbol not in quotes:
                 continue
             entry = quotes is not None and self.engine.has_queued_order(symbol)
-            if not (symbol in exits or entry):
+            newest = self._newest.get(symbol)
+            working = (
+                self.engine.working_until(symbol) is not None
+                and newest is not None
+                and self._offered.get(symbol) != newest.ts
+            )
+            if not (symbol in exits or entry or working):
                 continue
             if (quote := self._quote(symbol)) is not None:
                 self._fill(symbol, quote)
@@ -582,6 +595,8 @@ class PaperSession:
 
     def _fill(self, symbol: str, quote: Quote) -> None:
         newest = self._newest.get(symbol)
+        if newest is not None:
+            self._offered[symbol] = newest.ts  # a working order takes one slice per bar
         volume = 0.0 if newest is None else newest.volume
         if not (math.isfinite(volume) and volume >= 0):
             log.warning("paper_bar_volume_invalid", symbol=symbol, volume=volume)
