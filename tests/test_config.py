@@ -248,3 +248,19 @@ def test_with_overrides_copies_validates_and_keeps_original() -> None:
         with_overrides(cfg, {"risk.nope": 1})
     with pytest.raises(ValueError):
         with_overrides(cfg, {"risk.max_gross_leverage": 1.6})
+
+
+def test_every_config_file_loads_and_each_kraken_session_has_its_own_database() -> None:
+    paths = sorted((DEFAULT_CONFIG_PATH.parent).glob("*.yaml"))
+    configs = {path.stem: load_config(path) for path in paths}
+    assert len(configs) >= 12
+    kraken = configs["kraken"]
+    for name, cfg in configs.items():
+        if name.startswith("kraken_"):  # sessions side by side: one SQLite file each
+            assert cfg.database_url == f"sqlite:///data/paper_{name}.db"
+        if name.startswith("kraken_") and cfg.strategies.daily_trend.enabled:
+            assert (cfg.exchange, cfg.costs, cfg.risk) == (
+                kraken.exchange,
+                kraken.costs,
+                kraken.risk,
+            )

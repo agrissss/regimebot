@@ -15,17 +15,19 @@ and state built from earlier events. Orders it queues fill no earlier than the n
 With a ``TargetStrategy`` (daily_trend) the decision step is different and everything around it
 is the same: no regime, no stop, target or time exit; at each decision every symbol with a target
 weight is traded toward it (``_rebalance``), and the order fills like an entry at the next
-``fill_queued``. Halts, queued exits, funding, flattening and the equity snapshot work as for the
-playbook strategies; the loss-streak rules do not apply (no discrete stopped trades). Because a
-day has one decision, the loss limits are also checked at every hour boundary: ``on_minute``
-marks each open position at the bar closing on the hour and, once all are marked, checks them on
-that equity; a halt queues KILL exits, which fill at the next ``fill_queued`` (the next bar's
-open in a backtest, the next poll's quote in paper).
+``fill_queued`` (with ``strategies.daily_trend.fill_minutes`` above one bar, it keeps working: the
+unfilled rest fills at each later bar's ``fill_queued`` until its window ends). Halts, queued
+exits, funding, flattening and the equity snapshot work as for the playbook strategies; the
+loss-streak rules do not apply (no discrete stopped trades). Because a day has one decision, the
+loss limits are also checked at every hour boundary: ``on_minute`` marks each open position at
+the bar closing on the hour and, once all are marked, checks them on that equity; a halt queues
+KILL exits, which fill at the next ``fill_queued`` (the next bar's open in a backtest, the next
+poll's quote in paper).
 """
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -96,6 +98,7 @@ class _QueuedTarget:
     ts: datetime  # the decision that queued it
     target: float  # approved target position, signed base units
     ref_price: float  # decision close
+    offered: bool = False  # offered a fill already: it is working (fill_minutes)
 
 
 def _last_row(window: pd.DataFrame | None, ts: datetime) -> tuple[dict[str, float] | None, str]:
@@ -118,7 +121,8 @@ class Engine:
 
     At most one position or queued order per symbol (a target position may also have one
     queued order, toward its target). A queued exit takes the whole position; a queued entry
-    fills once, possibly cut by the participation cap, and only before the next decision.
+    fills once, possibly cut by the participation cap, and only before the next decision (a
+    target order too, unless it keeps working: ``working_until``).
     ``strategies`` are looked up by name in each regime's playbook order. A daily_trend config
     takes exactly one ``TargetStrategy`` instead (and nothing else).
     """
@@ -149,6 +153,9 @@ class Engine:
         if len(self.strategies) != len(signals):
             raise ValueError(f"duplicate strategy names in {[s.name for s in signals]}")
         self._decision_width = timedelta(minutes=timeframe_minutes(cfg.exchange.decision_timeframe))
+        self._base_width = timedelta(minutes=timeframe_minutes(cfg.exchange.base_timeframe))
+        self._fill_window = timedelta(minutes=cfg.strategies.daily_trend.fill_minutes)
+        self._works = self._fill_window > self._base_width  # target orders fill over later bars
         self.risk = risk
         self.portfolio = portfolio
         self.log = log
@@ -170,15 +177,26 @@ class Engine:
         )
 
     def has_queued_order(self, symbol: str) -> bool:
-        """True when ``symbol`` has a queued entry or target-position order: it fills only right
-        after its decision (an exit is retried until it fills)."""
+        """True when ``symbol`` has a queued entry or target-position order: it fills right after
+        its decision (a working target order also at later bars, ``working_until``; an exit is
+        retried until it fills)."""
         return symbol in self._entries or symbol in self._targets
+
+    def working_until(self, symbol: str) -> datetime | None:
+        """End of the fill window of ``symbol``'s queued target-position order when it may keep
+        filling at later base bars (``strategies.daily_trend.fill_minutes`` longer than one bar),
+        else None. A feed offers it one ``fill_queued`` per base bar opening before then."""
+        order = self._targets.get(symbol)
+        if order is None or not self._works:
+            return None
+        return order.ts + self._fill_window
 
     @property
     def needs_minute_bars(self) -> bool:
         """False for a target strategy: its positions have no stop or target to check, so a feed
         may send ``on_minute`` only the bars closing on an hour boundary (the loss-limit checks)
-        and a ``fill_queued`` after each (a halt's exits)."""
+        and a ``fill_queued`` after each (a halt's exits), plus one at each bar a working order
+        may fill at (``working_until``)."""
         return self._target is None
 
     @property
@@ -189,7 +207,9 @@ class Engine:
     def to_state(self) -> dict[str, Any]:
         """JSON-safe snapshot of what a restart needs besides the portfolio and risk state: the
         queued exits and the last decision closes (an exit's ``ref_price``). Queued entries and
-        target-position orders are not included: they only fill right after their decision."""
+        target-position orders are not included: they only fill right after their decision. A
+        working target order is therefore dropped by a restart; what it filled is in the
+        portfolio, so nothing fills twice, and the next decision trades from there."""
         return {
             "queued_exits": {s: r.value for s, r in self._exits.items()},
             "last_close": dict(self._last_close),
@@ -264,8 +284,9 @@ class Engine:
                 if entry.signal.ts < ts:  # never offered a fill (no bars since its decision)
                     self._cancel_entry(symbol, ts, "expired", f"not filled since {entry.signal.ts}")
             for symbol, order in list(self._targets.items()):
-                if order.ts < ts:
-                    self._cancel_target(symbol, ts, "expired", f"not filled since {order.ts}")
+                if order.ts < ts:  # this decision replaces it
+                    why = "still working, replaced" if order.offered else "not filled"
+                    self._cancel_target(symbol, ts, "expired", f"{why} since {order.ts}")
             if self._target is None:
                 self._look_for_entries(ts, windows, rows, regimes)
             else:
@@ -549,18 +570,36 @@ class Engine:
         ask: float,
         bar_volume: float,
     ) -> None:
-        """Trade ``symbol`` to its queued target (still queued), or cancel the order; it leaves
-        the queue only once decided. An order that only adds exposure is cut to
+        """Trade ``symbol`` toward its queued target (still queued), or cancel the order; it
+        leaves the queue only once decided. An order that only adds exposure is cut to
         ``max_participation`` of ``bar_volume`` and cancelled (``no_liquidity``) with no fill or
         one under ``risk.min_notional``, as an entry is; one that reduces or closes the position
         always fills in full, as an exit does. A flip closes in full and opens only as much as an
         entry could (``max_participation`` of ``bar_volume``; nothing when that is worth less
-        than ``risk.min_notional`` at the decision close): still one order, and the rest of the
-        target is traded at the next decision. ``expired`` as for an entry."""
+        than ``risk.min_notional`` at the decision close): still one order. ``expired`` as for
+        an entry. The order is cancelled (``kill_switch``) while halted or while the kill file
+        exists, the risk manager's first rules.
+
+        ``fill_minutes`` 1: one fill, and the rest of the target is traded at the next decision.
+        Longer, the order keeps working: it is offered again at each later base bar opening
+        within ``fill_minutes`` of the decision, each time for what is left of the approved
+        target (never more), priced and capped as above; an offer that cannot fill (no volume,
+        under ``risk.min_notional``) waits for the next bar. It ends when the rest is worth less
+        than ``risk.min_notional`` at the decision close (done, no row), or with the last bar of
+        the window, or at an offer after it (the rest dropped, ``no_liquidity``)."""
         if ts >= order.ts + self._decision_width:
             detail = f"first fill offered at {ts}, decision at {order.ts}"
             self._cancel_target(symbol, ts, "expired", detail)
             return
+        if (halt := self.risk.halted_reason) or self.risk.kill_file.exists():
+            why = f"halted: {halt}" if halt else f"kill file {self.risk.kill_file} exists"
+            self._cancel_target(symbol, ts, "kill_switch", why)
+            return
+        window_end = order.ts + self._fill_window
+        if order.offered and ts >= window_end:
+            self._drop_rest(symbol, order, ts)
+            return
+        last = not self._works or ts + self._base_width >= window_end  # no later bar in it
         current = self.portfolio.signed_qty(symbol)
         adds = current * order.target >= 0 and abs(order.target) > abs(current)
         qty = abs(order.target - current)
@@ -584,20 +623,51 @@ class Engine:
         )
         min_notional = self.cfg.risk.min_notional
         if fill is None or (adds and fill.qty * fill.price < min_notional):
+            if not last:  # a working order waits for the next bar
+                self._targets[symbol] = replace(order, offered=True)
+                return
             why = "no volume" if fill is None else f"fill notional {fill.qty * fill.price:.2f}"
             detail = f"{why} at bar volume {bar_volume}, min notional {min_notional}"
             self._cancel_target(symbol, ts, "no_liquidity", detail)
             return
         assert self._target is not None  # only a target strategy queues target orders
         trade = self.portfolio.rebalance(fill, self._target.name, ExitReason.SIGNAL)
-        del self._targets[symbol]
         self.log.fills.append(fill)
         if trade is not None:
             self.log.trades.append(trade)
+        rest = abs(order.target - self.portfolio.signed_qty(symbol))
+        if rest * order.ref_price < min_notional:  # done: the target reached, or only dust left
+            del self._targets[symbol]
+        elif not last:
+            self._targets[symbol] = replace(order, offered=True)
+        elif self._works:
+            self._drop_rest(symbol, order, ts)
+        else:  # fill_minutes 1: the rest is traded at the next decision, as before (no row)
+            del self._targets[symbol]
+
+    def _drop_rest(self, symbol: str, order: _QueuedTarget, ts: datetime) -> None:
+        """End a working target order whose fill window is over, recording the rest it drops."""
+        rest = abs(order.target - self.portfolio.signed_qty(symbol))
+        minutes = self.cfg.strategies.daily_trend.fill_minutes
+        detail = (
+            f"{rest:.8g} of target {order.target:+.8g} left after the {minutes}-minute fill window"
+        )
+        self._cancel_target(symbol, ts, "no_liquidity", detail)
 
     def _cancel_target(self, symbol: str, ts: datetime, rule: str, detail: str) -> None:
-        """Drop ``symbol``'s queued target order, recording that it will not fill."""
-        del self._targets[symbol]
+        """Drop ``symbol``'s queued target order, recording that it will not fill (and logging
+        the rest a working order drops: window over, replaced, halted, stopped)."""
+        order = self._targets.pop(symbol)
+        if self._works:
+            rest = abs(order.target - self.portfolio.signed_qty(symbol))
+            log.info(
+                "target_rest_dropped",
+                symbol=symbol,
+                ts=ts.isoformat(),
+                reason=rule,
+                rest_qty=rest,
+                rest_notional=rest * order.ref_price,
+            )
         decision = RiskDecision(False, 0.0, rule, f"{symbol}: {detail}")
         self.log.decisions.append((None, ts, decision))
 

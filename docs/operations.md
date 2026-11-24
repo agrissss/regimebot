@@ -256,11 +256,13 @@ History: `regimebot data download --start 2026-06-01` (about 250,000 one-minute 
 
 Check made on 2026-11-22, same rule and dates (2026-10-12 to 2026-11-22) on both venues: Kraken +383.74 (+3.84%, 9 trades, fees 4.77, funding -3.78), Binance +392.23 (+3.92%, 9 trades, fees 4.55, funding -5.21). Six weeks say nothing about an edge; the point is that the two venues give nearly the same result for a once-a-day rule. Daily closes differed by about 5 bps on average, 19 bps at most.
 
-Kraken is thinner at the fill minute (00:00 to 00:01 UTC). Over 175 days the 5% participation cap was worth under 1,000 USD on 10 days for BTC, 63 for ETH and 98 for SOL, so some orders fill in part and the rest waits for the next daily decision. In the six-week check that cut turnover by about 6% (9,534 against 10,106 with a 25% cap) and changed the result by about 4 USD. The cap is left at 5%: it is the pessimistic choice. An account much larger than 10,000 would need fills spread over several minutes, which the engine does not do.
+Kraken is thinner at the fill minute (00:00 to 00:01 UTC). Over 175 days the 5% participation cap was worth under 1,000 USD on 10 days for BTC, 63 for ETH and 98 for SOL, so some orders fill in part and the rest waits for the next daily decision. In the six-week check that cut turnover by about 6% (9,534 against 10,106 with a 25% cap) and changed the result by about 4 USD. The cap is left at 5%: it is the pessimistic choice.
+
+Working an order over several minutes: `strategies.daily_trend.fill_minutes` (default 1, one fill per decision as before; at most 1440). Above 1, the part of a target order the cap cut keeps working: it fills at the open of each following 1-minute bar (in paper: at a fresh quote on the first poll after each new bar), each slice capped at `costs.max_participation` of its bar (in paper of the last closed bar, so one bar behind the backtest, as for any first fill) and priced and costed like the first fill, until the decision's approved target is reached or `fill_minutes` have passed since the decision. Then the rest is dropped with a `no_liquidity` decision row ("... left after the N-minute fill window"). A rest worth less than `risk.min_notional` ends the order as done. A halt or the kill file stops it (`kill_switch` row), and the next decision replaces an order still working (`expired`). Paper restart: working orders are not saved, so a stop or crash in the window drops the rest (a clean stop records `cancelled`, a hard kill records nothing); what was filled is in the restored position, so nothing fills twice, and the next decision trades from there. Check on Kraken, 2026-10-12 to 2026-11-22 (in-sample, the same history as above): `fill_minutes` 1 filled 9,534.39 of turnover, net +383.74; `fill_minutes` 30 filled 10,106.98, net +379.90 (fees 5.05, funding -3.89). One cut order was completed a minute later; nothing was left unfilled.
 
 ## Parallel paper sessions
 
-Four rule sets paper-trade side by side on Kraken Futures public data so they can be compared. Each config has its own SQLite database (one file per session, because two sessions writing one SQLite file fail with "database is locked") and its own log. Each starts from 10,000 with the default risk limits.
+Rule sets paper-trade side by side on Kraken Futures public data so they can be compared. Each config has its own SQLite database (one file per session, because two sessions writing one SQLite file fail with "database is locked") and its own log. Each starts from 10,000 with the default risk limits. The first four have run since 2026-11-23; the six daily rules below them were added on 2026-11-24 (same symbols, costs and risk limits as `config/kraken.yaml`, and `fill_minutes: 30`: see "On Kraken data").
 
 | Config | Rule set | Database | Log | Run id |
 |---|---|---|---|---|
@@ -268,15 +270,23 @@ Four rule sets paper-trade side by side on Kraken Futures public data so they ca
 | `config/kraken_trend_longflat.yaml` | daily trend, long/flat | `data/paper_kraken_trend_longflat.db` | `data/paper_kraken_trend_longflat.log` | 1002 |
 | `config/kraken_playbook_15m.yaml` | the original 15-minute playbook (mean reversion, trend, breakout) | `data/paper_kraken_playbook_15m.db` | `data/paper_kraken_playbook_15m.log` | 2002 |
 | `config/kraken_breakout_1h.yaml` | breakout only, 1-hour decisions (`features.pctile_window` 720) | `data/paper_kraken_breakout_1h.db` | `data/paper_kraken_breakout_1h.log` | 3002 |
+| `config/kraken_trend_ls_fill.yaml` | daily trend, long/short, exactly as `config/kraken.yaml` but with `fill_minutes: 30`: its twin, to show what working an order over 30 minutes changes | `data/paper_kraken_trend_ls_fill.db` | `data/paper_kraken_trend_ls_fill.log` | placeholder 4000 |
+| `config/kraken_trend_fast.yaml` | daily trend, long/short, SMA lookbacks 10, 20 and 50 days | `data/paper_kraken_trend_fast.db` | `data/paper_kraken_trend_fast.log` | placeholder 5000 |
+| `config/kraken_trend_slow.yaml` | daily trend, long/short, SMA lookbacks 50, 100 and 200 days (230 days of warm-up) | `data/paper_kraken_trend_slow.db` | `data/paper_kraken_trend_slow.log` | placeholder 6000 |
+| `config/kraken_donchian.yaml` | daily Donchian, long/short: per lookback (20, 50, 100 days) +1 above the midpoint of the highest and lowest close, -1 below, averaged | `data/paper_kraken_donchian.db` | `data/paper_kraken_donchian.log` | placeholder 7000 |
+| `config/kraken_momentum.yaml` | daily time-series momentum, long/short: the sign of the 20, 50 and 100-day returns, averaged | `data/paper_kraken_momentum.db` | `data/paper_kraken_momentum.log` | placeholder 8000 |
+| `config/kraken_hold.yaml` | baseline: always long, with the same volatility-targeted size and band, long/flat | `data/paper_kraken_hold.db` | `data/paper_kraken_hold.log` | placeholder 9000 |
 
-**Warning.** The playbook and the 1-hour breakout rule sets LOST money in backtests: the playbook lost 45% over 2024-2025 (drawdown halt off), and the 1-hour breakout failed its pre-registered 2021-2023 confirmation test (-9.12%). They run on paper for comparison only. One night or one week of results says nothing about an edge, for any of the four.
+The first run of each new database gets the id after its placeholder (4001, 5001, ...), unless something else (a backtest) runs there first.
+
+**Warning.** The playbook and the 1-hour breakout rule sets LOST money in backtests: the playbook lost 45% over 2024-2025 (drawdown halt off), and the 1-hour breakout failed its pre-registered 2021-2023 confirmation test (-9.12%). They run on paper for comparison only. The six daily rules added on 2026-11-24 are comparisons of how different rules behave on paper, not candidates with an edge: none of them is pre-registered or confirmed, and their backtests (docs/research-protocol.md, "More daily rules for paper comparison (2026-11-24)") are in-sample on history used many times before. The hold baseline stays long through every fall: in its backtest it reached the permanent 10% drawdown halt in May 2022 and traded no more, and its paper session will stop the same way. One night, one week or a few months of results says nothing about an edge, for any of the ten.
 
 ```bash
 scripts/paper_all.sh start    # start each session that is not running; safe to re-run
 scripts/paper_all.sh status   # paper status for each, with its process id; exits 1 if one is hung
 ```
 
-`start` launches each missing session like a single one: `REGIMEBOT_CONFIG=config/<name>.yaml nohup caffeinate -i .venv/bin/regimebot paper run --resume latest >> data/paper_<name>.log 2>&1 &`. It recognises a running session by the `REGIMEBOT_CONFIG` value in the process environment, so start sessions with the script or with exactly that value. Set the same `REGIMEBOT_CONFIG` for every other command about a session (`paper status`, `paper end`, `report`). A backtest with one of these configs writes to that session's database, so run it while the session is stopped.
+`start` launches each missing session like a single one (a config whose database is not set up yet, see below, is skipped with a message, so the script stays safe to re-run): `REGIMEBOT_CONFIG=config/<name>.yaml nohup caffeinate -i .venv/bin/regimebot paper run --resume latest >> data/paper_<name>.log 2>&1 &`. It recognises a running session by the `REGIMEBOT_CONFIG` value in the process environment, so start sessions with the script or with exactly that value. Set the same `REGIMEBOT_CONFIG` for every other command about a session (`paper status`, `paper end`, `report`). A backtest with one of these configs writes to that session's database, so run it while the session is stopped.
 
 Two things are shared by every session, whatever the config, because the paper code keys them to the repository rather than to the database:
 
@@ -293,3 +303,16 @@ sqlite3 data/paper_<name>.db "INSERT INTO runs (id, mode, config_hash, config_js
 ```
 
 The download is optional (the session fetches its own warm-up on first start) but is needed for a backtest.
+
+Setting up the six daily-rule databases of 2026-11-24, once, with the run-id offsets of the table (4000 to 9000), before `scripts/paper_all.sh start`:
+
+```bash
+for pair in kraken_trend_ls_fill:4000 kraken_trend_fast:5000 kraken_trend_slow:6000 \
+            kraken_donchian:7000 kraken_momentum:8000 kraken_hold:9000; do
+  name=${pair%%:*}; id=${pair##*:}
+  REGIMEBOT_CONFIG=config/$name.yaml .venv/bin/regimebot db upgrade
+  sqlite3 data/paper_$name.db "INSERT INTO runs (id, mode, config_hash, config_json, git_sha, started_at, ended_at, note) VALUES ($id, 'reserved', '', '{}', '', datetime('now'), datetime('now'), 'run id offset: paper run locks are shared across databases')"
+done
+```
+
+`config/kraken_trend_slow.yaml` needs 201 daily closes before its first decision, so its `paper.warmup_bars` is 230: on first start the session fetches 230 days of 1-minute history per coin itself (about 332 requests of 1000 bars per coin, several minutes; Kraken Futures served 1-minute bars from 2026-03-01 when checked on 2026-11-24). For a backtest of it on Kraken data, download from an earlier start than the other configs: `REGIMEBOT_CONFIG=config/kraken_trend_slow.yaml .venv/bin/regimebot data download --start 2026-04-01 --end "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"` (a backtest starting 2026-10-20 or later is then warm). The others need 110 days (`config/kraken_hold.yaml` only 31).
