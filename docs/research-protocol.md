@@ -265,3 +265,34 @@ Question: does the daily trend rule work on 4-hour bars, to give results on a sh
 The timing test put the 0.01 run above 199 of 200 time-shifted runs, so the signal is real before costs. But the rule turns the book over about 145 times a year and pays about 11.6% of equity a year in costs; at doubled costs the whole result is gone. The daily rule on the same coins made +129.90% (Sharpe 0.79) and stayed profitable at doubled costs on the ten other coins. The 4-hour version is also no more regular: 44% of weeks and 48% of months are positive.
 
 Decision: rejected on cost fragility, without spending fresh coins on a confirmation run. A wider band does not help because the turnover comes from sign flips, not from small resizing.
+
+## More daily rules for paper comparison (2026-11-24)
+
+Purpose: six more once-a-day rules paper-trade on Kraken from 2026-11-24 (`config/kraken_trend_ls_fill.yaml`, `kraken_trend_fast`, `kraken_trend_slow`, `kraken_donchian`, `kraken_momentum`, `kraken_hold`; docs/operations.md, "Parallel paper sessions") so the owner can see how different rules behave side by side. The backtests below only show how each rule behaved on history already used. **All of this history has been used before (BTC, ETH and SOL 2021-2026 for every earlier daily-trend run, the Kraken six weeks for the venue check), so every number here is in-sample. None of these rules is pre-registered or confirmed, and none of the numbers is evidence of an edge.** The prototype had already tried single-lookback SMA, momentum and Donchian variants on the same data (third rule set above); these are six more trials on it. Picking the best row of this table and calling it the strategy would be selection on in-sample results.
+
+Method: the engine (`run_backtest`, 1-minute fills, default costs and risk limits: daily 1.5%, weekly 4%, a permanent halt at a 10% drawdown), `config/trend.yaml` (Binance BTC/ETH/SOL perpetuals, 10,000) with each paper config's rule and `fill_minutes: 30`, decisions from 2021-01-01 to 2026-11-21, on a copy of the database. One run each. The same with the CLI, for example: `REGIMEBOT_CONFIG=config/trend.yaml regimebot backtest run --set strategies.daily_trend.signal=donchian --set strategies.daily_trend.fill_minutes=30` (`kraken_trend_slow` also needs `--set paper.warmup_bars=230`). Net per year is the change in equity from the last snapshot of the year before (10,000 for 2021); 2026 ends on 2026-11-21.
+
+| Paper config | Rule | Net | Max drawdown | Trades | Fees | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `kraken_trend_ls_fill` | SMA 20/50/100, long/short | +2,890.68 (+28.91%) | 9.22% | 440 | 241.22 | +4.87% | +1.37% | +4.41% | +2.49% | +2.08% | +11.01% |
+| `kraken_trend_fast` | SMA 10/20/50, long/short | +3,745.44 (+37.45%) | 7.37% | 756 | 396.33 | +7.56% | +1.47% | +6.30% | +5.47% | +1.01% | +11.22% |
+| `kraken_trend_slow` | SMA 50/100/200, long/short | +2,348.30 (+23.48%) | 8.89% | 288 | 147.11 | +0.79% | +4.52% | +2.99% | +1.04% | +3.39% | +8.96% |
+| `kraken_donchian` | Donchian 20/50/100, long/short | +2,860.05 (+28.60%) | 7.13% | 404 | 212.18 | +4.24% | +3.59% | +7.17% | +0.99% | +0.92% | +9.02% |
+| `kraken_momentum` | momentum 20/50/100, long/short | +1,796.95 (+17.97%) | 8.31% | 475 | 217.97 | +3.61% | +2.35% | +5.60% | +1.90% | +0.53% | +2.83% |
+| `kraken_hold` | hold (always long), long/flat | +920.90 (+9.21%) | 10.00% | 15 | 7.43 | +17.38% | -6.97% | 0 | 0 | 0 | 0 |
+
+Read with:
+
+- `kraken_hold` hit the 10% drawdown limit on 2022-05-09 and, that halt being permanent, stayed flat for the rest of the run: its 0% years are the halt, not the market, and the row says little about buying and holding. Its paper session will stop trading the same way once it is 10% below its peak.
+- Warm-up: the Binance history starts on 2020-11-01, so a rule trades only from its first fully warm decision: `kraken_trend_fast` 2020-12-30, `kraken_hold` 2020-12-31, SMA and Donchian 20/50/100 2021-02-09, momentum 2021-02-10, `kraken_trend_slow` 2021-05-20.
+- Every run had one-day `daily_loss` halts: 4 to 6 for the five trend rules; `kraken_hold` 3, then a `weekly_loss` halt and the permanent one.
+- `fill_minutes: 30` changes nothing here: on Binance at 10,000 the 5% cap never bound, and the `kraken_trend_ls_fill` row reproduces the `fill_minutes` 1 run (run 26's numbers) log row for log row.
+
+Working an order over the minutes on Kraken (`config/kraken.yaml`, decisions 2026-10-12 to 2026-11-22, the same six weeks as the venue check in docs/operations.md, so also in-sample):
+
+| `fill_minutes` | Turnover filled | Net P&L | Fees | Funding | Fills |
+|---|---|---|---|---|---|
+| 1 (as before) | 9,534.39 | +383.74 (+3.84%) | 4.77 | -3.78 | 18 |
+| 30 | 10,106.98 | +379.90 (+3.80%) | 5.05 | -3.89 | 19 |
+
+One order was cut by the cap (an ETH short on 2026-10-27: 340 of 626 filled at 00:00) and its rest filled at 00:01; the 30-minute window never ran out. The bigger fill is the effect, not a better result: six weeks and nine trades say nothing either way.

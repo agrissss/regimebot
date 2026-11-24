@@ -61,7 +61,8 @@ Strategy, risk, portfolio and persistence code is identical in every mode.
   joined higher-timeframe bars. This removes the most common look-ahead bug.
 - Backtests model the spread as a constant; paper uses the live quoted spread, so the `liquidity_stress` regime is triggered only by the illiquidity percentile in backtests and results by regime are not strictly comparable between the two.
 - Inside one 1m bar, if both stop and target are touched, the stop is assumed
-  to fill first. Fill conventions are in ADR 0004.
+  to fill first. Fill conventions are in ADR 0004; a daily target order working
+  over several minutes (`strategies.daily_trend.fill_minutes`) in ADR 0006.
 
 ## Storage
 

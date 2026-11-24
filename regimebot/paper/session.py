@@ -551,8 +551,8 @@ class PaperSession:
         orders (reductions too) on the poll of their decision (``quotes`` given), and a working
         target order (``Engine.working_until``) on the first poll of each newer base bar after
         that, once per bar. A symbol whose pre-decision quote failed is not filled on that poll:
-        its entry or target order expires at the next decision (a working one is offered at the
-        next bar instead), its exit waits for the next poll."""
+        its entry or target order expires at the next decision (a working one is offered again
+        on the next poll instead), its exit waits for the next poll."""
         exits = self.engine.queued_exits
         for symbol in self._symbols:
             if quotes is not None and symbol not in quotes:
